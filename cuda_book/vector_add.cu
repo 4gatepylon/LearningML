@@ -1,6 +1,7 @@
 #include <cuda_runtime.h>
 #include <gtest/gtest.h>
 
+#include <cassert>
 #include <cstddef>
 #include <stdexcept>
 #include <string>
@@ -10,10 +11,17 @@
 // GPU implementations and CPU launch code/helpers
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-__global__ void vector_add_kernel_on_gpu(const float* a, const float* b, float* c, int n) {
-  int i = static_cast<int>((blockDim.x * blockIdx.x) + threadIdx.x);
-  if (i < n) {
-    c[i] = a[i] + b[i];
+__global__ void vector_add_kernel_on_gpu(const float* a, const float* b, float* c, int n, int k) {
+  // Threads index i maps onto index j as such:
+  // Thread 0: 0, 1, 2, 3, ..., k-1
+  // Thread 1: k, ..., 2*k-1
+  // ...
+  // Thread i: i*k, ..., (i+1)*k-1
+  // ...
+  int i_thread = static_cast<int>((blockDim.x * blockIdx.x) + threadIdx.x);
+  int i_arrays = i_thread * k;
+  for (int j_arrays = i_arrays; j_arrays < i_arrays + k && j_arrays < n; j_arrays++) {
+    c[j_arrays] = a[j_arrays] + b[j_arrays];
   }
 }
 
@@ -24,6 +32,13 @@ void vector_add_gpu(const float* a, const float* b, float* c, int n) {
   float* ptr_to_abc_on_cuda;
   const size_t n_bytes = static_cast<size_t>(n) * sizeof(float);
   const std::ptrdiff_t n_elems = n;
+  const size_t block_size_gpu = 256;
+  const size_t thread_size_gpu = 32;
+
+  const size_t n_elems_per_block_gpu = block_size_gpu * thread_size_gpu;
+  const size_t n_blocks_gpu = (n + n_elems_per_block_gpu - 1) / n_elems_per_block_gpu;
+  assert(n_blocks_gpu >= 1);
+
   cudaError_t malloc_err = cudaMalloc((void**)&ptr_to_abc_on_cuda, 3 * n_bytes);
   if (malloc_err != cudaSuccess) {
     throw std::runtime_error(std::string("cudaMalloc failed: ") + cudaGetErrorString(malloc_err));
@@ -32,9 +47,9 @@ void vector_add_gpu(const float* a, const float* b, float* c, int n) {
   cudaMemcpy(ptr_to_abc_on_cuda + (1 * n_elems), b, n_bytes, cudaMemcpyHostToDevice);
 
   // Do computation
-  vector_add_kernel_on_gpu<<<((n + 255) / 256), 256>>>(ptr_to_abc_on_cuda + (0 * n_elems),
-                                                       ptr_to_abc_on_cuda + (1 * n_elems),
-                                                       ptr_to_abc_on_cuda + (2 * n_elems), n);
+  vector_add_kernel_on_gpu<<<n_blocks_gpu, block_size_gpu>>>(
+      ptr_to_abc_on_cuda + (0 * n_elems), ptr_to_abc_on_cuda + (1 * n_elems),
+      ptr_to_abc_on_cuda + (2 * n_elems), n, thread_size_gpu);
 
   // Free on Cuda
   cudaMemcpy(c, ptr_to_abc_on_cuda + (2 * n_elems), n_bytes, cudaMemcpyDeviceToHost);
