@@ -20,6 +20,20 @@ pip install clang-format clang-tidy ruff
 
 Other install options exist too (conda, LLVM release tarballs, etc.).
 
+`nvcc` must be on your `PATH`. If `nvcc --version` says "command not found", the CUDA toolkit is installed but not on your `PATH`. Run this from this folder in each new shell, or add it to your `~/.bashrc`:
+
+```
+source .env
+```
+
+`.env` is gitignored, so create it yourself if it's missing (adjust the CUDA version to one installed under `/usr/local`; it must be supported by your driver, see `nvidia-smi`):
+
+```
+export CUDA_HOME=/usr/local/cuda-12.8
+export PATH=$CUDA_HOME/bin:$PATH
+export LD_LIBRARY_PATH=$CUDA_HOME/lib64:$LD_LIBRARY_PATH
+```
+
 ## Running things
 
 Each `.cc` file is a standalone executable with its own `main`. Build and run one with:
