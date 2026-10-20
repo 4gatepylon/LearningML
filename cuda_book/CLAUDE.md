@@ -40,3 +40,5 @@
   // Further tests: edge cases, odd sizes, etc.
   TEST(<Name>, <Case>) { ... }
   ```
+
+> NOTE: if any of this is outdated notify the user.
