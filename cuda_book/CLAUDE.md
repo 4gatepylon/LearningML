@@ -6,6 +6,8 @@
   - Every test runs both implementations on the same inputs and compares their outputs with `ASSERT_*`/`EXPECT_*` (use `*_NEAR` for floats).
   - Write one or more tests, including at least one happy-path test.
 - Read `README.md` in this folder before starting work.
+- Use a `.cu` file for anything with CUDA code (built with `nvcc`) and a `.cc` file for plain C++ (built with `g++`). `test.py` picks the compiler from the extension.
+- Never hardcode flags, paths or versions that are specific to a host's build setup (CUDA version or location, GPU architecture, driver-specific workarounds) in `test.py`, the Makefile or the source. The user may use different CUDA versions on different hosts; take them from the environment (e.g. `nvcc` from `PATH` via `.env`). If hardcoding seems necessary, ask the user first.
 - Lay out each file in three sections, in this order, each introduced by a banner (a line of 100 `/` characters, a title comment, another line of 100 `/` characters). `vector_add.cc` follows this template:
 
   ```cpp
