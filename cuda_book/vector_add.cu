@@ -47,7 +47,9 @@ void vector_add_gpu(const float* a, const float* b, float* c, int n) {
   cudaMemcpy(ptr_to_abc_on_cuda + (1 * n_elems), b, n_bytes, cudaMemcpyHostToDevice);
 
   // Do computation
-  vector_add_kernel_on_gpu<<<n_blocks_gpu, block_size_gpu>>>(
+  dim3 dim_grid(n_blocks_gpu, 1, 1);
+  dim3 dim_block(block_size_gpu, 1, 1);
+  vector_add_kernel_on_gpu<<<dim_grid, dim_block>>>(
       ptr_to_abc_on_cuda + (0 * n_elems), ptr_to_abc_on_cuda + (1 * n_elems),
       ptr_to_abc_on_cuda + (2 * n_elems), n, thread_size_gpu);
 
