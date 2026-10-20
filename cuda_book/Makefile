@@ -1,9 +1,10 @@
 CXX      ?= g++
 CXXFLAGS ?= -std=c++17 -O2 -Wall -Wextra
 ARTIFACTS := .artifacts
-CLANG_FORMAT ?= clang-format
-CLANG_TIDY ?= clang-tidy
-RUFF ?= ruff
+# Dev tools come from the uv environment (see pyproject.toml); override to use system installs.
+CLANG_FORMAT ?= uv run clang-format
+CLANG_TIDY ?= uv run clang-tidy
+RUFF ?= uv run ruff
 SOURCES := $(wildcard *.cc *.cu *.cuh *.h)
 
 # No implicit rules: `make run vector_add` must not try to build `vector_add` itself.
@@ -25,7 +26,7 @@ help:
 
 # `make run` just forwards to run.py; extra goals after `run` are its arguments.
 run:
-	@./run.py $(filter-out run,$(MAKECMDGOALS))
+	@uv run ./run.py $(filter-out run,$(MAKECMDGOALS))
 
 # Swallow the names given after `run` so make doesn't complain they have no rule.
 ifneq ($(filter run,$(MAKECMDGOALS)),)

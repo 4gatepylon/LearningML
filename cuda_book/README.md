@@ -5,34 +5,18 @@ I did the exercises as I went through and wrote them down below in this folder.
 
 ## Prerequisites
 
-`make fmt` and `make tidy` need `clang-format`, `clang-tidy` and `ruff` (for the Python files). Install the clang tools with apt:
+Install [uv](https://docs.astral.sh/uv/), then run:
 
 ```
-sudo apt install clang-format
-sudo apt install clang-tidy
+uv sync
 ```
 
-or with pip (no sudo needed):
+This installs the dev tools (`ruff`, `clang-format`, `clang-tidy`) into `.venv`, and the Makefile
+runs them through `uv run`. You also need a C++ compiler (`g++`).
 
-```
-pip install clang-format clang-tidy ruff
-```
-
-Other install options exist too (conda, LLVM release tarballs, etc.).
-
-`nvcc` must be on your `PATH`. If `nvcc --version` says "command not found", the CUDA toolkit is installed but not on your `PATH` (this happens on some lab machines that Adriano uses). Run this from this folder in each new shell, or add it to your `~/.bashrc`:
-
-```
-source .env
-```
-
-`.env` is gitignored, so create it yourself if it's missing (adjust the CUDA version to one installed under `/usr/local`; it must be supported by your driver, see `nvidia-smi`):
-
-```
-export CUDA_HOME=/insert/your/path/here/cuda_version
-export PATH=$CUDA_HOME/bin:$PATH
-export LD_LIBRARY_PATH=$CUDA_HOME/lib64:$LD_LIBRARY_PATH
-```
+Alternatively, install the tools yourself (e.g. `sudo apt install clang-format clang-tidy`, or
+`pip install clang-format clang-tidy ruff`) and point the Makefile at them, e.g.
+`make fmt CLANG_FORMAT=clang-format RUFF=ruff`. Other install options exist too.
 
 ## Running things
 

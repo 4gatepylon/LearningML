@@ -1,0 +1,12 @@
+[project]
+name = "cuda-book"
+version = "0.1.0"
+description = "Exercises from Programming Massively Parallel Processors (5th edition)"
+requires-python = ">=3.10"
+dependencies = []
+
+[dependency-groups]
+dev = ["ruff", "clang-format", "clang-tidy"]
+
+[tool.uv]
+package = false
