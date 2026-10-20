@@ -1,6 +1,7 @@
 #include <cuda_runtime.h>
 #include <gtest/gtest.h>
 
+#include <cstddef>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -9,34 +10,34 @@
 // GPU implementations and CPU launch code/helpers
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-__global__ void vector_add_kernel_on_gpu(float* a, float* b, float* c, int n) {
-  int i = blockDim.x * blockIdx.x + threadIdx.x;
+__global__ void vector_add_kernel_on_gpu(const float* a, const float* b, float* c, int n) {
+  int i = static_cast<int>((blockDim.x * blockIdx.x) + threadIdx.x);
   if (i < n) {
     c[i] = a[i] + b[i];
   }
 }
 
 // Element-wise c[i] = a[i] + b[i] on the GPU.
-// TODO: not implemented yet; leaves c untouched.
-// NOLINTNEXTLINE(readability-non-const-parameter): remove once c is actually written.
 void vector_add_gpu(const float* a, const float* b, float* c, int n) {
   // Allocate on CUDA memory
   // (we can store as a then b then c)
   float* ptr_to_abc_on_cuda;
-  int n_bytes = n * sizeof(float);
+  const size_t n_bytes = static_cast<size_t>(n) * sizeof(float);
+  const std::ptrdiff_t n_elems = n;
   cudaError_t malloc_err = cudaMalloc((void**)&ptr_to_abc_on_cuda, 3 * n_bytes);
   if (malloc_err != cudaSuccess) {
     throw std::runtime_error(std::string("cudaMalloc failed: ") + cudaGetErrorString(malloc_err));
   }
-  cudaMemcpy(ptr_to_abc_on_cuda + 0 * n, a, n_bytes, cudaMemcpyHostToDevice);
-  cudaMemcpy(ptr_to_abc_on_cuda + 1 * n, b, n_bytes, cudaMemcpyHostToDevice);
+  cudaMemcpy(ptr_to_abc_on_cuda + (0 * n_elems), a, n_bytes, cudaMemcpyHostToDevice);
+  cudaMemcpy(ptr_to_abc_on_cuda + (1 * n_elems), b, n_bytes, cudaMemcpyHostToDevice);
 
   // Do computation
-  vector_add_kernel_on_gpu<<<((n + 255) / 256), 256>>>(
-      ptr_to_abc_on_cuda + 0 * n, ptr_to_abc_on_cuda + 1 * n, ptr_to_abc_on_cuda + 2 * n, n);
+  vector_add_kernel_on_gpu<<<((n + 255) / 256), 256>>>(ptr_to_abc_on_cuda + (0 * n_elems),
+                                                       ptr_to_abc_on_cuda + (1 * n_elems),
+                                                       ptr_to_abc_on_cuda + (2 * n_elems), n);
 
   // Free on Cuda
-  cudaMemcpy(c, ptr_to_abc_on_cuda + 2 * n, n_bytes, cudaMemcpyDeviceToHost);
+  cudaMemcpy(c, ptr_to_abc_on_cuda + (2 * n_elems), n_bytes, cudaMemcpyDeviceToHost);
   cudaFree(ptr_to_abc_on_cuda);
 }
 
