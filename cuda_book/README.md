@@ -25,9 +25,10 @@ Other install options exist too (conda, LLVM release tarballs, etc.).
 Each `.cc` file is a standalone executable with its own `main`. Build and run one with:
 
 ```
-make run F=<name>    # <name> is the filename without the .cc extension
+make run <name>    # the .cc extension is optional
+make run           # no name: build and run every .cc file
 ```
 
-For example, `make run F=vector_add`. Run `make help` to see all targets.
+For example, `make run vector_add`. Run `make help` to see all targets.
 
 Object files and binaries are stored in `./.artifacts/` (gitignored). `make clean` removes that folder.

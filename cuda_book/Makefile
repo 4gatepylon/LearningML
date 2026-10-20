@@ -5,36 +5,32 @@ CLANG_FORMAT ?= clang-format
 CLANG_TIDY ?= clang-tidy
 SOURCES := $(wildcard *.cc *.cu *.cuh *.h)
 
-# Usage: make run F=vector_add   (the .cc extension is omitted)
-F ?=
+# No implicit rules: `make run vector_add` must not try to build `vector_add` itself.
+MAKEFLAGS += --no-builtin-rules
+.SUFFIXES:
 
 .PHONY: help run fmt tidy clean
 
 help:
 	@echo "Targets:"
 	@echo "  make help             Show this message"
-	@echo "  make run F=<name>     Build <name>.cc and run it (omit the .cc extension)"
+	@echo "  make run [name ...]   Build and run <name>.cc (.cc optional); with no name, run every .cc"
 	@echo "  make fmt              Format all .cc/.cu/.cuh/.h files in place with clang-format"
 	@echo "  make tidy             Lint all .cc files with clang-tidy"
 	@echo "  make clean            Remove $(ARTIFACTS)/"
 	@echo ""
-	@echo "Example: make run F=vector_add"
-	@echo "Object files and binaries are written to $(ARTIFACTS)/"
+	@echo "Example: make run vector_add"
+	@echo "Binaries are written to $(ARTIFACTS)/ (see run.py)"
 
-$(ARTIFACTS):
-	@mkdir -p $(ARTIFACTS)
-
-$(ARTIFACTS)/%.o: %.cc | $(ARTIFACTS)
-	$(CXX) $(CXXFLAGS) -c $< -o $@
-
-$(ARTIFACTS)/%: $(ARTIFACTS)/%.o
-	$(CXX) $(CXXFLAGS) $< -o $@
-
+# `make run` just forwards to run.py; extra goals after `run` are its arguments.
 run:
-	@test -n "$(F)" || { echo "error: F is required, e.g. make run F=vector_add"; exit 1; }
-	@test -f "$(F).cc" || { echo "error: $(F).cc not found"; exit 1; }
-	@$(MAKE) --no-print-directory $(ARTIFACTS)/$(F)
-	./$(ARTIFACTS)/$(F)
+	@./run.py $(filter-out run,$(MAKECMDGOALS))
+
+# Swallow the names given after `run` so make doesn't complain they have no rule.
+ifneq ($(filter run,$(MAKECMDGOALS)),)
+%:
+	@:
+endif
 
 fmt:
 	$(CLANG_FORMAT) -i $(SOURCES)
