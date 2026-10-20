@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""Build and run the standalone C++ programs in this folder.
+"""Build and test the standalone C++ programs in this folder.
 
 Usage:
-  ./run.py                    # build and run every *.cc file
-  ./run.py vector_add         # build and run vector_add.cc
-  ./run.py vector_add.cc      # same; the .cc extension is optional
-  ./run.py vec                # same, if vector_add.cc is the only file starting with "vec"
+  ./test.py                    # build and test every *.cc file
+  ./test.py vector_add         # build and test vector_add.cc
+  ./test.py vector_add.cc      # same; the .cc extension is optional
+  ./test.py vec                # same, if vector_add.cc is the only file starting with "vec"
 """
 
 import argparse
@@ -39,7 +39,7 @@ def resolve(arg: str) -> str | None:
     return None
 
 
-def build_and_run(name: str) -> bool:
+def build_and_test(name: str) -> bool:
     src = HERE / f"{name}.cc"
 
     ARTIFACTS.mkdir(exist_ok=True)
@@ -57,7 +57,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawTextHelpFormatter
     )
-    parser.add_argument("names", nargs="*", help="programs to run (default: all)")
+    parser.add_argument("names", nargs="*", help="programs to test (default: all)")
     args = parser.parse_args()
 
     if args.names:
@@ -71,7 +71,7 @@ def main() -> int:
     for name in names:
         if len(names) > 1:
             print(f"\n==> {name}", flush=True)
-        if not build_and_run(name):
+        if not build_and_test(name):
             failed.append(name)
 
     if len(names) > 1:

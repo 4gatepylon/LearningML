@@ -20,13 +20,13 @@ Alternatively, install the tools yourself (e.g. `sudo apt install clang-format c
 
 ## Running things
 
-Each `.cc` file is a standalone executable with its own `main`. Build and run one with:
+Each `.cc` file is a standalone executable with its own `main`. Build and test one with:
 
 ```
-make run <name>    # the .cc extension is optional; a unique prefix (e.g. `vec`) also works
-make run           # no name: build and run every .cc file
+make test <name>   # the .cc extension is optional; a unique prefix (e.g. `vec`) also works
+make test           # no name: build and test every .cc file
 ```
 
-For example, `make run vector_add`. Run `make help` to see all targets.
+For example, `make test vector_add`. Run `make help` to see all targets.
 
 Object files and binaries are stored in `./.artifacts/` (gitignored). `make clean` removes that folder.

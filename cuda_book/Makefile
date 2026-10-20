@@ -7,29 +7,29 @@ CLANG_TIDY ?= uv run clang-tidy
 RUFF ?= uv run ruff
 SOURCES := $(wildcard *.cc *.cu *.cuh *.h)
 
-# No implicit rules: `make run vector_add` must not try to build `vector_add` itself.
+# No implicit rules: `make test vector_add` must not try to build `vector_add` itself.
 MAKEFLAGS += --no-builtin-rules
 .SUFFIXES:
 
-.PHONY: help run fmt tidy clean
+.PHONY: help test fmt tidy clean
 
 help:
 	@echo "Targets:"
 	@echo "  make help             Show this message"
-	@echo "  make run [name ...]   Build and run <name>.cc (.cc optional); with no name, run every .cc"
+	@echo "  make test [name ...]  Build and test <name>.cc (.cc optional); with no name, test every .cc"
 	@echo "  make fmt              Format C++ (clang-format) and Python (ruff) files in place"
 	@echo "  make tidy             Lint C++ (clang-tidy) and Python (ruff) files"
 	@echo "  make clean            Remove $(ARTIFACTS)/"
 	@echo ""
-	@echo "Example: make run vector_add"
-	@echo "Binaries are written to $(ARTIFACTS)/ (see run.py)"
+	@echo "Example: make test vector_add"
+	@echo "Binaries are written to $(ARTIFACTS)/ (see test.py)"
 
-# `make run` just forwards to run.py; extra goals after `run` are its arguments.
-run:
-	@uv run ./run.py $(filter-out run,$(MAKECMDGOALS))
+# `make test` just forwards to test.py; extra goals after `test` are its arguments.
+test:
+	@uv run ./test.py $(filter-out test,$(MAKECMDGOALS))
 
-# Swallow the names given after `run` so make doesn't complain they have no rule.
-ifneq ($(filter run,$(MAKECMDGOALS)),)
+# Swallow the names given after `test` so make doesn't complain they have no rule.
+ifneq ($(filter test,$(MAKECMDGOALS)),)
 %:
 	@:
 endif
