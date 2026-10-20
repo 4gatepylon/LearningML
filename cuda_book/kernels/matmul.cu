@@ -29,8 +29,24 @@ void matmul_cpu(const float* a, const float* b, float* c, int m, int n, int k) {
 // Tests (main comes from gtest_main)
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
+// Fails if `c` is exactly zero everywhere. Outputs start zeroed and every test input is positive,
+// so a correct product is never all zero; an all-zero output means nothing was ever written.
+static ::testing::AssertionResult NotAllZero(const std::vector<float>& c, const char* who) {
+  for (float x : c) {
+    if (x != 0.0F) {
+      return ::testing::AssertionSuccess();
+    }
+  }
+  return ::testing::AssertionFailure()
+         << who << " left all " << c.size()
+         << " output values exactly zero. The test inputs are all positive, so a correct product "
+            "is never all zero: "
+         << who << " is probably unimplemented or never writes to its output.";
+}
+
 // Runs both implementations on the same inputs and expects the outputs to match (stops at the first
-// mismatch). The tolerance scales with k since summation order differs between CPU and GPU.
+// mismatch). Inputs must be positive so the expected output is never all zero. The tolerance scales
+// with k since summation order differs between CPU and GPU.
 static void ExpectCpuGpuMatch(const std::vector<float>& a, const std::vector<float>& b, int m,
                               int n, int k) {
   ASSERT_EQ(a.size(), static_cast<size_t>(m) * static_cast<size_t>(k));
@@ -41,17 +57,19 @@ static void ExpectCpuGpuMatch(const std::vector<float>& a, const std::vector<flo
   matmul_cpu(a.data(), b.data(), c_cpu.data(), m, n, k);
   matmul_gpu(a.data(), b.data(), c_gpu.data(), m, n, k);
 
+  ASSERT_TRUE(NotAllZero(c_cpu, "matmul_cpu"));
+  ASSERT_TRUE(NotAllZero(c_gpu, "matmul_gpu"));
   const float tol = 1e-5F * static_cast<float>(k > 1 ? k : 1);
   for (size_t i = 0; i < c_cpu.size(); ++i) {
     ASSERT_NEAR(c_cpu[i], c_gpu[i], tol) << "first mismatch at index " << i;
   }
 }
 
-// Fills v with a deterministic pattern of small values in [-1, 1).
+// Fills v with a deterministic pattern of strictly positive values in (0, 2].
 static std::vector<float> Pattern(int size, int seed) {
   std::vector<float> v(static_cast<size_t>(size));
   for (int i = 0; i < size; ++i) {
-    v[static_cast<size_t>(i)] = (static_cast<float>(((i * 31) + (seed * 17)) % 64) / 32.0F) - 1.0F;
+    v[static_cast<size_t>(i)] = static_cast<float>((((i * 31) + (seed * 17)) % 64) + 1) / 32.0F;
   }
   return v;
 }
