@@ -22,7 +22,7 @@ CXXFLAGS = os.environ.get("CXXFLAGS", "-std=c++17 -O2 -Wall -Wextra").split()
 # nvcc comes from PATH (e.g. `source .env`), so no CUDA version or location is hardcoded here.
 NVCC = os.environ.get("NVCC", "nvcc")
 NVCCFLAGS = os.environ.get(
-    "NVCCFLAGS", "-std=c++17 -O2 -Xcompiler=-Wall,-Wextra -Wno-deprecated-gpu-targets"
+    "NVCCFLAGS", "-std=c++17 -O2 -Xcompiler=-Wall,-Wextra -arch=native"
 ).split()
 # GoogleTest (libgtest-dev); gtest_main supplies main().
 LIBS = ["-lgtest", "-lgtest_main", "-lpthread"]
