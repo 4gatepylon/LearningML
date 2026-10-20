@@ -5,3 +5,32 @@
   - `main` always runs both implementations on the same inputs and compares their outputs.
   - `main` runs one or more tests, including at least one happy-path test, and prints whether the CPU and GPU answers matched.
 - Read `README.md` in this folder before starting work.
+- Lay out each file in three sections, in this order, each introduced by a banner (a line of 100 `/` characters, a title comment, another line of 100 `/` characters). `vector_add.cc` follows this template:
+
+  ```cpp
+  #include <...>
+
+  ////////////////////////////////////////////////////////////////////////////////////////////////////
+  // GPU implementations and CPU launch code/helpers
+  ////////////////////////////////////////////////////////////////////////////////////////////////////
+
+  void <name>_gpu(...) { ... }
+
+  ////////////////////////////////////////////////////////////////////////////////////////////////////
+  // CPU reference implementations
+  ////////////////////////////////////////////////////////////////////////////////////////////////////
+
+  void <name>_cpu(...) { ... }
+
+  ////////////////////////////////////////////////////////////////////////////////////////////////////
+  // Tests and main
+  ////////////////////////////////////////////////////////////////////////////////////////////////////
+
+  // Runs both implementations on the same inputs; returns true if outputs match.
+  static bool run_test(const char* name, ...) { ... }
+
+  int main() {
+    // one or more run_test calls (at least one happy path), then print the overall result
+    // and return nonzero if any test mismatched
+  }
+  ```
