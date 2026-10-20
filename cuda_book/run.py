@@ -5,6 +5,7 @@ Usage:
   ./run.py                    # build and run every *.cc file
   ./run.py vector_add         # build and run vector_add.cc
   ./run.py vector_add.cc      # same; the .cc extension is optional
+  ./run.py vec                # same, if vector_add.cc is the only file starting with "vec"
 """
 
 import argparse
@@ -19,11 +20,27 @@ CXX = os.environ.get("CXX", "g++")
 CXXFLAGS = os.environ.get("CXXFLAGS", "-std=c++17 -O2 -Wall -Wextra").split()
 
 
+def resolve(arg: str) -> str | None:
+    """Maps an argument to a program name: exact match, else a unique filename prefix match."""
+    files = sorted(p.name for p in HERE.glob("*.cc"))
+    for exact in (arg, f"{arg}.cc"):
+        if exact in files:
+            return exact.removesuffix(".cc")
+    matches = [f for f in files if f.startswith(arg)]
+    if len(matches) == 1:
+        return matches[0].removesuffix(".cc")
+    if matches:
+        print(
+            f"error: '{arg}' matches multiple files ({', '.join(matches)}); type more of the name",
+            file=sys.stderr,
+        )
+    else:
+        print(f"error: no .cc file matches '{arg}'", file=sys.stderr)
+    return None
+
+
 def build_and_run(name: str) -> bool:
     src = HERE / f"{name}.cc"
-    if not src.is_file():
-        print(f"error: {src.name} not found", file=sys.stderr)
-        return False
 
     ARTIFACTS.mkdir(exist_ok=True)
     exe = ARTIFACTS / name
@@ -37,12 +54,17 @@ def build_and_run(name: str) -> bool:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawTextHelpFormatter)
+    parser = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawTextHelpFormatter
+    )
     parser.add_argument("names", nargs="*", help="programs to run (default: all)")
     args = parser.parse_args()
 
-    names = [n.removesuffix(".cc") for n in args.names]
-    if not names:
+    if args.names:
+        names = [resolve(a) for a in args.names]
+        if None in names:
+            return 1
+    else:
         names = sorted(p.stem for p in HERE.glob("*.cc"))
 
     failed = []
