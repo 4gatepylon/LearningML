@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
-"""Build and test the standalone C++/CUDA programs in this folder (*.cc via g++, *.cu via nvcc).
+"""Build and test the standalone C++/CUDA programs in this folder and kernels/.
+
+*.cc files are built with g++ and *.cu files with nvcc.
 
 Usage:
   ./test.py                    # build and test every *.cc and *.cu file
@@ -27,10 +29,11 @@ NVCCFLAGS = os.environ.get(
 # GoogleTest (libgtest-dev); gtest_main supplies main().
 LIBS = ["-lgtest", "-lgtest_main", "-lpthread"]
 SUFFIXES = (".cc", ".cu")
+SOURCE_DIRS = (HERE, HERE / "kernels")
 
 
 def sources() -> list[Path]:
-    return sorted(p for p in HERE.iterdir() if p.suffix in SUFFIXES)
+    return sorted(p for d in SOURCE_DIRS if d.is_dir() for p in d.iterdir() if p.suffix in SUFFIXES)
 
 
 def resolve(arg: str) -> Path | None:

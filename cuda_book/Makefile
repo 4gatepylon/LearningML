@@ -5,7 +5,8 @@ ARTIFACTS := .artifacts
 CLANG_FORMAT ?= uv run clang-format
 CLANG_TIDY ?= uv run clang-tidy
 RUFF ?= uv run ruff
-SOURCES := $(wildcard *.cc *.cu *.cuh *.h)
+SOURCE_DIRS := . kernels
+SOURCES := $(foreach d,$(SOURCE_DIRS),$(wildcard $(d)/*.cc $(d)/*.cu $(d)/*.cuh $(d)/*.h))
 
 # No implicit rules: `make test vector_add` must not try to build `vector_add` itself.
 MAKEFLAGS += --no-builtin-rules
@@ -43,8 +44,8 @@ fmt:
 GCC_INSTALL := --gcc-install-dir=$(shell dirname $$($(CXX) -print-libgcc-file-name))
 # .cu files are linted as host-only CUDA; the toolkit root is derived from nvcc on PATH.
 CUDA_PATH ?= $(shell dirname $$(dirname $$(readlink -f $$(command -v nvcc))))
-CC_SOURCES := $(wildcard *.cc)
-CU_SOURCES := $(wildcard *.cu)
+CC_SOURCES := $(strip $(foreach d,$(SOURCE_DIRS),$(wildcard $(d)/*.cc)))
+CU_SOURCES := $(strip $(foreach d,$(SOURCE_DIRS),$(wildcard $(d)/*.cu)))
 
 tidy:
 	$(if $(CC_SOURCES),$(CLANG_TIDY) $(CC_SOURCES) -- $(CXXFLAGS) $(GCC_INSTALL))
