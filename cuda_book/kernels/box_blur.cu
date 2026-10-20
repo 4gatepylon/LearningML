@@ -94,3 +94,41 @@ TEST(BoxBlur, RadiusZero) {
   }
   ExpectCpuGpuMatch(in, width, height, 0);
 }
+
+// CPU only: runs box_blur_cpu and expects exactly the hand-computed `expected` image.
+static void ExpectCpuEquals(const std::vector<float>& in, int width, int height, int radius,
+                            const std::vector<float>& expected) {
+  ASSERT_EQ(in.size(), expected.size());
+  std::vector<float> out(in.size(), 0.0F);
+  box_blur_cpu(in.data(), out.data(), width, height, radius);
+  for (size_t i = 0; i < out.size(); ++i) {
+    ASSERT_NEAR(out[i], expected[i], 1e-5F) << "first mismatch at index " << i;
+  }
+}
+
+// CPU only: blurring a constant image leaves it unchanged, whatever the radius. This also checks
+// that edge pixels are averaged over only their in-bounds neighbors.
+TEST(BoxBlurCpu, ConstantImageStaysConstant) {
+  const int width = 6;
+  const int height = 4;
+  const std::vector<float> in(static_cast<size_t>(width) * height, 3.0F);
+  ExpectCpuEquals(in, width, height, 1, in);
+  ExpectCpuEquals(in, width, height, 2, in);
+}
+
+// CPU only: a single 9 in the middle of a zero 5x5 image with radius 1 spreads to a 3x3 patch of 1s
+// (9 / 9 each). The result doesn't depend on the edge rule since the patch is away from the edges.
+TEST(BoxBlurCpu, SinglePixelSpreadsToThreeByThree) {
+  const int width = 5;
+  const int height = 5;
+  std::vector<float> in(static_cast<size_t>(width) * height, 0.0F);
+  in[(2 * width) + 2] = 9.0F;
+
+  std::vector<float> expected(in.size(), 0.0F);
+  for (int i = 1; i <= 3; ++i) {
+    for (int j = 1; j <= 3; ++j) {
+      expected[(i * width) + j] = 1.0F;
+    }
+  }
+  ExpectCpuEquals(in, width, height, 1, expected);
+}

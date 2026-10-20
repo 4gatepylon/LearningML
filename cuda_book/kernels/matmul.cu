@@ -95,3 +95,31 @@ TEST(Matmul, VectorAndOuterProduct) {
   ExpectCpuGpuMatch(Pattern(16 * 10, 5), Pattern(10 * 1, 6), 16, 1, 10);
   ExpectCpuGpuMatch(Pattern(9 * 1, 7), Pattern(1 * 12, 8), 9, 12, 1);
 }
+
+// CPU only: runs matmul_cpu and expects exactly the hand-computed `expected` product.
+static void ExpectCpuEquals(const std::vector<float>& a, const std::vector<float>& b, int m, int n,
+                            int k, const std::vector<float>& expected) {
+  ASSERT_EQ(expected.size(), static_cast<size_t>(m) * static_cast<size_t>(n));
+  std::vector<float> c(expected.size(), 0.0F);
+  matmul_cpu(a.data(), b.data(), c.data(), m, n, k);
+  for (size_t i = 0; i < c.size(); ++i) {
+    ASSERT_NEAR(c[i], expected[i], 1e-5F) << "first mismatch at index " << i;
+  }
+}
+
+// CPU only: [[1, 2], [3, 4]] * [[5, 6], [7, 8]] = [[19, 22], [43, 50]].
+TEST(MatmulCpu, TwoByTwo) {
+  ExpectCpuEquals({1, 2, 3, 4}, {5, 6, 7, 8}, 2, 2, 2, {19, 22, 43, 50});
+}
+
+// CPU only: a 2x3 matrix times the 3x3 identity is unchanged.
+TEST(MatmulCpu, IdentityLeavesMatrixUnchanged) {
+  const std::vector<float> a = {1, 2, 3, 4, 5, 6};
+  const std::vector<float> identity = {1, 0, 0, 0, 1, 0, 0, 0, 1};
+  ExpectCpuEquals(a, identity, 2, 3, 3, a);
+}
+
+// CPU only: a 1x3 row times a 3x1 column is their dot product: 1*4 + 2*5 + 3*6 = 32.
+TEST(MatmulCpu, RowTimesColumnIsDotProduct) {
+  ExpectCpuEquals({1, 2, 3}, {4, 5, 6}, 1, 1, 3, {32});
+}
