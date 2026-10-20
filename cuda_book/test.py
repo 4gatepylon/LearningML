@@ -18,6 +18,8 @@ HERE = Path(__file__).resolve().parent
 ARTIFACTS = HERE / ".artifacts"
 CXX = os.environ.get("CXX", "g++")
 CXXFLAGS = os.environ.get("CXXFLAGS", "-std=c++17 -O2 -Wall -Wextra").split()
+# GoogleTest (libgtest-dev); gtest_main supplies main().
+LIBS = ["-lgtest", "-lgtest_main", "-pthread"]
 
 
 def resolve(arg: str) -> str | None:
@@ -44,7 +46,7 @@ def build_and_test(name: str) -> bool:
 
     ARTIFACTS.mkdir(exist_ok=True)
     exe = ARTIFACTS / name
-    compile_cmd = [CXX, *CXXFLAGS, str(src), "-o", str(exe)]
+    compile_cmd = [CXX, *CXXFLAGS, str(src), "-o", str(exe), *LIBS]
     print(" ".join(compile_cmd), flush=True)
     if subprocess.run(compile_cmd).returncode != 0:
         return False

@@ -2,12 +2,14 @@
 - Every C++ file (including ones with CUDA code) is a standalone executable tested with `make test <name>` (the `.cc` extension is optional; `make test` alone tests every file). Rules for these files:
   - One file per task/function. File names must NOT say cpu/gpu (e.g. `vector_add.cc`, not `vector_add_cpu.cc`).
   - Each file contains both a CPU reference implementation and a GPU implementation, named `<name>_cpu` and `<name>_gpu`. Usually the user implements both; if the user asks you to implement something, it's fine to implement only the CPU one.
-  - `main` always runs both implementations on the same inputs and compares their outputs.
-  - `main` runs one or more tests, including at least one happy-path test, and prints whether the CPU and GPU answers matched.
+  - Tests use GoogleTest (`TEST(...)`); do not write a `main`, since `gtest_main` supplies it.
+  - Every test runs both implementations on the same inputs and compares their outputs with `ASSERT_*`/`EXPECT_*` (use `*_NEAR` for floats).
+  - Write one or more tests, including at least one happy-path test.
 - Read `README.md` in this folder before starting work.
 - Lay out each file in three sections, in this order, each introduced by a banner (a line of 100 `/` characters, a title comment, another line of 100 `/` characters). `vector_add.cc` follows this template:
 
   ```cpp
+  #include <gtest/gtest.h>
   #include <...>
 
   ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -23,14 +25,15 @@
   void <name>_cpu(...) { ... }
 
   ////////////////////////////////////////////////////////////////////////////////////////////////////
-  // Tests and main
+  // Tests (main comes from gtest_main)
   ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-  // Runs both implementations on the same inputs; returns true if outputs match.
-  static bool run_test(const char* name, ...) { ... }
+  // Runs both implementations on the same inputs and expects the outputs to match.
+  static void ExpectCpuGpuMatch(...) { ... }
 
-  int main() {
-    // one or more run_test calls (at least one happy path), then print the overall result
-    // and return nonzero if any test mismatched
-  }
+  // Happy path.
+  TEST(<Name>, HappyPath) { ... ExpectCpuGpuMatch(...); }
+
+  // Further tests: edge cases, odd sizes, etc.
+  TEST(<Name>, <Case>) { ... }
   ```
