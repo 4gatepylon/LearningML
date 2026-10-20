@@ -18,7 +18,7 @@ help:
 	@echo "  make help             Show this message"
 	@echo "  make test [name ...]  Build and test <name>.cc (.cc optional); with no name, test every .cc"
 	@echo "  make fmt              Format C++ (clang-format) and Python (ruff) files in place"
-	@echo "  make tidy             Lint C++ (clang-tidy) and Python (ruff) files"
+	@echo "  make tidy             Lint .cc/.cu (clang-tidy; .cu needs nvcc on PATH) and Python (ruff) files"
 	@echo "  make clean            Remove $(ARTIFACTS)/"
 	@echo ""
 	@echo "Example: make test vector_add"
@@ -40,8 +40,15 @@ fmt:
 	$(RUFF) check --select I --fix .
 
 # clang-tidy can't always find libstdc++ headers on its own, so point it at g++'s install.
+GCC_INSTALL := --gcc-install-dir=$(shell dirname $$($(CXX) -print-libgcc-file-name))
+# .cu files are linted as host-only CUDA; the toolkit root is derived from nvcc on PATH.
+CUDA_PATH ?= $(shell dirname $$(dirname $$(readlink -f $$(command -v nvcc))))
+CC_SOURCES := $(wildcard *.cc)
+CU_SOURCES := $(wildcard *.cu)
+
 tidy:
-	$(CLANG_TIDY) $(wildcard *.cc) -- $(CXXFLAGS) --gcc-install-dir=$(shell dirname $$($(CXX) -print-libgcc-file-name))
+	$(if $(CC_SOURCES),$(CLANG_TIDY) $(CC_SOURCES) -- $(CXXFLAGS) $(GCC_INSTALL))
+	$(if $(CU_SOURCES),$(CLANG_TIDY) $(CU_SOURCES) -- -x cuda --cuda-path=$(or $(CUDA_PATH),$(error nvcc not found on PATH; source .env or set CUDA_PATH)) --cuda-host-only -nocudalib $(CXXFLAGS) $(GCC_INSTALL))
 	$(RUFF) check .
 
 clean:
