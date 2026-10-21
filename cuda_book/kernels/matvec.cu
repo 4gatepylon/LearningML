@@ -9,10 +9,10 @@
 
 // TODO: kernel. a = B * c, with B an N x N row-major matrix and a, c vectors of length N.
 // One thread computes one element of a.
-__global__ void matvec_kernel_on_gpu(float* a, const float* b, const float* c, int n) {}
+__global__ void matvec_kernel_on_gpu(float* a_d, const float* B_d, const float* c_d, int n) {}
 
 // a = B * c on the GPU, with B N x N row-major and a, c of length N.
-void matvec_gpu(float* a, const float* b, const float* c, int n) {
+void matvec_gpu(float* a_h, const float* B_h, const float* c_h, int n) {
   // TODO: allocate, copy, launch, copy back, free.
 }
 
@@ -21,7 +21,7 @@ void matvec_gpu(float* a, const float* b, const float* c, int n) {
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 // a = B * c on the CPU, with B N x N row-major and a, c of length N.
-void matvec_cpu(float* a, const float* b, const float* c, int n) {
+void matvec_cpu(float* a_h, const float* B_h, const float* c_h, int n) {
   // TODO: a_i = sum_j B[i][j] * c[j].
 }
 
@@ -47,20 +47,20 @@ static ::testing::AssertionResult NotAllZero(const std::vector<float>& a, const 
 // Runs both implementations on the same inputs and expects the outputs to match (stops at the first
 // mismatch). Inputs must be positive so the expected output is never all zero. The tolerance scales
 // with n since summation order may differ between CPU and GPU.
-static void ExpectCpuGpuMatch(const std::vector<float>& b, const std::vector<float>& c, int n) {
-  ASSERT_EQ(b.size(), static_cast<size_t>(n) * static_cast<size_t>(n));
-  ASSERT_EQ(c.size(), static_cast<size_t>(n));
-  std::vector<float> a_cpu(static_cast<size_t>(n), 0.0F);
-  std::vector<float> a_gpu(static_cast<size_t>(n), 0.0F);
+static void ExpectCpuGpuMatch(const std::vector<float>& B_h, const std::vector<float>& c_h, int n) {
+  ASSERT_EQ(B_h.size(), static_cast<size_t>(n) * static_cast<size_t>(n));
+  ASSERT_EQ(c_h.size(), static_cast<size_t>(n));
+  std::vector<float> a_cpu_h(static_cast<size_t>(n), 0.0F);
+  std::vector<float> a_gpu_h(static_cast<size_t>(n), 0.0F);
 
-  matvec_cpu(a_cpu.data(), b.data(), c.data(), n);
-  matvec_gpu(a_gpu.data(), b.data(), c.data(), n);
+  matvec_cpu(a_cpu_h.data(), B_h.data(), c_h.data(), n);
+  matvec_gpu(a_gpu_h.data(), B_h.data(), c_h.data(), n);
 
-  ASSERT_TRUE(NotAllZero(a_cpu, "matvec_cpu"));
-  ASSERT_TRUE(NotAllZero(a_gpu, "matvec_gpu"));
+  ASSERT_TRUE(NotAllZero(a_cpu_h, "matvec_cpu"));
+  ASSERT_TRUE(NotAllZero(a_gpu_h, "matvec_gpu"));
   const float tol = 1e-5F * static_cast<float>(n > 1 ? n : 1);
-  for (size_t i = 0; i < a_cpu.size(); ++i) {
-    ASSERT_NEAR(a_cpu[i], a_gpu[i], tol) << "first mismatch at index " << i;
+  for (size_t i = 0; i < a_cpu_h.size(); ++i) {
+    ASSERT_NEAR(a_cpu_h[i], a_gpu_h[i], tol) << "first mismatch at index " << i;
   }
 }
 
@@ -95,13 +95,13 @@ TEST(Matvec, Large) {
 }
 
 // CPU only: runs matvec_cpu and expects exactly the hand-computed `expected` product.
-static void ExpectCpuEquals(const std::vector<float>& b, const std::vector<float>& c, int n,
+static void ExpectCpuEquals(const std::vector<float>& B_h, const std::vector<float>& c_h, int n,
                             const std::vector<float>& expected) {
   ASSERT_EQ(expected.size(), static_cast<size_t>(n));
-  std::vector<float> a(expected.size(), 0.0F);
-  matvec_cpu(a.data(), b.data(), c.data(), n);
-  for (size_t i = 0; i < a.size(); ++i) {
-    ASSERT_NEAR(a[i], expected[i], 1e-5F) << "first mismatch at index " << i;
+  std::vector<float> a_h(expected.size(), 0.0F);
+  matvec_cpu(a_h.data(), B_h.data(), c_h.data(), n);
+  for (size_t i = 0; i < a_h.size(); ++i) {
+    ASSERT_NEAR(a_h[i], expected[i], 1e-5F) << "first mismatch at index " << i;
   }
 }
 
@@ -110,6 +110,6 @@ TEST(MatvecCpu, TwoByTwo) { ExpectCpuEquals({1, 2, 3, 4}, {5, 6}, 2, {17, 39}); 
 
 // CPU only: the identity matrix leaves the vector unchanged.
 TEST(MatvecCpu, IdentityLeavesVectorUnchanged) {
-  const std::vector<float> c = {1, 2, 3};
-  ExpectCpuEquals({1, 0, 0, 0, 1, 0, 0, 0, 1}, c, 3, c);
+  const std::vector<float> c_h = {1, 2, 3};
+  ExpectCpuEquals({1, 0, 0, 0, 1, 0, 0, 0, 1}, c_h, 3, c_h);
 }
