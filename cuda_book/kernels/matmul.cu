@@ -14,6 +14,8 @@ __global__ void matmul_kernel_on_gpu(const float* a, const float* b, float* c, i
 // C = A * B on the GPU, with A m x k, B k x n and C m x n, all row-major.
 void matmul_gpu(const float* a, const float* b, float* c, int m, int n, int k) {
   // TODO: allocate, copy, launch, copy back, free.
+  // TODO(hadriano) support tile-based coarsening in both axes (so each individual does a single tile loop-nest and the tile
+  // size can default be 1 for fully parallel; however the k tile dim is 1 always because idk how to do synchronization)
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
