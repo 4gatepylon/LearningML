@@ -22,7 +22,53 @@ void matmul_gpu(const float* a, const float* b, float* c, int m, int n, int k) {
 
 // C = A * B on the CPU, with A m x k, B k x n and C m x n, all row-major.
 void matmul_cpu(const float* a, const float* b, float* c, int m, int n, int k) {
-  // TODO
+  // TODO(hadriano) implement some way of parameterizing the loop orderings and be able to
+  // cost-model.
+  // TODO(hadriano) learn to use sanitize.
+
+  // Left matrix is A: [m x k]
+  // Right matrix is B: [k x n]
+  // Output matrix is C: [m x n]
+  const int m_tile_size = 16;
+  const int n_tile_size = 16;
+  const int k_tile_size = 16;
+  // Outer nest
+  for (int m_tile_offset_2d = 0; m_tile_offset_2d < m; m_tile_offset_2d += m_tile_size) {
+    for (int n_tile_offset_2d = 0; n_tile_offset_2d < n; n_tile_offset_2d += n_tile_size) {
+      for (int k_tile_offset_2d = 0; k_tile_offset_2d < k; k_tile_offset_2d += k_tile_size) {
+        // Inner nest
+        for (int m_tile_idx_2d = 0;
+             m_tile_idx_2d < m_tile_size && m_tile_offset_2d + m_tile_idx_2d < m; m_tile_idx_2d++) {
+          for (int n_tile_idx_2d = 0;
+               n_tile_idx_2d < n_tile_size && n_tile_offset_2d + n_tile_idx_2d < n;
+               n_tile_idx_2d++) {
+            // Output write index
+            for (int k_tile_idx_2d = 0;
+                 k_tile_idx_2d < k_tile_size && k_tile_offset_2d + k_tile_idx_2d < k;
+                 k_tile_idx_2d++) {
+              // Get locations in the array
+              const int m_idx_2d = m_tile_offset_2d + m_tile_idx_2d;
+              const int n_idx_2d = n_tile_offset_2d + n_tile_idx_2d;
+              const int k_idx_2d = k_tile_offset_2d + k_tile_idx_2d;
+              // We want to do this:
+              // c[m_global_idx][n_global_idx] +=
+              //     a[m_global_idx][k_global_idx] * b[k_global_idx][n_global_idx];
+              const int a_idx_1d =
+                  m_idx_2d * k +
+                  k_idx_2d;  // a is [m x k] where k is the width, so we need to increase by k
+              const int b_idx_1d =
+                  k_idx_2d * n +
+                  n_idx_2d;  // b is [k x n] where n is the width, so we need to increase by n
+              const int c_idx_1d =
+                  m_idx_2d * n +
+                  n_idx_2d;  // c is [m x n] where n is the width, so we need to increase by n
+              c[c_idx_1d] += a[a_idx_1d] * b[b_idx_1d];
+            }
+          }
+        }
+      }
+    }
+  }
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////

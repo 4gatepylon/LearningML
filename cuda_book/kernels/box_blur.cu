@@ -1,6 +1,8 @@
 #include <cuda_runtime.h>
 #include <gtest/gtest.h>
 
+#include <algorithm>
+#include <cassert>
 #include <vector>
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -23,7 +25,26 @@ void box_blur_gpu(const float* in, float* out, int width, int height, int radius
 
 // Box blur of a row-major width x height single-channel image on the CPU.
 void box_blur_cpu(const float* in, float* out, int width, int height, int radius) {
-  // TODO
+  for (int i = 0; i < height; i++) {
+    for (int j = 0; j < width; j++) {
+      float sum = 0;
+      const int imin = std::max(i - radius, 0);
+      const int imax = std::min(i + radius, height - 1);
+      const int jmin = std::max(j - radius, 0);
+      const int jmax = std::min(j + radius, width - 1);
+      const int count = (imax - imin + 1) * (jmax - jmin + 1);
+      assert(count > 0);
+
+      const int output_address = i * width + j;
+      for (int ii = imin; ii <= imax; ii++) {
+        for (int jj = jmin; jj <= jmax; jj++) {
+          const int input_address = ii * width + jj;
+          sum += in[input_address];
+        }
+      }
+      out[output_address] = sum / count;
+    }
+  }
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
