@@ -40,5 +40,8 @@
   // Further tests: edge cases, odd sizes, etc.
   TEST(<Name>, <Case>) { ... }
   ```
+- Variable naming convention (for new code; existing kernels are older and don't follow it yet, so don't rewrite them just for this):
+  - Matrices and higher-order tensors have capitalized names (`A`, `B`); vectors and scalars have lowercase names (`a`, `b`).
+  - Suffix `_h` for data on the host/CPU and `_d` for data on the device/GPU (e.g. `A_h`, `A_d`, `x_h`, `x_d`).
 
 > NOTE: if any of this is outdated notify the user.
