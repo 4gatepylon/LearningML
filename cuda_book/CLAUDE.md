@@ -7,6 +7,21 @@
   - Write one or more tests, including at least one happy-path test.
 - Read `README.md` in this folder before starting work.
 - New exercise files go in `kernels/`. `megakernels/` holds megakernels, each in its own subfolder (currently `naive_pytorch_v0`) with its own `README.md`; it is not part of the test setup (see `megakernels/README.md`).
+- Keep plans out of `README.md`s (they describe what exists and how to use it). Multi-step work gets an ephemeral `PLAN.md` in the folder it concerns, so agents and the user can share the plan: check items off and append to the work log as you go, and delete `PLAN.md` once every item is done. Template:
+
+  ```markdown
+  # Plan: <title>
+
+  ## Description
+  <What we're building and why, in a few sentences.>
+
+  ## Checklist
+  - [ ] <step>
+  - [ ] <step>
+
+  ## Work log
+  - YYYY-MM-DD: <what was done, decisions made, open issues>
+  ```
 - Use a `.cu` file for anything with CUDA code (built with `nvcc`) and a `.cc` file for plain C++ (built with `g++`). `test.py` picks the compiler from the extension.
 - Never hardcode flags, paths or versions that are specific to a host's build setup (CUDA version or location, GPU architecture, driver-specific workarounds) in `test.py`, the Makefile or the source. The user may use different CUDA versions on different hosts; take them from the environment (e.g. `nvcc` from `PATH` via `.env`). If hardcoding seems necessary, ask the user first.
 - Lay out each file in three sections, in this order, each introduced by a banner (a line of 100 `/` characters, a title comment, another line of 100 `/` characters). `kernels/vector_add.cc` follows this template:
