@@ -42,3 +42,10 @@ make test           # no name: build and test every file in kernels/
 For example, `make test vector_add` (builds `kernels/vector_add.cu`). Run `make help` to see all targets.
 
 Object files and binaries are stored in `./.artifacts/` (gitignored). `make clean` removes that folder.
+
+## Megakernels
+
+The `megakernels/` folder holds megakernels, each in its own subfolder. They are not built or tested
+by `make test`. Currently there is one: [`naive_pytorch_v0`](megakernels/naive_pytorch_v0/README.md),
+which compiles static PyTorch graphs into a single forward-pass megakernel. See
+[`megakernels/README.md`](megakernels/README.md).
