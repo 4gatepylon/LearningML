@@ -44,5 +44,6 @@
   - Matrices and higher-order tensors have capitalized names (`A`, `B`); vectors and scalars have lowercase names (`a`, `b`).
   - Suffix `_h` for data on the host/CPU and `_d` for data on the device/GPU (e.g. `A_h`, `A_d`, `x_h`, `x_d`).
   - `kernels/matvec.cu` follows this convention; use it as the example.
+- If `nvidia-smi`/`nvcc` isn't found or other GPU/CUDA commands fail, it's likely due to missing environment variables (e.g. `PATH`, `.env`) or a sandbox, not a broken setup. Don't work around it; ask the user.
 
 > NOTE: if any of this is outdated notify the user.
