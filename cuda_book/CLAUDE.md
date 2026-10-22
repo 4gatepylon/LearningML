@@ -7,6 +7,7 @@
   - Write one or more tests, including at least one happy-path test.
 - Read `README.md` in this folder before starting work.
 - New exercise files go in `kernels/`. `megakernels/` holds megakernels, each in its own subfolder (currently `naive_pytorch_v0`) with its own `README.md`; it is not part of the test setup (see `megakernels/README.md`).
+- Write `README.md`s in the present tense, describing the project in its completed state even if it isn't finished yet (e.g. "`run.py` decodes the prompts", not "`run.py` will decode the prompts"). Future-tense and planning content ("X will go here") belongs in `PLAN.md`.
 - Keep plans out of `README.md`s (they describe what exists and how to use it). Multi-step work gets an ephemeral `PLAN.md` in the folder it concerns, so agents and the user can share the plan: check items off and append to the work log as you go, and delete `PLAN.md` once every item is done. Template:
 
   ```markdown
