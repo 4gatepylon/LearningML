@@ -63,4 +63,13 @@ else is required.
 > NOTE: `cuda_book/` is separate from this template and doesn't necessarily follow it. It keeps its
 > own layout and rules (see `cuda_book/CLAUDE.md`).
 
+## Documenting the system
+
+Documentation of the system (GPU model, compute capability, clocks, power limit, driver and toolkit
+versions, OS, and so on) exists so that results can be reproduced. Record the settings that
+determine or explain a result. Don't record observations that are likely temporary or that don't
+matter for reproducing results, such as a tool failing to run, a permission or install quirk, or
+which GPUs are busy right now. If something like that gets in your way, tell the user instead of
+writing it into the docs.
+
 > NOTE: if any of this is outdated notify the user.
