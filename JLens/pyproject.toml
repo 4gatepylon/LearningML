@@ -1,0 +1,15 @@
+[project]
+name = "jlens-model-playground"
+version = "0.1.0"
+description = "Minimal LFM inference and PyTorch activation-hook example"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "datasets>=4.0.0",
+    "torch>=2.6.0",
+    "transformers>=4.57.0",
+    "zstandard>=0.23.0",
+]
+
+[tool.uv]
+package = false
