@@ -71,3 +71,8 @@ running them back to back, more than once.
 > minor-version compatibility; check it first if a launch fails with a driver/runtime mismatch.
 
 > NOTE: `ncu` may fail with `ERR_NVGPUCTRPERM` if the driver restricts performance counters to root.
+
+> NOTE: The "datasheet boost" clock (1.620 GHz) is not measured. It's implied by NVIDIA's datasheet
+> peak of about 756 TFLOPS dense bf16: 756.4e12 / (114 SMs * 4096 FLOP/clk/SM) = 1.620 GHz. The
+> driver reports a higher max SM clock (1.755 GHz, hence 819.5 TFLOPS). Under sustained load, the
+> 310 W power cap pulls the clock below both, so cuBLAS gets about 400 TFLOPS.
