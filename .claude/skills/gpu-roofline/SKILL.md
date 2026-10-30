@@ -13,6 +13,8 @@ kernel folder's env file first, e.g. `source optimizing_matmul/.env` (copied fro
 device first, since other jobs on the same GPU distort the numbers. On the `align-4` host the user
 wants device 2 (`CUDA_VISIBLE_DEVICES=2`).
 
+> NOTE: This may change and likely varies across machines. Ask the user if you are ever uncertain.
+
 ## 1. Get the peaks (once per GPU)
 
 ```
