@@ -49,6 +49,7 @@ into `.build/`, runs its GoogleTest tests, and benchmarks it only if they all pa
 make run-cublas                                  # test, then benchmark at N = 8192
 make run-cublas MATMUL_ARGS='--n 4096 --tries 50 --warmup-ms 1000'
 make test-cublas MATMUL_ARGS=--gtest_filter=Cublas.*   # tests only, optionally filtered
+make fmt && make tidy                            # clang-format / clang-tidy (cuda_book's configs)
 ```
 
 ## What the hardware can do
@@ -70,9 +71,12 @@ WGMMA) is capped near 51 TFLOPS.
 time at N = 8192: 1.0995e12 / 756.4e12 = 1.45 ms (datasheet boost), / 819.5e12 = 1.34 ms (max clock)
 ```
 
-**cuBLAS reference** (`make run-cublas`): 2.72 ms min and median, about 404 TFLOPS, 53% of the
-datasheet ceiling. Under sustained load the card sits at its 310 W power cap, which is why it falls
-well short of the ceiling. This is the bar to approach.
+**cuBLAS reference** (`make run-cublas`): min 2.72-2.82 ms (390-404 TFLOPS), median 2.72-2.92 ms
+(376-404 TFLOPS) across runs, about 53% of the datasheet ceiling. Under sustained load the card sits
+at its 310 W power cap, which is why it falls well short of the ceiling. This is the bar to approach.
+
+Times land on discrete steps (2.725, 2.772, 2.820, 2.923 ms) as the clock settles at a different
+level from run to run, so compare implementations by running them back to back, more than once.
 
 ## Notes
 

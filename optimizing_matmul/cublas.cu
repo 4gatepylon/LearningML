@@ -3,4 +3,4 @@
 
 MATMUL_TESTS(Cublas, matmul_cublas)
 
-int main(int argc, char **argv) { return run_matmul("cublas", matmul_cublas, argc, argv); }
+int main(int argc, char** argv) { return run_matmul("cublas", matmul_cublas, argc, argv); }
