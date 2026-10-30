@@ -62,14 +62,10 @@ Put the plot in the scratchpad unless the user wants it saved, and show it to th
 
 ## Nsight Compute
 
-`ncu --set roofline` would measure FLOPs and bytes from hardware counters and draw a hierarchical
-roofline. On `align-4` it does not work. The `ncu` wrapper picks the newest install,
-`/opt/nvidia/nsight-compute/2026.3.1`, which fails with "failed to connect to the CUDA driver"
-(likely too new for driver 545). The older `/opt/nvidia/nsight-compute/2025.1.1/ncu` connects but
-fails with `ERR_NVGPUCTRPERM`: counters are admin-only (`RmProfilingAdminOnly: 1`) and there is no
-passwordless sudo. On another host, check with a quick
-`ncu --launch-count 1 --metrics dram__bytes_read.sum <binary>` before relying on it. Note that
-`ncu` locks clocks to base by default (`--clock-control none` to disable).
+`ncu --set roofline` measures FLOPs and bytes from hardware counters and draws a hierarchical
+roofline. Before relying on it, check that it runs with a quick
+`ncu --launch-count 1 --metrics dram__bytes_read.sum <binary>`. By default `ncu` locks clocks to
+base (`--clock-control none` disables that), so its timings are slower than normal runs.
 
 ## Reference: NVIDIA H100 PCIe on align-4, device 2 (2026-10-30)
 

@@ -21,7 +21,7 @@ GPU 2 of 4, selected with `CUDA_VISIBLE_DEVICES=2` (set by `.env`).
 | Memory | 80 GB HBM2e, 5120-bit bus, 1593 MHz |
 | Power limit | 310 W (default and maximum) |
 | OS / CPU | Ubuntu 22.04.5, kernel 5.15.0-176, AMD EPYC 7543, 1 TiB RAM |
-| Driver / CUDA | 545.23.08 / toolkit 12.8 (`nvcc` 12.8.93); `ncu` can't profile here (see notes) |
+| Driver / CUDA | 545.23.08 / toolkit 12.8 (`nvcc` 12.8.93, with `ncu` and `nsys`) |
 
 `nvcc` is not on `PATH` by default. Copy `.env.example` to `.env` (git-ignored, since the CUDA
 version is per host) and `source .env`.
@@ -70,8 +70,4 @@ running them back to back, more than once.
 > NOTE: `nvidia-smi` reports CUDA 12.3 (the driver's maximum) but the toolkit is 12.8. This works via
 > minor-version compatibility; check it first if a launch fails with a driver/runtime mismatch.
 
-> NOTE: `ncu` can't profile on this machine. The `ncu` on `PATH` runs the newest install, Nsight
-> Compute 2026.3.1 in `/opt/nvidia/nsight-compute`, which fails with "failed to connect to the CUDA
-> driver" (likely too new for driver 545). The older `/opt/nvidia/nsight-compute/2025.1.1/ncu`
-> connects but fails with `ERR_NVGPUCTRPERM`: performance counters are restricted to admins
-> (`RmProfilingAdminOnly: 1`).
+> NOTE: `ncu` may fail with `ERR_NVGPUCTRPERM` if the driver restricts performance counters to root.
