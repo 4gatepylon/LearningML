@@ -26,4 +26,38 @@ These rules apply to the whole repository. Folders can add their own rules in th
   by hand: open the PRs with `gh pr create --base <branch below>`, then link them into a stack on
   GitHub.
 
+## Kernel folders
+
+A kernel folder (e.g. `optimizing_matmul/`) mixes three languages. CUDA (`.cu`) implements the
+kernels. C++ (`.cc`) provides host-side stubs, such as launch wrappers and `main`s, and light
+orchestration. Python (`.py`) is for scripts: building, orchestrating tests, benchmarking and
+plotting.
+
+Every kernel folder implements this tree. Entries marked "optional" may be left out; everything
+else is required.
+
+```
+<folder>/
+├── README.md                    # what it does and how to run it (present tense)
+├── CLAUDE.md                    # optional: folder-specific rules
+├── Makefile                     # entry points: make test, make fmt, make tidy, make clean
+├── .gitignore                   # ignores .build/
+├── .env.example                 # puts nvcc on PATH and sets CUDA_VISIBLE_DEVICES; copy to .env
+├── .clang-format, .clang-tidy   # copies of cuda_book's (Google style, 100 columns)
+├── pyproject.toml, ruff.toml    # uv project for the Python scripts and tools (ruff, clang-*)
+├── kernels/                     # .cu: the kernels, one kernel/task per file
+├── host/                        # optional: .cc stubs and orchestration
+├── tests/                       # GoogleTest tests (.cu/.cc)
+├── scripts/                     # .py: build/test orchestration, benchmarks, plots
+└── .build/                      # build outputs (git-ignored)
+```
+
+- Before committing, run `make fmt` (clang-format and ruff) and `make tidy` (clang-tidy and ruff).
+  Both must come back clean for the folder's own files.
+- Never hardcode host-specific settings (CUDA version or path, GPU architecture). Take them from
+  the environment (`.env`), and build with `-arch=native`.
+
+> NOTE: `cuda_book/` is separate from this template and doesn't necessarily follow it. It keeps its
+> own layout and rules (see `cuda_book/CLAUDE.md`).
+
 > NOTE: if any of this is outdated notify the user.
