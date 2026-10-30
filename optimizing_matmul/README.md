@@ -1,0 +1,1 @@
+This is a 3 hour-ish exercise in trying to optimize a matmul kernel with AI help for implementation. The idea is to be able to call all the shots algorithmically, but have the AI do experiments. This is on a single H100.
