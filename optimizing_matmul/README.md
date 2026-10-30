@@ -24,6 +24,21 @@ GPU 2 of 4, selected with `CUDA_VISIBLE_DEVICES=2` (set by `.env`).
 `nvcc` is not on `PATH` by default. Copy `.env.example` to `.env` (git-ignored, since the CUDA
 version is per host) and `source .env`.
 
+## Code layout
+
+`common/` holds shared headers, `kernels/` one matmul implementation per `.cu` file, and `tests/`
+tests of the shared code. Every `.cu` file is a standalone GoogleTest executable, built into
+`.build/` (git-ignored) by the `Makefile`:
+
+```
+make test-<name>   # build and run kernels/<name>.cu or tests/<name>.cu
+make test          # every kernel and test
+make fmt           # clang-format, configured like cuda_book (Google style, 100 columns)
+make tidy          # clang-tidy, configured like cuda_book
+```
+
+`make fmt` and `make tidy` use the tools from `cuda_book`'s uv environment (run `uv sync` there).
+
 ## What the hardware can do
 
 ```
