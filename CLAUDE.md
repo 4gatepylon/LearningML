@@ -45,8 +45,11 @@ else is required.
 ├── .env.example                 # puts nvcc on PATH and sets CUDA_VISIBLE_DEVICES; copy to .env
 ├── .clang-format, .clang-tidy   # copies of cuda_book's (Google style, 100 columns)
 ├── pyproject.toml, ruff.toml    # uv project for the Python scripts and tools (ruff, clang-*)
+├── common/                      # optional: shared code used by both kernels and host code
 ├── kernels/                     # .cu: the kernels, one kernel/task per file
+│   └── common/                  # optional: shared CUDA code (.cuh)
 ├── host/                        # optional: .cc stubs and orchestration
+│   └── common/                  # optional: shared host code (.h)
 ├── tests/                       # GoogleTest tests (.cu/.cc)
 ├── scripts/                     # .py: build/test orchestration, benchmarks, plots
 └── .build/                      # build outputs (git-ignored)
