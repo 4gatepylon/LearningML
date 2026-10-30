@@ -1,6 +1,16 @@
 These rules apply to the whole repository. Folders can add their own rules in their own `CLAUDE.md`
 (e.g. `cuda_book/CLAUDE.md`).
 
+## Pull requests
+
+- Keep each PR small enough to review: at most 200 non-blank lines of hand-written code (source,
+  scripts, build files and configs, comments included), counting added and changed lines. Prose
+  such as READMEs doesn't count, but keep it minimal. Split larger changes into stacked PRs (below).
+- Lockfiles and verbatim copies of existing files don't count.
+- Generated code (output of a script or compiler) doesn't count either, but commit it only if the
+  user agrees. A PR may go well over 200 lines this way: the limit is on what reviewers read.
+- State the reviewable line count in the PR description.
+
 ## Stacked pull requests
 
 - When a change splits into a sequence of dependent pieces, make one PR per logical piece and stack
