@@ -33,7 +33,20 @@ Python projects:
 - `make test`: runs all the tests.
 - `make fmt`: formats and lints the code with ruff (`ruff format` and `ruff check`), so a separate
   `tidy` is usually not needed.
-- `make clean`: only when the project has build outputs to remove (e.g. a `dist/` or `.build/` or `./data` or `./artifacts`; the last of these is usually used for ML projects' weights and other results that may be too large to commit).
+- `make clean`: only when the project has build outputs to remove (`.build/`). It never removes
+  `.data/` or `.artifacts/` (see "Uncommitted files" in the root `CLAUDE.md`).
+
+ML training projects: the Python targets, plus:
+
+- `make reset-artifacts`: deletes `.artifacts/` (weights, checkpoints, logs, results) after the
+  user types `yes` to a warning that recreating it may mean rerunning costly experiments:
+
+```make
+reset-artifacts:
+	@printf "This deletes .artifacts/. Recreating it may mean rerunning costly experiments.\n"
+	@printf "Type yes to continue: "; read answer; [ "$$answer" = yes ]
+	rm -rf .artifacts
+```
 
 ## Target names
 

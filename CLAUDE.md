@@ -51,6 +51,37 @@ decide, list in the PR with a short rationale. Follow the `experiment-decisions`
 (`.claude/skills/experiment-decisions/`) for when to ask, the template, and where the list goes
 (PR description or a per-experiment `DECISIONS.md`).
 
+## Uncommitted files
+
+Everything that must not be committed (compiler output, generated code, datasets, weights, run
+outputs) goes in one of these git-ignored folders at the root of its project folder (e.g.
+`optimizing_matmul/.build/`), never at the repository root or next to the sources. Any other
+git-ignored folder a project needs is dot-prefixed too. Each project's `.gitignore` lists its
+folders, and its README says which scripts write to them.
+
+| Folder | Holds | Recreated by | Removed by |
+| --- | --- | --- | --- |
+| `.build/` | compiler output and generated code: binaries, object files, code written by scripts | rebuilding | `make clean` |
+| `.data/` | datasets, downloaded or preprocessed, one `.data/<dataset>/` each | the download or prepare script the README names | by hand only |
+| `.artifacts/` | run outputs: weights, checkpoints, logs, profiler reports, raw benchmark output, plots | rerunning, which may be costly | `make reset-artifacts` |
+
+- **Runs:** a script writes each run to `.artifacts/<script>/<run_id>/`. `<script>` is the
+  script's file stem (`bench`, `train`), and `<run_id>` is the UTC start time, `YYYYMMDD-HHMMSS`,
+  optionally followed by `-<label>`, so the newest run sorts last.
+- **Provenance:** each run folder has a `command.txt` with the exact command line and the git
+  commit (`git describe --always --dirty`), so a past result can be found, read and reproduced.
+- **Paths:** scripts build these paths from the project folder (`Path(__file__)`), not from the
+  current directory.
+
+By project type:
+
+- **Kernel folders:** `.build/` and `.artifacts/` (profiler reports, raw benchmark output, plots).
+- **ML training projects:** `.data/`, `.artifacts/`, and `.build/` if anything is compiled.
+  `make reset-artifacts` deletes `.artifacts/` only after the user types `yes` to a warning that
+  recreating it may mean rerunning costly experiments.
+- **Other software projects:** there is no rule yet. Before creating any git-ignored folder, tell
+  the user there is no guidance for this project type and ask for it.
+
 ## Kernel folders
 
 A kernel folder (e.g. `optimizing_matmul/`) mixes three languages. CUDA (`.cu`) implements the
@@ -66,7 +97,7 @@ else is required.
 ├── README.md                    # what it does and how to run it (present tense)
 ├── CLAUDE.md                    # optional: folder-specific rules
 ├── Makefile                     # entry points: make help, test, fmt, tidy, clean (makefiles skill)
-├── .gitignore                   # ignores .build/
+├── .gitignore                   # ignores .build/ and .artifacts/
 ├── .env.example                 # puts nvcc on PATH and sets CUDA_VISIBLE_DEVICES; copy to .env
 ├── .clang-format, .clang-tidy   # copies of cuda_book's (Google style, 100 columns)
 ├── pyproject.toml, ruff.toml    # uv project for the Python scripts and tools (ruff, clang-*)
@@ -77,7 +108,8 @@ else is required.
 │   └── common/                  # optional: shared host code (.h)
 ├── tests/                       # GoogleTest tests (.cu/.cc)
 ├── scripts/                     # .py: build/test orchestration, benchmarks, plots
-└── .build/                      # build outputs (git-ignored)
+├── .build/                      # build outputs (git-ignored; see Uncommitted files)
+└── .artifacts/                  # run outputs: profiles, raw benchmark output, plots (git-ignored)
 ```
 
 - Write the Makefile with the `makefiles` skill (`.claude/skills/makefiles/`).
