@@ -36,6 +36,14 @@ These rules apply to the whole repository. Folders can add their own rules in th
   by hand: open the PRs with `gh pr create --base <branch below>`, then link them into a stack on
   GitHub.
 
+## Experiments, evaluations and benchmarks
+
+For experiments, evaluations and benchmarks (anything that compares options or ablates
+something), let the user make the important decisions: ask rather than choose. Whatever you do
+decide, list in the PR with a short rationale. Follow the `experiment-decisions` skill
+(`.claude/skills/experiment-decisions/`) for when to ask, the template, and where the list goes
+(PR description or a per-experiment `DECISIONS.md`).
+
 ## Kernel folders
 
 A kernel folder (e.g. `optimizing_matmul/`) mixes three languages. CUDA (`.cu`) implements the
