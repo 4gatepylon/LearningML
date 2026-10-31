@@ -10,6 +10,7 @@
  * - `matmul.matches_cublas_large_random_normal`: Checks every kernel against cuBLAS at a large N.
  * - `matmul.sign_*`: One test per part of the sign partitioning (see Coverage).
  * - `matmul.magnitude_*`: Tests for the tiny and huge parts of the magnitude partitioning.
+ * - `matmul.shape_*`: Tests for the non-square parts of the shape partitioning.
  *
  * @par Example
  * @code
@@ -17,7 +18,8 @@
  * @endcode
  *
  * @par Coverage
- * Every kernel is checked against the CPU reference on one exemplar per part.
+ * Every kernel is checked against the CPU reference on one exemplar per part. A is M x K and B
+ * is K x N.
  * | Partitioning | Part | Tests |
  * | --- | --- | --- |
  * | Sign of every value in A and B | All zero | `matmul.sign_all_zero` |
@@ -27,6 +29,12 @@
  * | Largest abs value m in A and B | Tiny: 0 < m < 2^-63 | `matmul.magnitude_tiny_*` |
  * | | Normal: m = 0, or 2^-63 <= m < 2^64 | `matmul.matches_reference_random_normal` |
  * | | Huge: m >= 2^64 | `matmul.magnitude_huge_*` |
+ * | Shape | Both square: M = K = N | `matmul.matches_reference_random_normal` |
+ * | | Only A square: M = K != N | `matmul.shape_only_a_square` |
+ * | | Only B square: K = N != M | `matmul.shape_only_b_square` |
+ * | | Neither square, K > M and K > N | `matmul.shape_k_longest` |
+ * | | Neither square, K < M and K < N | `matmul.shape_k_shortest` |
+ * | | Neither square, K between M and N | `matmul.shape_k_between` |
  *
  * 2^-63 is the square root of bf16's smallest normal (2^-126), and 2^64 is the smallest power of
  * two whose square passes bf16's largest value (about 2^128): below 2^-63 and from 2^64 up,
@@ -273,6 +281,23 @@ std::vector<float> make_identity_matrix(int N) {
   return I_host;
 }
 
+/**
+ * @brief `expect_random_normal_close_to_reference` checks every kernel on random normal A and B.
+ *
+ * @param[in] M Rows of A and C.
+ * @param[in] N Columns of B and C.
+ * @param[in] K Columns of A and rows of B.
+ *
+ * @par Example
+ * @code
+ * expect_random_normal_close_to_reference(64, 96, 64);
+ * @endcode
+ */
+void expect_random_normal_close_to_reference(int M, int N, int K) {
+  expect_close_to_reference(make_random_matrix(M, K, A_SEED, draw_standard_normal),
+                            make_random_matrix(K, N, B_SEED, draw_standard_normal), M, N, K);
+}
+
 }  // namespace
 
 /**
@@ -491,4 +516,63 @@ TEST(matmul, magnitude_huge_at_bf16_max) {
     EXPECT_EQ(run_kernel(kernel.matmul_fn, A_host, B_host, REFERENCE_N, REFERENCE_N, REFERENCE_N),
               A_host);
   }
+}
+
+/**
+ * @brief `matmul.shape_only_a_square` covers M = K != N.
+ */
+TEST(matmul, shape_only_a_square) {
+  constexpr int M = 64;
+  constexpr int N = 96;
+  constexpr int K = 64;
+  static_assert(M == K && K != N);
+  expect_random_normal_close_to_reference(M, N, K);
+}
+
+/**
+ * @brief `matmul.shape_only_b_square` covers K = N != M.
+ */
+TEST(matmul, shape_only_b_square) {
+  constexpr int M = 96;
+  constexpr int N = 64;
+  constexpr int K = 64;
+  static_assert(K == N && N != M);
+  expect_random_normal_close_to_reference(M, N, K);
+}
+
+/**
+ * @brief `matmul.shape_k_longest` covers K > M and K > N, with neither matrix square.
+ *
+ * @par Must know
+ * - Gotchas:
+ *   - Narrow, long-K shapes make cuBLAS split K, which needs fp32 reductions to pass.
+ */
+TEST(matmul, shape_k_longest) {
+  constexpr int M = 64;
+  constexpr int N = 2;
+  constexpr int K = 1024;
+  static_assert(K > M && K > N);
+  expect_random_normal_close_to_reference(M, N, K);
+}
+
+/**
+ * @brief `matmul.shape_k_shortest` covers K < M and K < N, with neither matrix square.
+ */
+TEST(matmul, shape_k_shortest) {
+  constexpr int M = 96;
+  constexpr int N = 80;
+  constexpr int K = 32;
+  static_assert(K < M && K < N);
+  expect_random_normal_close_to_reference(M, N, K);
+}
+
+/**
+ * @brief `matmul.shape_k_between` covers K between M and N, with neither matrix square.
+ */
+TEST(matmul, shape_k_between) {
+  constexpr int M = 40;
+  constexpr int N = 112;
+  constexpr int K = 72;
+  static_assert(M < K && K < N);
+  expect_random_normal_close_to_reference(M, N, K);
 }
