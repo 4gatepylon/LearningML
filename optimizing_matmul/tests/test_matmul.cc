@@ -11,6 +11,7 @@
  * - `matmul.sign_*`: One test per part of the sign partitioning (see Coverage).
  * - `matmul.magnitude_*`: Tests for the tiny and huge parts of the magnitude partitioning.
  * - `matmul.shape_*`: Tests for the non-square parts of the shape partitioning.
+ * - `matmul.parity_all_even`: Covers the even parts of the parity partitionings.
  *
  * @par Example
  * @code
@@ -35,6 +36,12 @@
  * | | Neither square, K > M and K > N | `matmul.shape_k_longest` |
  * | | Neither square, K < M and K < N | `matmul.shape_k_shortest` |
  * | | Neither square, K between M and N | `matmul.shape_k_between` |
+ * | Parity of M | Even | `matmul.parity_all_even` |
+ * | | Odd | `matmul.shape_k_between` |
+ * | Parity of N | Even | `matmul.parity_all_even` |
+ * | | Odd | `matmul.shape_k_between` |
+ * | Parity of K | Even | `matmul.parity_all_even` |
+ * | | Odd | `matmul.shape_k_between` |
  *
  * 2^-63 is the square root of bf16's smallest normal (2^-126), and 2^64 is the smallest power of
  * two whose square passes bf16's largest value (about 2^128): below 2^-63 and from 2^64 up,
@@ -567,12 +574,28 @@ TEST(matmul, shape_k_shortest) {
 }
 
 /**
- * @brief `matmul.shape_k_between` covers K between M and N, with neither matrix square.
+ * @brief `matmul.shape_k_between` covers K between M and N, and odd M, N and K.
+ *
+ * @par Must know
+ * - Gotchas:
+ *   - Odd sizes leave partial thread blocks and catch kernels that assume even sizes.
  */
 TEST(matmul, shape_k_between) {
-  constexpr int M = 40;
-  constexpr int N = 112;
-  constexpr int K = 72;
+  constexpr int M = 41;
+  constexpr int N = 113;
+  constexpr int K = 73;
   static_assert(M < K && K < N);
+  static_assert(M % 2 == 1 && N % 2 == 1 && K % 2 == 1);
+  expect_random_normal_close_to_reference(M, N, K);
+}
+
+/**
+ * @brief `matmul.parity_all_even` covers even M, N and K with distinct sizes.
+ */
+TEST(matmul, parity_all_even) {
+  constexpr int M = 34;
+  constexpr int N = 58;
+  constexpr int K = 46;
+  static_assert(M % 2 == 0 && N % 2 == 0 && K % 2 == 0);
   expect_random_normal_close_to_reference(M, N, K);
 }
