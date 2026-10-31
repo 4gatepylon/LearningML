@@ -38,10 +38,11 @@ These rules apply to the whole repository. Folders can add their own rules in th
 
 ## Experiments, evaluations and benchmarks
 
-Whenever a PR adds or changes an experiment, evaluation or benchmark (anything that compares
-options or ablates something), list every decision you made without the user's exact say, with a
-short rationale. Follow the `experiment-decisions` skill (`.claude/skills/experiment-decisions/`)
-for the template and for where the list goes (PR description or a per-experiment `decisions.md`).
+For experiments, evaluations and benchmarks (anything that compares options or ablates
+something), let the user make the important decisions: ask rather than choose. Whatever you do
+decide, list in the PR with a short rationale. Follow the `experiment-decisions` skill
+(`.claude/skills/experiment-decisions/`) for when to ask, the template, and where the list goes
+(PR description or a per-experiment `DECISIONS.md`).
 
 ## Kernel folders
 
