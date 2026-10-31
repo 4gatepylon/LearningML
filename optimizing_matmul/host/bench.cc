@@ -196,14 +196,14 @@ int main(int argc, char** argv) {
   CHECK(cudaEventCreate(&stop_event));
   for (const Kernel& kernel : selected_kernels) {
     for (int i = 0; i < warmup_iteration_count; ++i) {
-      kernel.matmul_fn(A_device, B_device, C_device, N);
+      kernel.matmul_fn(A_device, B_device, C_device, N, N, N);
     }
   }
   for (int trial = 0; trial < trial_count; ++trial) {
     for (const Kernel& kernel : selected_kernels) {
       CHECK(cudaEventRecord(start_event));
       for (int i = 0; i < batch_size; ++i) {
-        kernel.matmul_fn(A_device, B_device, C_device, N);
+        kernel.matmul_fn(A_device, B_device, C_device, N, N, N);
       }
       CHECK(cudaEventRecord(stop_event));
       CHECK(cudaEventSynchronize(stop_event));
