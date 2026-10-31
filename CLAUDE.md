@@ -330,6 +330,25 @@ These practices aim for fewer bugs, code that reads quickly, and short code. The
 keeping code standard, informative and correct. When something you write isn't covered by a rule
 here, ask the user whether to set one, so that conventions don't drift apart.
 
+## Unit tests
+
+Choose unit tests by partitioning the input space, so that what they cover is deliberate and easy
+to check.
+
+1. **Input space:** write down everything the code under test takes as input. For a matmul, that's
+   the sizes `M`, `N` and `K` and the values in `A` and `B`.
+2. **Partitionings:** split the input space along one property at a time. Each partitioning is a
+   set of parts that don't overlap and together cover the whole space, usually a tree or a grid of
+   conditions. For a matmul, one partitioning is the sign of the values: all zero, non-negative,
+   non-positive, or mixed.
+3. **Coverage:** pick tests (exemplars) so that every part of every partitioning is covered by at
+   least one test. One test covers one part of each partitioning at once, so the minimum number
+   of tests is the largest partitioning's part count, not the size of their Cartesian product.
+4. **Coverage table:** the test file's docstring lists each partitioning, its parts, and which tests
+   cover each part, so a reviewer can check that no part is missing.
+5. **One partitioning per PR:** for a large set of tests, add the partitionings one at a time, as
+   stacked PRs. Each PR adds or changes tests until its partitioning's parts are all covered.
+
 ## Machine-specific workarounds
 
 This repo is used from several machines, so don't write a workaround for one machine (e.g. a
