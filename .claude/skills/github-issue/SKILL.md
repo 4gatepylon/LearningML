@@ -89,9 +89,9 @@ gh issue close <n> --reason "not planned"  # or "completed"; close, don't delete
 
 ```bash
 gh label create experiment       --color 5319e7 --description "Benchmark, evaluation or ablation"
-gh label create area:kernels     --color 1d76db --description "CUDA kernels, their tests and benchmarks"
-gh label create area:models      --color 1d76db --description "Model code, training, data, inference, eval"
-gh label create area:compilers   --color 1d76db --description "ML compilers and code generation"
-gh label create area:distributed --color 1d76db --description "Multi-GPU and multi-node code"
-gh label create area:tooling     --color 1d76db --description "Build, scripts, environment, repo rules"
+gh label create area:kernels     --color 2da44e --description "CUDA kernels, their tests and benchmarks"
+gh label create area:models      --color fbca04 --description "Model code, training, data, inference, eval"
+gh label create area:compilers   --color e99695 --description "ML compilers and code generation"
+gh label create area:distributed --color 006b75 --description "Multi-GPU and multi-node code"
+gh label create area:tooling     --color bfd4f2 --description "Build, scripts, environment, repo rules"
 ```
