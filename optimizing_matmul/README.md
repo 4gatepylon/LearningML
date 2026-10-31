@@ -24,6 +24,18 @@ GPU 2 of 4, selected with `CUDA_VISIBLE_DEVICES=2` (set by `.env`).
 `nvcc` is not on `PATH` by default. Copy `.env.example` to `.env` (git-ignored, since the CUDA
 version is per host) and `source .env`.
 
+## Running it
+
+```bash
+cp .env.example .env && source .env  # nvcc on PATH, GPU 2
+make test                            # build and run the GoogleTest tests
+make bench                           # time each kernel at N = 8192
+make bench BENCH_ARGS="-N 4096"      # pass flags; list them with `uv run scripts/bench.py -h`
+make fmt && make tidy                # format and lint
+```
+
+Every kernel in `KERNELS` (`common/matmul.h`) is tested and benchmarked.
+
 ## What the hardware can do
 
 ```
