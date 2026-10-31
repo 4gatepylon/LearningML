@@ -10,6 +10,8 @@ These rules apply to the whole repository. Folders can add their own rules in th
 - Generated code (output of a script or compiler) doesn't count either, but commit it only if the
   user agrees. A PR may go well over 200 lines this way: the limit is on what reviewers read.
 - State the reviewable line count in the PR description.
+- Write every PR description with the `pr-description` skill (`.claude/skills/pr-description/`).
+  Every PR uses its template unchanged.
 
 ## Stacked pull requests
 
