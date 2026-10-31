@@ -14,7 +14,7 @@ Interface:
     --list-kernels: Print the kernel names and exit.
 
 Example:
-    $ make bench BENCH_ARGS="-N 4096 --batch-size 1000 --kernel cublas"
+    $ make bench-kernels BENCH_ARGS="-N 4096 --batch-size 1000 --kernel cublas"
 
 Must know:
     Gotchas:
