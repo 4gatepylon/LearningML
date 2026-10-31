@@ -38,6 +38,11 @@ These rules apply to the whole repository. Folders can add their own rules in th
   by hand: open the PRs with `gh pr create --base <branch below>`, then link them into a stack on
   GitHub.
 
+## Issues
+
+Open, format, label and split GitHub issues with the `github-issue` skill
+(`.claude/skills/github-issue/`). Every issue uses its title format, template and labels.
+
 ## Experiments, evaluations and benchmarks
 
 For experiments, evaluations and benchmarks (anything that compares options or ablates
