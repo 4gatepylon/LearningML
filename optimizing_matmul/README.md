@@ -29,11 +29,12 @@ version is per host) and `source .env`.
 ```bash
 cp .env.example .env && source .env  # nvcc on PATH, GPU 2
 make test                            # build and run the GoogleTest tests
-make bench                           # time each kernel at N = 8192 (flags: scripts/bench.py -h)
+make bench                           # time each kernel at N = 8192
+make bench BENCH_ARGS="-N 4096"      # pass flags; list them with `uv run scripts/bench.py -h`
 make fmt && make tidy                # format and lint
 ```
 
-Every kernel in `kKernels` (`common/matmul.h`) is tested and benchmarked.
+Every kernel in `KERNELS` (`common/matmul.h`) is tested and benchmarked.
 
 ## What the hardware can do
 

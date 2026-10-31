@@ -2,10 +2,11 @@
 
 Interface:
     -N: Matrix size (default 8192).
-    --warmup-iterations: Untimed calls per kernel before the timed one (default 1).
+    --warmup-iteration-count: Untimed calls per kernel before the timed one (default 1).
+    stdout: One table row per kernel.
 
 Example:
-    $ make bench BENCH_ARGS="-N 4096 --warmup-iterations 0"
+    $ make bench BENCH_ARGS="-N 4096 --warmup-iteration-count 0"
 
 Must know:
     Gotchas:
@@ -19,9 +20,9 @@ from pathlib import Path
 
 BENCH_BINARY_PATH: Path = Path(__file__).resolve().parent.parent / ".build" / "bench"
 DEFAULT_N: int = 8192
-DEFAULT_WARMUP_ITERATIONS: int = 1
+DEFAULT_WARMUP_ITERATION_COUNT: int = 1
 FLOP_PER_MULTIPLY_ADD: int = 2
-MATRICES_CROSSING_DRAM_COUNT: int = 3
+DRAM_CROSSING_MATRIX_COUNT: int = 3
 BF16_BYTES: int = 2
 MS_PER_S: float = 1e3
 FLOP_PER_TFLOP: float = 1e12
@@ -42,7 +43,9 @@ def main() -> None:
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
     parser.add_argument("-N", type=int, default=DEFAULT_N)
-    parser.add_argument("--warmup-iterations", type=int, default=DEFAULT_WARMUP_ITERATIONS)
+    parser.add_argument(
+        "--warmup-iteration-count", type=int, default=DEFAULT_WARMUP_ITERATION_COUNT
+    )
     args: argparse.Namespace = parser.parse_args()
     N: int = args.N
 
@@ -53,14 +56,14 @@ def main() -> None:
         os.environ["MEM_BANDWIDTH_TBYTES_PER_S_ACCORDING_TO_NVIDIA_SPEC"]
     )
     matmul_flop: int = FLOP_PER_MULTIPLY_ADD * N**3
-    matmul_traffic_bytes: int = MATRICES_CROSSING_DRAM_COUNT * N**2 * BF16_BYTES
+    matmul_traffic_bytes: int = DRAM_CROSSING_MATRIX_COUNT * N**2 * BF16_BYTES
     intensity_flop_per_byte: float = matmul_flop / matmul_traffic_bytes
     roofline_tflops_according_to_nvidia_spec: float = min(
         peak_dense_bf16_tflops_according_to_nvidia_spec,
         intensity_flop_per_byte * mem_bandwidth_tbytes_per_s_according_to_nvidia_spec,
     )
 
-    bench_command: list[str] = [str(BENCH_BINARY_PATH), str(N), str(args.warmup_iterations)]
+    bench_command: list[str] = [str(BENCH_BINARY_PATH), str(N), str(args.warmup_iteration_count)]
     bench_stdout: str = subprocess.run(
         bench_command, check=True, stdout=subprocess.PIPE, text=True
     ).stdout

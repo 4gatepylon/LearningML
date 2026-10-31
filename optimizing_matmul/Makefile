@@ -49,8 +49,10 @@ CUDA_PATH ?= $(shell dirname $$(dirname $$(readlink -f $$(command -v nvcc))))
 TIDY_FLAGS := -std=c++17 -I. --gcc-install-dir=$(shell dirname $$(g++ -print-libgcc-file-name))
 
 tidy:
-	$(CLANG_TIDY) --header-filter=common/ $(HOST_SOURCES) -- $(TIDY_FLAGS) -isystem $(CUDA_PATH)/include
-	$(CLANG_TIDY) $(KERNEL_SOURCES) -- -x cuda --cuda-path=$(CUDA_PATH) --cuda-host-only -nocudalib $(TIDY_FLAGS)
+	$(CLANG_TIDY) --header-filter=common/ $(HOST_SOURCES) -- $(TIDY_FLAGS) \
+	  -isystem $(CUDA_PATH)/include
+	$(CLANG_TIDY) $(KERNEL_SOURCES) -- -x cuda --cuda-path=$(CUDA_PATH) --cuda-host-only \
+	  -nocudalib $(TIDY_FLAGS)
 	$(RUFF) check .
 
 clean:

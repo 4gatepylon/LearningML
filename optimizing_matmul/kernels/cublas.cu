@@ -3,7 +3,7 @@
  * @brief `cublas.cu` defines `matmul_cublas`, the cuBLAS reference kernel.
  *
  * @par Interface
- * - `matmul_cublas`: C = A * B with cuBLAS.
+ * - `matmul_cublas`: Computes C = A * B with cuBLAS.
  *
  * @par Example
  * @code

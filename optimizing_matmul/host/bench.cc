@@ -3,22 +3,23 @@
  * @brief `bench.cc` times one call of each kernel and prints one CSV line per kernel.
  *
  * @par Interface
- * - Arguments: `N warmup_iterations`.
- * - Output: one `name,milliseconds` line per kernel on stdout.
+ * - `N`: Matrix size.
+ * - `warmup_iteration_count`: Untimed calls per kernel before the timed one.
+ * - stdout: One `name,elapsed_ms_according_to_cuda_events` line per kernel.
  *
  * @par Example
  * @code
- * .build/bench 8192 1
+ * $ .build/bench 8192 1
  * @endcode
  *
  * @par Must know
  * - Gotchas:
- *   - The timed call includes cuBLAS setup when `warmup_iterations` is 0.
- *   - `scripts/bench.py` runs this binary with its defaults and prints a table.
+ *   - The timed call includes cuBLAS setup when `warmup_iteration_count` is 0.
  */
 #include <cstdio>
 #include <cstdlib>
 #include <random>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -27,14 +28,14 @@
 constexpr int EXPECTED_ARG_COUNT = 3;
 constexpr int PROGRAM_NAME_ARG_INDEX = 0;
 constexpr int N_ARG_INDEX = 1;
-constexpr int WARMUP_ITERATIONS_ARG_INDEX = 2;
+constexpr int WARMUP_ITERATION_COUNT_ARG_INDEX = 2;
 constexpr unsigned RNG_SEED = 0;
 
 /**
  * @brief `upload_random_matrix` fills `temp_X_host` with N(0, 1) samples and copies them over.
  *
  * @param[in,out] rng Random number generator that supplies the samples.
- * @param[out] temp_X_host Scratch buffer; its size sets the matrix size.
+ * @param[in,out] temp_X_host Scratch buffer; its size sets the matrix size.
  * @return A new device buffer that holds the samples rounded to bf16.
  *
  * @par Example
@@ -55,24 +56,30 @@ static bf16_t* upload_random_matrix(std::mt19937& rng, std::vector<float>& temp_
 }
 
 /**
- * @brief `main` times one call of each kernel after `warmup_iterations` untimed calls.
+ * @brief `main` times one call of each kernel after `warmup_iteration_count` untimed calls.
  *
  * @param[in] argc Argument count, `EXPECTED_ARG_COUNT`.
- * @param[in] argv Program name, `N` and `warmup_iterations`.
+ * @param[in] argv Program name, `N` and `warmup_iteration_count`.
  * @return `EXIT_SUCCESS`, or `EXIT_FAILURE` after a usage error.
  *
  * @par Example
  * @code
- * .build/bench 8192 1
+ * $ .build/bench 8192 1
  * @endcode
  */
 int main(int argc, char** argv) {
-  if (argc != EXPECTED_ARG_COUNT) {
-    std::fprintf(stderr, "usage: %s N warmup_iterations\n", argv[PROGRAM_NAME_ARG_INDEX]);
+  int N = 0;
+  int warmup_iteration_count = 0;
+  try {
+    if (argc != EXPECTED_ARG_COUNT) {
+      throw std::invalid_argument("wrong argument count");
+    }
+    N = std::stoi(argv[N_ARG_INDEX]);
+    warmup_iteration_count = std::stoi(argv[WARMUP_ITERATION_COUNT_ARG_INDEX]);
+  } catch (const std::logic_error&) {
+    std::fprintf(stderr, "usage: %s N warmup_iteration_count\n", argv[PROGRAM_NAME_ARG_INDEX]);
     return EXIT_FAILURE;
   }
-  const int N = std::stoi(argv[N_ARG_INDEX]);
-  const int warmup_iterations = std::stoi(argv[WARMUP_ITERATIONS_ARG_INDEX]);
   std::mt19937 rng(RNG_SEED);  // NOLINT(bugprone-random-generator-seed)
   std::vector<float> temp_X_host(static_cast<size_t>(N) * N);
   bf16_t* A_device = upload_random_matrix(rng, temp_X_host);
@@ -85,7 +92,7 @@ int main(int argc, char** argv) {
   CHECK(cudaEventCreate(&start_event));
   CHECK(cudaEventCreate(&stop_event));
   for (const Kernel& kernel : KERNELS) {
-    for (int i = 0; i < warmup_iterations; ++i) {
+    for (int i = 0; i < warmup_iteration_count; ++i) {
       kernel.matmul_fn(A_device, B_device, C_device, N);
     }
     CHECK(cudaEventRecord(start_event));

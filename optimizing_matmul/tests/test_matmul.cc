@@ -3,11 +3,11 @@
  * @brief `test_matmul.cc` checks every kernel in `KERNELS` against known products.
  *
  * @par Interface
- * - `matmul.known_2x2`: a hand-computed 2x2 product, compared exactly.
+ * - `matmul.known_2x2`: Checks a hand-computed 2x2 product exactly.
  *
  * @par Example
  * @code
- * make test
+ * $ make test
  * @endcode
  */
 #include <gtest/gtest.h>

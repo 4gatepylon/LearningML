@@ -3,10 +3,13 @@
  * @brief `matmul.h` holds the kernel interface, the list of kernels and the shared helpers.
  *
  * @par Interface
- * - `bf16_t`, `matmul_fn_t`: the element type, and the signature that every kernel has.
- * - `Kernel`, `KERNELS`: every kernel that the tests and the benchmark run.
- * - `CHECK`, `check_status`: abort on a failed CUDA or cuBLAS call.
- * - `copy_to_device`: copy a host array into a new device buffer.
+ * - `bf16_t`: The element type of every matrix.
+ * - `matmul_fn_t`: The signature that every kernel has.
+ * - `Kernel`: A kernel's name and function.
+ * - `KERNELS`: Every kernel that the tests and the benchmark run.
+ * - `check_status`: Aborts on a failed CUDA or cuBLAS call.
+ * - `CHECK`: Calls `check_status` with the call's text, file and line.
+ * - `copy_to_device`: Copies a host array into a new device buffer.
  *
  * @par Example
  * @code
