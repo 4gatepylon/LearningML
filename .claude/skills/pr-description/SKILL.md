@@ -27,7 +27,7 @@ covers only the description (and title); how to split and stack PRs is in the ro
 
 ## Decisions
 
-<None.> or <the decisions list or decisions.md links, per the experiment-decisions skill>
+<None.> or <the decisions list or DECISIONS.md links, per the experiment-decisions skill>
 
 ## Testing
 
