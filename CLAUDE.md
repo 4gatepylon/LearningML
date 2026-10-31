@@ -77,7 +77,8 @@ else is required.
 
 These rules are for new code in every language; don't rewrite existing code only to follow them.
 Inside `cuda_book/`, `cuda_book/CLAUDE.md` wins where the two differ (e.g. `_h`/`_d` instead of
-`_host`/`_device`); the rest applies there too.
+`_host`/`_device`, and the banner and `//` comments in its file template); the rest applies there
+too.
 
 ### Names and declarations
 
@@ -159,28 +160,34 @@ For a unit the table lacks, build the suffix the same way, from lowercase unit n
 Code has no comments except docstrings and DANGEROUS comments. Tool directives such as
 `// NOLINT(...)`, `# noqa`, `#pragma` and shebangs aren't comments for this rule.
 
-- **Docstrings:** every file, class and function has one docstring, in the template for its
-  language below. It gives the purpose, the interface, an example and, optionally, what a reader
-  must know.
-- **DANGEROUS comments:** a line that someone MUST know something about before changing it gets a
-  one-line comment right above it:
+- **Docstrings:** every Python, C++ and CUDA file, class and function has one docstring, in the
+  template for its language below. It gives the purpose, the interface, an example and,
+  optionally, what a reader must know.
+- **DANGEROUS comments:** a line that is really dangerous to change, so that whoever changes it
+  MUST know something first, gets a one-line comment right above it:
   `// DANGEROUS DANGEROUS DANGEROUS IF YOU CHANGE THIS THEN <CONSEQUENCE> WILL HAPPEN` (`#` in
-  Python). In a dangerous section, every line gets one. A DANGEROUS comment longer than one line
-  needs the user's approval. Nothing else gets a comment.
+  Python). The whole comment fits in 100 columns, so `<CONSEQUENCE>` is a few words
+  (`A USE-AFTER-FREE`). In a dangerous section, every line gets the same comment. A DANGEROUS
+  comment longer than one line needs the user's approval. A must-know fact that isn't dangerous
+  goes in the docstring's Must know list instead. Nothing else gets a comment.
 - **Phrasing:** every sentence names its subject and uses the active voice: "`copy_to_device`
   copies a host array to the device.", not "Copies a host array to the device.". Write directly,
   clearly and briefly. Separate points are bullets; a line of reasoning is a paragraph.
 - **Sections:** a docstring's sections come in the template's order. A section with nothing to say
-  is left out, except Example, which every docstring has except a test's.
+  is left out, except Example: every docstring has one, except docstrings in test files.
 - **Interface:** a function's interface is its arguments, return value and errors. A file's is its
-  command-line arguments (scripts and `main`s) or its public names (libraries). A Python class's is
-  its constructor arguments and attributes; a C++ class documents its interface on its public
-  methods and static constructors.
+  command-line arguments and what it prints (scripts and `main`s), or its public names
+  (libraries), one entry each. A Python class's is its `__init__` arguments (under Args) and its
+  attributes, and `__init__` has no docstring of its own. A C++ class documents its interface on
+  its public methods and static constructors.
+- **Placement:** a C++ function declared in a header and defined in a `.cc` or `.cu` file has its
+  docstring on the definition; the declaration has none.
 - **Must know:** an optional list grouped under these categories, in this order: Limitations,
-  Gotchas, Side effects, Performance. Each item is one bullet of one sentence that fits on one
-  line. A new category needs the user's agreement.
-- **Files without docstrings:** Makefiles, shell scripts, TOML and `.env` files start with a `#`
-  block shaped like the Python file docstring.
+  Gotchas, Side effects, Performance. Each item is one bullet that fits on one line without
+  wrapping, ideally one sentence. A new category needs the user's agreement.
+- **Files without docstring syntax:** a Makefile, shell script, TOML or `.env` file has a `#` block
+  at its top as its docstring, shaped like the Python file docstring. `.gitignore`, YAML (such as
+  the copied `.clang-format` and `.clang-tidy`), Markdown, JSON and lockfiles have no docstring.
 
 Python docstrings use the Google style:
 
@@ -189,7 +196,8 @@ Python docstrings use the Google style:
 
 Interface:
     -N: Matrix size (default 8192).
-    --warmup-iterations: Untimed calls per kernel before the timed one (default 1).
+    --warmup-iteration-count: Untimed calls per kernel before the timed one (default 1).
+    stdout: One table row per kernel.
 
 Example:
     $ uv run scripts/bench.py -N 4096
@@ -210,7 +218,7 @@ class Dataloader:
         batch_count: Number of batches loaded so far.
 
     Example:
-        >>> dataloader = Dataloader.FromFiles(paths)
+        >>> dataloader: Dataloader = Dataloader(paths)
 
     Must know:
         Limitations:
@@ -231,7 +239,7 @@ def copy_to_device(X_host: np.ndarray) -> DeviceArray:
         MemoryError: The device has no room for the copy.
 
     Example:
-        >>> X_device = copy_to_device(X_host)
+        >>> X_device: DeviceArray = copy_to_device(X_host)
 
     Must know:
         Side effects:
@@ -244,20 +252,21 @@ C++ and CUDA docstrings use Doxygen's Javadoc style:
 ```cpp
 /**
  * @file
- * @brief `bench.cc` times one call of each kernel and prints one CSV line per kernel.
+ * @brief `bench.cc` times each kernel once and prints one CSV line per kernel.
  *
  * @par Interface
- * - Arguments: `N warmup_iterations`.
- * - Output: one `name,milliseconds` line per kernel on stdout.
+ * - `N`: Matrix size.
+ * - `warmup_iteration_count`: Untimed calls per kernel before the timed one.
+ * - stdout: One `name,elapsed_ms_according_to_cuda_events` line per kernel.
  *
  * @par Example
  * @code
- * .build/bench 8192 1
+ * $ .build/bench 8192 1
  * @endcode
  *
  * @par Must know
  * - Gotchas:
- *   - The timed call includes cuBLAS setup when `warmup_iterations` is 0.
+ *   - The timed call includes cuBLAS setup when `warmup_iteration_count` is 0.
  */
 
 /**
@@ -292,14 +301,21 @@ C++ and CUDA docstrings use Doxygen's Javadoc style:
  */
 ```
 
-A C++ function that returns a value adds `@return <meaning>.` after its `@param` lines, and one that
-throws adds `@throws <type> <when>.`.
+A C++ function documents its return value and errors between its `@param` lines and
+`@par Example`: first `@return <meaning>.` if it returns a value, then one
+`@throws <type> <condition>.` line per exception it can throw.
 
 ### Why
 
-These practices aim for fewer bugs, code that reads quickly, and short code. They get there by
-keeping code standard, informative and correct. When something you write isn't covered by a rule
-here, ask the user whether to set one, so that conventions don't drift apart.
+These practices aim for:
+
+- Fewer bugs.
+- Code that reads quickly.
+- Short code.
+
+They get there by keeping code standard, informative and correct. When you find something these
+rules don't standardize, ask the user whether to set a rule for it, so that conventions don't drift
+apart.
 
 ## Documenting the system
 
