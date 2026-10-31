@@ -8,6 +8,7 @@
  * - `Kernel`: A kernel's name and function.
  * - `KERNELS`: Every kernel that the tests and the benchmark run.
  * - `matmul_cublas`: The cuBLAS reference kernel, defined in `kernels/cublas.cu`.
+ * - `matmul_naive`: The one-thread-per-element kernel, defined in `kernels/naive.cu`.
  * - `check_status`: Aborts on a failed CUDA or cuBLAS call.
  * - `CHECK`: Calls `check_status` with the call's text, file and line.
  * - `copy_to_device`: Copies a host array into a new device buffer.

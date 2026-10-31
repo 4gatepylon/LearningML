@@ -15,8 +15,8 @@
 
 #include "common/matmul.h"
 
-constexpr int BLOCK_COLS = 32;
-constexpr int BLOCK_ROWS = 8;
+constexpr int BLOCK_COL_COUNT = 32;
+constexpr int BLOCK_ROW_COUNT = 8;
 
 /**
  * @brief `matmul_naive_kernel` computes C[i][j] = sum over k of A[i][k] * B[k][j], one per thread.
@@ -33,7 +33,7 @@ constexpr int BLOCK_ROWS = 8;
  *
  * @par Must know
  * - Limitations:
- *   - The grid's y dimension caps N at 65535 * `BLOCK_ROWS` = 524280.
+ *   - The grid's y dimension caps N at 65535 * `BLOCK_ROW_COUNT` = 524280.
  * - Performance:
  *   - `threadIdx.x` walks the columns, so each warp reads B and writes C coalesced.
  */
@@ -69,7 +69,8 @@ __global__ void matmul_naive_kernel(const bf16_t* A_device, const bf16_t* B_devi
  *   - The launch is asynchronous; `cudaGetLastError` reports a failed launch.
  */
 void matmul_naive(const bf16_t* A_device, const bf16_t* B_device, bf16_t* C_device, int N) {
-  const dim3 block(BLOCK_COLS, BLOCK_ROWS);
-  const dim3 grid((N + BLOCK_COLS - 1) / BLOCK_COLS, (N + BLOCK_ROWS - 1) / BLOCK_ROWS);
+  const dim3 block(BLOCK_COL_COUNT, BLOCK_ROW_COUNT);
+  const dim3 grid((N + BLOCK_COL_COUNT - 1) / BLOCK_COL_COUNT,
+                  (N + BLOCK_ROW_COUNT - 1) / BLOCK_ROW_COUNT);
   matmul_naive_kernel<<<grid, block>>>(A_device, B_device, C_device, N);
 }
