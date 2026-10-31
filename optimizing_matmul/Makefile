@@ -1,9 +1,10 @@
 # `Makefile` builds and runs the tests and the benchmark, and formats and lints the code.
 #
 # Interface:
+#     make help: list the targets.
 #     make test: build and run the GoogleTest tests.
-#     make bench [BENCH_ARGS="-N 4096"]: build the benchmark and print its table.
-#     make scan [SCAN_ARGS="--kernel cublas"]: time a range of batch sizes and fit the fixed cost.
+#     make bench-kernels [BENCH_ARGS="-N 4096"]: build the benchmark and print its table.
+#     make scan-batch-sizes [SCAN_ARGS="--kernel cublas"]: time a range of batch sizes and fit the fixed cost.
 #     make fmt, make tidy: format and lint with clang-format, clang-tidy and ruff.
 #     make clean: remove .build/.
 #
@@ -25,15 +26,28 @@ KERNEL_SOURCES := $(wildcard kernels/*.cu)
 HEADER_FILES := $(wildcard common/*.h)
 HOST_SOURCES := $(wildcard host/*.cc tests/*.cc)
 
-.PHONY: test bench scan fmt tidy clean
+.PHONY: help test bench-kernels scan-batch-sizes fmt tidy clean
+
+help:
+	@echo "Targets:"
+	@echo "  make help                                   List the targets"
+	@echo "  make test                                   Build and run the GoogleTest tests"
+	@echo "  make bench-kernels [BENCH_ARGS=\"-N 4096\"]   Time each kernel and print a table"
+	@echo "  make scan-batch-sizes [SCAN_ARGS=\"...\"]     Time a range of batch sizes; fit the fixed cost"
+	@echo "  make fmt                                    Format C++/CUDA (clang-format) and Python (ruff)"
+	@echo "  make tidy                                   Lint C++/CUDA (clang-tidy) and Python (ruff)"
+	@echo "  make clean                                  Remove $(BUILD_DIR)/"
+	@echo ""
+	@echo "Example: source .env && make bench-kernels BENCH_ARGS=\"--kernel cublas\""
+	@echo "Flags for BENCH_ARGS and SCAN_ARGS: uv run scripts/bench.py -h, uv run scripts/scan_batch_size.py -h"
 
 test: $(BUILD_DIR)/test
 	$(BUILD_DIR)/test
 
-bench: $(BUILD_DIR)/bench
+bench-kernels: $(BUILD_DIR)/bench
 	uv run scripts/bench.py $(BENCH_ARGS)
 
-scan: $(BUILD_DIR)/bench
+scan-batch-sizes: $(BUILD_DIR)/bench
 	uv run scripts/scan_batch_size.py $(SCAN_ARGS)
 
 $(BUILD_DIR)/test: tests/test_matmul.cc $(KERNEL_SOURCES) $(HEADER_FILES)

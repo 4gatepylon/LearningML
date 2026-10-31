@@ -18,7 +18,7 @@ Interface:
     --list-kernels: Print the kernel names and exit.
 
 Example:
-    $ make scan SCAN_ARGS="--kernel cublas --max-batch-size 512"
+    $ make scan-batch-sizes SCAN_ARGS="--kernel cublas --max-batch-size 512"
 
 Must know:
     Limitations:
