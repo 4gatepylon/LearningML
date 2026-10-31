@@ -316,6 +316,15 @@ These practices aim for fewer bugs, code that reads quickly, and short code. The
 keeping code standard, informative and correct. When something you write isn't covered by a rule
 here, ask the user whether to set one, so that conventions don't drift apart.
 
+## Machine-specific workarounds
+
+This repo is used from several machines, so don't write a workaround for one machine (e.g. a
+broken `gh` command) as if it held everywhere. In `CLAUDE.md` files and skills, write it as a
+condition, a one-line note on where it was seen, and the fix. Keep it to a line or two:
+
+> If `gh pr edit` fails with a Projects (classic) error (seen once with gh 2.55 on align-4,
+> 2026-10-30), set the body with `gh api -X PATCH repos/<owner>/<repo>/pulls/<n> -f body=...`.
+
 ## Documenting the system
 
 Documentation of the system (GPU model, compute capability, clocks, power limit, driver and toolkit
