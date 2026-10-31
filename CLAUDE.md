@@ -104,6 +104,9 @@ a function or a file, or that a decision depends on, spells out its meaning.
 - **Number:** collections are plural, scalars singular: `for kernel in kernels`.
 - **Units:** every quantity that has a unit carries a suffix from the table below: `timeout_ms`,
   `tile_bytes`.
+- **Ratios:** a value that is one quantity per another, such as a conversion factor, is named
+  `<numerator>_per_<denominator>`: `bytes_per_bf16` and `meters_per_mile`, not `bf16_bytes`,
+  `bytes_bf16`, `mile_meters` or `meters_in_mile`.
 - **Source:** a measured value, or one taken from a spec or other document, says where it comes
   from with `_according_to_<source>`, and `<source>` makes clear whether it is a spec or a
   measurement: `elapsed_ms_according_to_cuda_events`,
