@@ -7,6 +7,8 @@
  * - `matmul_fn_t`: The signature that every kernel has.
  * - `Kernel`: A kernel's name and function.
  * - `KERNELS`: Every kernel that the tests and the benchmark run.
+ * - `matmul_cublas`: The cuBLAS reference kernel, defined in `kernels/cublas.cu`.
+ * - `CUDA_AND_CUBLAS_SUCCESS_STATUS_CODE`: The status that CUDA and cuBLAS return on success.
  * - `check_status`: Aborts on a failed CUDA or cuBLAS call.
  * - `CHECK`: Calls `check_status` with the call's text, file and line.
  * - `copy_to_device`: Copies a host array into a new device buffer.
