@@ -33,7 +33,7 @@ Python projects:
 - `make test`: runs all the tests.
 - `make fmt`: formats and lints the code with ruff (`ruff format` and `ruff check`), so a separate
   `tidy` is usually not needed.
-- `make clean`: only when the project has build outputs to remove (e.g. a `dist/` or `.build/`).
+- `make clean`: only when the project has build outputs to remove (e.g. a `dist/` or `.build/` or `./data` or `./artifacts`; the last of these is usually used for ML projects' weights and other results that may be too large to commit).
 
 ## Target names
 
