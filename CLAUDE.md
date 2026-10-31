@@ -73,6 +73,58 @@ else is required.
 > NOTE: `cuda_book/` is separate from this template and doesn't necessarily follow it. It keeps its
 > own layout and rules (see `cuda_book/CLAUDE.md`).
 
+## Names and declarations
+
+A name should say what a value is without making the reader look at the code around it. Match a
+name's length to its scope: `i`, `j` and `x` are fine for a few lines, but a name that lives across
+a function or a file, or that a decision depends on, spells out its meaning. These rules are for new
+code; don't rename existing code only to follow them. `cuda_book/` keeps its own conventions.
+
+- **Intent:** say what the value is for, not what type it is: `active_user_count`, not `count`.
+- **Units:** end every quantity that has a unit in a suffix from the table below: `elapsed_ms`,
+  `bus_width_bits`.
+- **Source:** a measured value, or one taken from a document, says where it comes from with
+  `_according_to_<source>`: `elapsed_ms_according_to_cuda_events`,
+  `PEAK_DENSE_BF16_TFLOPS_ACCORDING_TO_NVIDIA_SPEC`.
+- **Maker:** when it matters what made a thing, say so with `_created_by_<maker>`:
+  `plan_created_by_autotuner`.
+- **Range bounds:** an index or pointer that starts or ends a range (other than a loop variable)
+  ends in `_incl` or `_excl`: `end_excl`, `last_row_incl`.
+- **Temporaries:** a throwaway value starts with `temp_`: `temp_sum`.
+- **Functions:** `<verb>_<noun>`, the action and what it acts on: `copy_to_device`, `parse_args`.
+  Interchangeable implementations of one operation may be `<operation>_<variant>`: `matmul_cublas`.
+- **Types:** classes, structs and type aliases end in `_t` and name the object, not the action:
+  `dataloader_t`, not `dataload_t`; `bf16_t`, `matmul_fn_t`.
+- **Math letters:** arrays, matrices and tensors are capitals (`A`, `B`, `C`, `D`); vectors are
+  lowercase (`x`, `b`); sizes and lengths are capitals (`N`, `M`, `K`); loop indices are `i`, `j`,
+  `k`; spatial coordinates and quaternion parts are `x`, `y`, `z`, `w`.
+- **Location:** data ends in where it lives, `_host` or `_device` (`A_host`, `A_device`), with
+  `_device0`, `_device1`, ... when there are several devices and it matters which.
+- **Order:** `<what>_<unit>_according_to_<source>`, then the location suffix.
+- **Case:** snake_case for everything, in every language; never CamelCase or camelCase. Globals and
+  global constants are UPPER_SNAKE_CASE (`KERNELS`, `DEFAULT_N`), and so are macros and environment
+  variables. The math letters above keep their case.
+- **No magic numbers:** every literal with a meaning gets a named constant: `constexpr` in C++, a
+  module-level constant in Python, `#define` only where a constant can't work. Bare `0` and `1` as
+  start values, identities or increments are fine.
+- **Declared types:** write the type when declaring a variable, in Python too
+  (`elapsed_ms: float = ...`). Use C++ `auto` only where the type can't be written (lambdas).
+
+| Quantity | Suffixes | Meaning |
+| --- | --- | --- |
+| Time | `_ns`, `_us`, `_ms`, `_s` | |
+| Frequency | `_mhz`, `_ghz` | 10^6, 10^9 Hz |
+| Data | `_bits`, `_bytes` | |
+| Data, decimal | `_kbytes`, `_mbytes`, `_gbytes`, `_tbytes` | 10^3, 10^6, 10^9, 10^12 bytes |
+| Data, binary | `_kibytes`, `_mibytes`, `_gibytes` | 2^10, 2^20, 2^30 bytes |
+| Bandwidth | `_gbytes_per_s`, `_tbytes_per_s`, `_gbits_per_s` | not `_gbps`: bits or bytes? |
+| Work | `_flop` | a count of floating-point operations |
+| Throughput | `_gflops`, `_tflops` | 10^9, 10^12 FLOP per second |
+| Arithmetic intensity | `_flop_per_byte` | |
+| Power | `_w` | watts |
+| Count | `_count` | a number of items: `element_count` |
+| Fraction | `_frac`, `_pct` | 0 to 1, 0 to 100 |
+
 ## Documenting the system
 
 Documentation of the system (GPU model, compute capability, clocks, power limit, driver and toolkit
