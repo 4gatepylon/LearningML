@@ -10,7 +10,7 @@ name = "optimizing-matmul"
 version = "0.1.0"
 description = "Optimizing a bf16 matmul kernel on an H100"
 requires-python = ">=3.10"
-dependencies = []
+dependencies = ["click>=8.1"]
 
 [dependency-groups]
 dev = ["ruff", "clang-format", "clang-tidy"]
