@@ -73,6 +73,86 @@ else is required.
 > NOTE: `cuda_book/` is separate from this template and doesn't necessarily follow it. It keeps its
 > own layout and rules (see `cuda_book/CLAUDE.md`).
 
+## Names and declarations
+
+A name should say what a value is without making the reader look at the code around it. Match a
+name's length to its scope: `i`, `j` and `x` are fine for a few lines, but a name that lives across
+a function or a file, or that a decision depends on, spells out its meaning. These rules are for new
+code; don't rename existing code only to follow them. Inside `cuda_book/`, `cuda_book/CLAUDE.md`
+wins where the two differ (e.g. `_h`/`_d` instead of `_host`/`_device`); the rest applies there too.
+
+- **Intent:** say what the value is for, not what type it is: `active_user_count`, not `count`.
+- **Number:** collections are plural, scalars singular: `for kernel in kernels`.
+- **Units:** every quantity that has a unit carries a suffix from the table below: `timeout_ms`,
+  `tile_bytes`.
+- **Source:** a measured value, or one taken from a spec or other document, says where it comes
+  from with `_according_to_<source>`, and `<source>` makes clear whether it is a spec or a
+  measurement: `elapsed_ms_according_to_cuda_events`,
+  `PEAK_DENSE_BF16_TFLOPS_ACCORDING_TO_NVIDIA_SPEC`, not `_according_to_nvidia`.
+- **Maker:** when it matters what made a thing, say so with `_created_by_<maker>`:
+  `plan_created_by_autotuner`.
+- **Range bounds:** an index or pointer that starts or ends a range (other than a loop variable)
+  carries `_incl` or `_excl`: `end_excl`, `last_row_incl`.
+- **Booleans:** read as a yes/no question, starting with a verb such as `is_`, `has_`, `can_` or
+  `should_`: `is_too_big`, not `too_big`.
+- **Temporaries:** a throwaway value starts with `temp_`: `temp_sum`.
+- **Functions:** `<verb>_<noun>`, the action and what it acts on, optionally followed by context:
+  `copy_to_device`, `move_box_outside`. Interchangeable implementations of one operation may be
+  `<operation>_<variant>`: `matmul_cublas`.
+- **Dangerous functions:** a function that is dangerous to call ends in
+  `_DANGEROUS_DANGEROUS_DANGEROUS_BECAUSE_<REASON>`:
+  `free_buffer_DANGEROUS_DANGEROUS_DANGEROUS_BECAUSE_KERNELS_MAY_STILL_READ_IT`.
+- **Dangerous code:** every line of a section that is dangerous to change is preceded by
+  `// DANGEROUS DANGEROUS DANGEROUS IF YOU CHANGE THIS THEN <CONSEQUENCE> WILL HAPPEN` (`#` in
+  Python), the same comment before each line.
+- **Types:** classes and structs are nouns for the object, not the action: `Dataloader`, not
+  `Dataload`. Type aliases end in `_t`: `bf16_t`, `matmul_fn_t`.
+- **Math letters:** where code follows a formula or a standard algorithm (kernels, linear algebra),
+  use the standard letters. Arrays, matrices and tensors are capitals (`A`, `B`, `C`, `D`); vectors
+  are lowercase (`x`, `b`); sizes and lengths are capitals (`N`, `M`, `K`); loop indices are `i`,
+  `j`, `k`, or the lowercase of the size they run over (`m` over `M`, `n` over `N`, `k` over `K`);
+  spatial coordinates and quaternion parts are `x`, `y`, `z`, `w`. There these letters override the
+  length, intent and unit rules, so a matrix size stays `N` across a whole file. Elsewhere, name
+  arrays and sizes by what they hold: `kernels`, `sample_count`.
+- **Location:** an array, tensor or buffer, or a pointer to one, says where it lives with `_host` or
+  `_device` (`A_host`, `A_device`), with `_device0`, `_device1`, ... when there are several devices
+  and it matters which. Plain scalars, and code that never touches a device, don't take it.
+- **Order:** when a name takes several suffixes, they go `<what>_<unit>`, then `_incl`/`_excl`,
+  then `_according_to_<source>` or `_created_by_<maker>`, then the location:
+  `elapsed_ms_according_to_cuda_events`, `end_offset_bytes_excl_device`.
+- **Case:** snake_case for variables and free functions, in every language. Classes are the
+  exception, and their rules take precedence: class and struct names are UpperCamelCase
+  (`Dataloader`), methods are lowerCamelCase (`moveBoxOutside`), and static constructors are
+  UpperCamelCase (`Dataloader::FromFiles`). Globals, global constants, macros and environment
+  variables are UPPER_SNAKE_CASE (`KERNELS`, `DEFAULT_N`). The math letters above keep their case.
+  A Python script's work goes in a `main()` function, so its working variables are locals and only
+  constants sit at module level.
+- **No magic numbers:** every literal with a meaning gets a named constant: `constexpr` in C++, a
+  module-level constant in Python, `#define` only where a constant can't work. Bare `0` and `1` as
+  start values, identities or increments are fine.
+- **Declared types:** write the type when declaring a variable, in Python too
+  (`timeout_ms: float = ...`). Use C++ `auto` only where the type can't be written (lambdas).
+
+| Quantity | Suffixes | Meaning |
+| --- | --- | --- |
+| Time | `_ns`, `_us`, `_ms`, `_s` | |
+| Clock | `_cycles` | clock cycles, e.g. from `clock64()` |
+| Frequency | `_mhz`, `_ghz` | 10^6, 10^9 Hz |
+| Data | `_bits`, `_bytes` | |
+| Data, decimal | `_kbytes`, `_mbytes`, `_gbytes`, `_tbytes` | 10^3, 10^6, 10^9, 10^12 bytes |
+| Data, decimal bits | `_kbits`, `_mbits`, `_gbits` | 10^3, 10^6, 10^9 bits |
+| Data, binary | `_kibytes`, `_mibytes`, `_gibytes`, `_tibytes` | 2^10, 2^20, 2^30, 2^40 bytes |
+| Bandwidth | `_gbytes_per_s`, `_tbytes_per_s`, `_gbits_per_s` | not `_gbps`: bits or bytes? |
+| Work | `_flop`, `_gflop`, `_tflop` | 1, 10^9, 10^12 floating-point operations; never `_flops` |
+| Throughput | `_gflops`, `_tflops` | 10^9, 10^12 FLOP per second: the `s` means per second |
+| Arithmetic intensity | `_flop_per_byte` | |
+| Power | `_w` | watts |
+| Count | `_count` | a number of items: `element_count` |
+| Fraction | `_frac`, `_pct` | 0 to 1, 0 to 100 |
+
+For a unit the table lacks, build the suffix the same way, from lowercase unit names joined with
+`_per_` (`_hz`, `_flop_per_cycle`), and add its row here in the same change.
+
 ## Documenting the system
 
 Documentation of the system (GPU model, compute capability, clocks, power limit, driver and toolkit
