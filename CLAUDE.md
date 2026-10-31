@@ -65,7 +65,7 @@ else is required.
 <folder>/
 ├── README.md                    # what it does and how to run it (present tense)
 ├── CLAUDE.md                    # optional: folder-specific rules
-├── Makefile                     # entry points: make test, make fmt, make tidy, make clean
+├── Makefile                     # entry points: make help, test, fmt, tidy, clean (makefiles skill)
 ├── .gitignore                   # ignores .build/
 ├── .env.example                 # puts nvcc on PATH and sets CUDA_VISIBLE_DEVICES; copy to .env
 ├── .clang-format, .clang-tidy   # copies of cuda_book's (Google style, 100 columns)
@@ -80,7 +80,7 @@ else is required.
 └── .build/                      # build outputs (git-ignored)
 ```
 
-- Name Makefile targets with the `make-target-names` skill (`.claude/skills/make-target-names/`).
+- Write the Makefile with the `makefiles` skill (`.claude/skills/makefiles/`).
 - Before committing, run `make fmt` (clang-format and ruff) and `make tidy` (clang-tidy and ruff).
   Both must come back clean for the folder's own files.
 - Never hardcode host-specific settings (CUDA version or path, GPU architecture). Take them from
