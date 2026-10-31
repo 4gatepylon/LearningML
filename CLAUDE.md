@@ -73,13 +73,17 @@ else is required.
 > NOTE: `cuda_book/` is separate from this template and doesn't necessarily follow it. It keeps its
 > own layout and rules (see `cuda_book/CLAUDE.md`).
 
-## Names and declarations
+## Code practices
+
+These rules are for new code in every language; don't rewrite existing code only to follow them.
+Inside `cuda_book/`, `cuda_book/CLAUDE.md` wins where the two differ (e.g. `_h`/`_d` instead of
+`_host`/`_device`); the rest applies there too.
+
+### Names and declarations
 
 A name should say what a value is without making the reader look at the code around it. Match a
 name's length to its scope: `i`, `j` and `x` are fine for a few lines, but a name that lives across
-a function or a file, or that a decision depends on, spells out its meaning. These rules are for new
-code; don't rename existing code only to follow them. Inside `cuda_book/`, `cuda_book/CLAUDE.md`
-wins where the two differ (e.g. `_h`/`_d` instead of `_host`/`_device`); the rest applies there too.
+a function or a file, or that a decision depends on, spells out its meaning.
 
 - **Intent:** say what the value is for, not what type it is: `active_user_count`, not `count`.
 - **Number:** collections are plural, scalars singular: `for kernel in kernels`.
@@ -102,9 +106,6 @@ wins where the two differ (e.g. `_h`/`_d` instead of `_host`/`_device`); the res
 - **Dangerous functions:** a function that is dangerous to call ends in
   `_DANGEROUS_DANGEROUS_DANGEROUS_BECAUSE_<REASON>`:
   `free_buffer_DANGEROUS_DANGEROUS_DANGEROUS_BECAUSE_KERNELS_MAY_STILL_READ_IT`.
-- **Dangerous code:** every line of a section that is dangerous to change is preceded by
-  `// DANGEROUS DANGEROUS DANGEROUS IF YOU CHANGE THIS THEN <CONSEQUENCE> WILL HAPPEN` (`#` in
-  Python), the same comment before each line.
 - **Types:** classes and structs are nouns for the object, not the action: `Dataloader`, not
   `Dataload`. Type aliases end in `_t`: `bf16_t`, `matmul_fn_t`.
 - **Math letters:** where code follows a formula or a standard algorithm (kernels, linear algebra),
@@ -152,6 +153,153 @@ wins where the two differ (e.g. `_h`/`_d` instead of `_host`/`_device`); the res
 
 For a unit the table lacks, build the suffix the same way, from lowercase unit names joined with
 `_per_` (`_hz`, `_flop_per_cycle`), and add its row here in the same change.
+
+### Comments
+
+Code has no comments except docstrings and DANGEROUS comments. Tool directives such as
+`// NOLINT(...)`, `# noqa`, `#pragma` and shebangs aren't comments for this rule.
+
+- **Docstrings:** every file, class and function has one docstring, in the template for its
+  language below. It gives the purpose, the interface, an example and, optionally, what a reader
+  must know.
+- **DANGEROUS comments:** a line that someone MUST know something about before changing it gets a
+  one-line comment right above it:
+  `// DANGEROUS DANGEROUS DANGEROUS IF YOU CHANGE THIS THEN <CONSEQUENCE> WILL HAPPEN` (`#` in
+  Python). In a dangerous section, every line gets one. A DANGEROUS comment longer than one line
+  needs the user's approval. Nothing else gets a comment.
+- **Phrasing:** every sentence names its subject and uses the active voice: "`copy_to_device`
+  copies a host array to the device.", not "Copies a host array to the device.". Write directly,
+  clearly and briefly. Separate points are bullets; a line of reasoning is a paragraph.
+- **Sections:** a docstring's sections come in the template's order. A section with nothing to say
+  is left out, except Example, which every docstring has except a test's.
+- **Interface:** a function's interface is its arguments, return value and errors. A file's is its
+  command-line arguments (scripts and `main`s) or its public names (libraries). A Python class's is
+  its constructor arguments and attributes; a C++ class documents its interface on its public
+  methods and static constructors.
+- **Must know:** an optional list grouped under these categories, in this order: Limitations,
+  Gotchas, Side effects, Performance. Each item is one bullet of one sentence that fits on one
+  line. A new category needs the user's agreement.
+- **Files without docstrings:** Makefiles, shell scripts, TOML and `.env` files start with a `#`
+  block shaped like the Python file docstring.
+
+Python docstrings use the Google style:
+
+```python
+"""`bench.py` times every kernel and prints a table of time, TFLOPS and roofline share.
+
+Interface:
+    -N: Matrix size (default 8192).
+    --warmup-iterations: Untimed calls per kernel before the timed one (default 1).
+
+Example:
+    $ uv run scripts/bench.py -N 4096
+
+Must know:
+    Gotchas:
+        - `bench.py` reads the roofline peaks from `.env`, so `source .env` must run first.
+"""
+
+
+class Dataloader:
+    """`Dataloader` loads batches of samples from files on disk.
+
+    Args:
+        paths: Files that the `Dataloader` reads, in order.
+
+    Attributes:
+        batch_count: Number of batches loaded so far.
+
+    Example:
+        >>> dataloader = Dataloader.FromFiles(paths)
+
+    Must know:
+        Limitations:
+            - A `Dataloader` is not thread-safe.
+    """
+
+
+def copy_to_device(X_host: np.ndarray) -> DeviceArray:
+    """`copy_to_device` copies a host array into a new device buffer.
+
+    Args:
+        X_host: The array to copy.
+
+    Returns:
+        A new device buffer that holds a copy of `X_host`.
+
+    Raises:
+        MemoryError: The device has no room for the copy.
+
+    Example:
+        >>> X_device = copy_to_device(X_host)
+
+    Must know:
+        Side effects:
+            - The caller owns the new buffer and must free it.
+    """
+```
+
+C++ and CUDA docstrings use Doxygen's Javadoc style:
+
+```cpp
+/**
+ * @file
+ * @brief `bench.cc` times one call of each kernel and prints one CSV line per kernel.
+ *
+ * @par Interface
+ * - Arguments: `N warmup_iterations`.
+ * - Output: one `name,milliseconds` line per kernel on stdout.
+ *
+ * @par Example
+ * @code
+ * .build/bench 8192 1
+ * @endcode
+ *
+ * @par Must know
+ * - Gotchas:
+ *   - The timed call includes cuBLAS setup when `warmup_iterations` is 0.
+ */
+
+/**
+ * @brief `Dataloader` loads batches of samples from files on disk.
+ *
+ * @par Example
+ * @code
+ * Dataloader dataloader = Dataloader::FromFiles(paths);
+ * @endcode
+ *
+ * @par Must know
+ * - Limitations:
+ *   - A `Dataloader` is not thread-safe.
+ */
+
+/**
+ * @brief `matmul_cublas` computes C = A * B for N x N row-major bf16 matrices with cuBLAS.
+ *
+ * @param[in] A_device Left factor, N x N, in device memory.
+ * @param[in] B_device Right factor, N x N, in device memory.
+ * @param[out] C_device Product, N x N, in device memory.
+ * @param[in] N Matrix size.
+ *
+ * @par Example
+ * @code
+ * matmul_cublas(A_device, B_device, C_device, N);
+ * @endcode
+ *
+ * @par Must know
+ * - Performance:
+ *   - The first call creates the cuBLAS handle, so it is much slower than later calls.
+ */
+```
+
+A C++ function that returns a value adds `@return <meaning>.` after its `@param` lines, and one that
+throws adds `@throws <type> <when>.`.
+
+### Why
+
+These practices aim for fewer bugs, code that reads quickly, and short code. They get there by
+keeping code standard, informative and correct. When something you write isn't covered by a rule
+here, ask the user whether to set one, so that conventions don't drift apart.
 
 ## Documenting the system
 
