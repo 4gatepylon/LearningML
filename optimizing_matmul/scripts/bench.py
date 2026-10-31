@@ -1,4 +1,4 @@
-"""`bench.py` times every kernel over trials of batched calls and prints a table of time statistics.
+"""`bench.py` times kernels over trials of batched calls and prints a table of time statistics.
 
 `bench.py` is more than a shim around `.build/bench`. The C++ binary does the timing, since the
 kernels and CUDA events live in C++. `bench.py` owns the command line (flags, defaults and
@@ -10,9 +10,11 @@ Interface:
     --warmup-iteration-count: Untimed calls per kernel before the trials (default 1, at least 0).
     --trial-count: Timed batches per kernel, interleaved across kernels (default 3, at least 1).
     --batch-size: Back-to-back calls per timed batch (default 100, at least 1).
+    --kernel: A kernel to time; repeat it for several (default: every kernel).
+    --list-kernels: Print the kernel names and exit.
 
 Example:
-    $ make bench BENCH_ARGS="-N 4096 --batch-size 1000"
+    $ make bench BENCH_ARGS="-N 4096 --batch-size 1000 --kernel cublas"
 
 Must know:
     Gotchas:
@@ -24,12 +26,10 @@ Must know:
 
 import os
 import statistics
-import subprocess
-from pathlib import Path
 
 import click
+from bench_binary import check_kernel_names, list_kernel_names, run_bench
 
-_BENCH_BINARY_PATH: Path = Path(__file__).resolve().parent.parent / ".build" / "bench"
 _DEFAULT_N: int = 8192
 _DEFAULT_WARMUP_ITERATION_COUNT: int = 1
 _DEFAULT_TRIAL_COUNT: int = 3
@@ -47,7 +47,7 @@ _ROW_FORMAT: str = "{:<8}{:>6}{:>8}{:>7}{:>10}{:>11}{:>10}{:>10}{:>9}{:>10}{:>7}
 
 
 @click.command(
-    help="Times every kernel over trials of batched calls and prints time statistics.",
+    help="Times kernels over trials of batched calls and prints time statistics.",
     context_settings={"help_option_names": ["-h", "--help"]},
 )
 @click.option(
@@ -79,7 +79,21 @@ _ROW_FORMAT: str = "{:<8}{:>6}{:>8}{:>7}{:>10}{:>11}{:>10}{:>10}{:>9}{:>10}{:>7}
     show_default=True,
     help="Back-to-back calls per timed batch.",
 )
-def main(N: int, warmup_iteration_count: int, trial_count: int, batch_size: int) -> None:
+@click.option(
+    "--kernel",
+    "kernel_names",
+    multiple=True,
+    help="A kernel to time; repeat it for several. Default: every kernel.",
+)
+@click.option("--list-kernels", "is_listing_kernels", is_flag=True, help="Print the kernel names.")
+def main(
+    N: int,
+    warmup_iteration_count: int,
+    trial_count: int,
+    batch_size: int,
+    kernel_names: tuple[str, ...],
+    is_listing_kernels: bool,
+) -> None:
     """`main` runs the benchmark binary and prints one row of time statistics per kernel.
 
     Args:
@@ -87,6 +101,8 @@ def main(N: int, warmup_iteration_count: int, trial_count: int, batch_size: int)
         warmup_iteration_count: Untimed calls per kernel before the trials.
         trial_count: Timed batches per kernel.
         batch_size: Back-to-back calls per timed batch.
+        kernel_names: Kernels to time; empty times every kernel.
+        is_listing_kernels: Whether to print the kernel names and exit instead.
 
     Example:
         $ uv run scripts/bench.py -N 4096 --batch-size 1000
@@ -95,6 +111,10 @@ def main(N: int, warmup_iteration_count: int, trial_count: int, batch_size: int)
         Limitations:
             - The roofline assumes that A, B and C each cross DRAM exactly once.
     """
+    if is_listing_kernels:
+        click.echo("\n".join(list_kernel_names()))
+        return
+    check_kernel_names(kernel_names)
     peak_dense_bf16_tflops_according_to_nvidia_spec: float = float(
         os.environ["PEAK_DENSE_BF16_TFLOPS_ACCORDING_TO_NVIDIA_SPEC"]
     )
@@ -109,22 +129,9 @@ def main(N: int, warmup_iteration_count: int, trial_count: int, batch_size: int)
         intensity_flop_per_byte * mem_bandwidth_tbytes_per_s_according_to_nvidia_spec,
     )
 
-    bench_command: list[str] = [
-        str(_BENCH_BINARY_PATH),
-        str(N),
-        str(warmup_iteration_count),
-        str(trial_count),
-        str(batch_size),
-    ]
-    bench_stdout: str = subprocess.run(
-        bench_command, check=True, stdout=subprocess.PIPE, text=True
-    ).stdout
-    kernel_name_to_ms_per_call_samples_according_to_cuda_events: dict[str, list[float]] = {}
-    for csv_line in bench_stdout.splitlines():
-        kernel_name, elapsed_ms_text = csv_line.split(",")
-        kernel_name_to_ms_per_call_samples_according_to_cuda_events.setdefault(
-            kernel_name, []
-        ).append(float(elapsed_ms_text))
+    kernel_name_to_ms_per_call_samples_according_to_cuda_events: dict[str, list[float]] = run_bench(
+        N, warmup_iteration_count, trial_count, batch_size, kernel_names
+    )
 
     print(
         _ROW_FORMAT.format(
