@@ -75,7 +75,7 @@ Exactly one **type** label and at least one **area** label.
 
 ```bash
 gh issue create --title "<title>" --body-file body.md --label enhancement --label area:kernels
-gh issue edit <n> --add-label <label>      # works, unlike `gh pr edit` on align-4
+gh issue edit <n> --add-label <label>
 gh issue close <n> --reason "not planned"  # or "completed"; close, don't delete
 ```
 

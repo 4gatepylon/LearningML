@@ -64,5 +64,6 @@ Reviewable lines: <N> (<what they are, e.g. "Markdown only" or "kernels/ + tests
 ## Updating
 
 When a PR changes after review, update the description so it matches the final diff (Changes,
-Testing, Size, Decisions). On this repo's `align-4` host `gh pr edit` is broken; set the body with
-`gh api -X PATCH repos/<owner>/<repo>/pulls/<n> -f body="$(cat body.md)"`.
+Testing, Size, Decisions), with `gh pr edit <n> --body-file body.md`. If that fails with a
+Projects (classic) error (seen once with gh 2.55 on align-4, 2026-10-30), use
+`gh api -X PATCH repos/<owner>/<repo>/pulls/<n> -f body="$(cat body.md)"` instead.
