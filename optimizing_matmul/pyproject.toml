@@ -1,3 +1,10 @@
+# `pyproject.toml` defines the uv project for the Python scripts and the dev tools.
+#
+# Interface:
+#     dev dependency group: ruff, clang-format and clang-tidy.
+#
+# Example:
+#     uv run ruff check .
 [project]
 name = "optimizing-matmul"
 version = "0.1.0"

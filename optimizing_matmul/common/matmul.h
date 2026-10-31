@@ -1,5 +1,24 @@
-// Shared by the kernels, tests and benchmark: every kernel computes C = A * B for n x n row-major
-// bf16 matrices in device memory, accumulating in fp32.
+/**
+ * @file
+ * @brief `matmul.h` holds the kernel interface, the list of kernels and the shared helpers.
+ *
+ * @par Interface
+ * - `bf16_t`, `matmul_fn_t`: the element type, and the signature that every kernel has.
+ * - `Kernel`, `KERNELS`: every kernel that the tests and the benchmark run.
+ * - `CHECK`, `check_status`: abort on a failed CUDA or cuBLAS call.
+ * - `copy_to_device`: copy a host array into a new device buffer.
+ *
+ * @par Example
+ * @code
+ * for (const Kernel& kernel : KERNELS) kernel.matmul_fn(A_device, B_device, C_device, N);
+ * @endcode
+ *
+ * @par Must know
+ * - Limitations:
+ *   - Every kernel computes C = A * B for N x N row-major bf16 matrices, accumulating in fp32.
+ * - Gotchas:
+ *   - A new kernel needs a declaration here and an entry in `KERNELS`, or nothing runs it.
+ */
 #pragma once
 
 #include <cuda_bf16.h>
@@ -9,32 +28,76 @@
 #include <cstdlib>
 #include <vector>
 
-using bf16 = __nv_bfloat16;
-using MatmulFn = void (*)(const bf16* A_d, const bf16* B_d, bf16* C_d, int n);
+using bf16_t = __nv_bfloat16;
+using matmul_fn_t = void (*)(const bf16_t* A_device, const bf16_t* B_device, bf16_t* C_device,
+                             int N);
 
-// Aborts with the call's text if a CUDA or cuBLAS call fails (both return 0 on success).
-#define CHECK(call) check_status(static_cast<int>(call), #call, __FILE__, __LINE__)
-inline void check_status(int err, const char* call, const char* file, int line) {
-  if (err != 0) {
-    std::fprintf(stderr, "%s:%d: %s failed with error %d\n", file, line, call, err);
+constexpr int CUDA_AND_CUBLAS_SUCCESS_STATUS_CODE = 0;
+
+/**
+ * @brief `check_status` prints the failed call and aborts if `status_code` is not a success.
+ *
+ * @param[in] status_code Status that a CUDA or cuBLAS call returned.
+ * @param[in] call_text Source text of the call.
+ * @param[in] file_name File that holds the call.
+ * @param[in] line_number Line that holds the call.
+ *
+ * @par Example
+ * @code
+ * CHECK(cudaDeviceSynchronize());
+ * @endcode
+ *
+ * @par Must know
+ * - Gotchas:
+ *   - Code calls it through `CHECK`, which fills in the call's text, file and line.
+ */
+inline void check_status(int status_code, const char* call_text, const char* file_name,
+                         int line_number) {
+  if (status_code != CUDA_AND_CUBLAS_SUCCESS_STATUS_CODE) {
+    std::fprintf(stderr, "%s:%d: %s failed with status %d\n", file_name, line_number, call_text,
+                 status_code);
     std::abort();
   }
 }
+#define CHECK(call) check_status(static_cast<int>(call), #call, __FILE__, __LINE__)
 
-void matmul_cublas(const bf16* A_d, const bf16* B_d, bf16* C_d, int n);
+void matmul_cublas(const bf16_t* A_device, const bf16_t* B_device, bf16_t* C_device, int N);
 
-// Every kernel the tests and benchmark run. A new kernel is declared above and added here.
+/**
+ * @brief `Kernel` pairs a kernel's name with its function.
+ *
+ * @par Example
+ * @code
+ * Kernel kernel = {"cublas", matmul_cublas};
+ * @endcode
+ */
 struct Kernel {
   const char* name;
-  MatmulFn fn;
+  matmul_fn_t matmul_fn;
 };
-inline constexpr Kernel kKernels[] = {{"cublas", matmul_cublas}};
 
-// Copies a host matrix into a new device buffer, rounding each value to bf16.
-inline bf16* to_device(const std::vector<float>& x_h) {
-  const std::vector<bf16> x_bf16_h(x_h.begin(), x_h.end());
-  bf16* x_d = nullptr;
-  CHECK(cudaMalloc(&x_d, x_bf16_h.size() * sizeof(bf16)));
-  CHECK(cudaMemcpy(x_d, x_bf16_h.data(), x_bf16_h.size() * sizeof(bf16), cudaMemcpyHostToDevice));
-  return x_d;
+inline constexpr Kernel KERNELS[] = {{"cublas", matmul_cublas}};
+
+/**
+ * @brief `copy_to_device` copies a host array into a new device buffer, rounding to bf16.
+ *
+ * @param[in] X_host Values to copy.
+ * @return A new device buffer that holds `X_host` rounded to bf16.
+ *
+ * @par Example
+ * @code
+ * bf16_t* A_device = copy_to_device(A_host);
+ * @endcode
+ *
+ * @par Must know
+ * - Side effects:
+ *   - The caller owns the returned buffer and must `cudaFree` it.
+ */
+inline bf16_t* copy_to_device(const std::vector<float>& X_host) {
+  const std::vector<bf16_t> X_bf16_host(X_host.begin(), X_host.end());
+  const size_t X_bytes = X_bf16_host.size() * sizeof(bf16_t);
+  bf16_t* X_device = nullptr;
+  CHECK(cudaMalloc(&X_device, X_bytes));
+  CHECK(cudaMemcpy(X_device, X_bf16_host.data(), X_bytes, cudaMemcpyHostToDevice));
+  return X_device;
 }
