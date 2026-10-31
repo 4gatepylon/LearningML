@@ -90,6 +90,8 @@ code; don't rename existing code only to follow them. `cuda_book/` keeps its own
   `plan_created_by_autotuner`.
 - **Range bounds:** an index or pointer that starts or ends a range (other than a loop variable)
   ends in `_incl` or `_excl`: `end_excl`, `last_row_incl`.
+- **Booleans:** read as a yes/no question, starting with a verb such as `is_`, `has_`, `can_` or
+  `should_`: `is_too_big`, not `too_big`.
 - **Temporaries:** a throwaway value starts with `temp_`: `temp_sum`.
 - **Functions:** `<verb>_<noun>`, the action and what it acts on: `copy_to_device`, `parse_args`.
   Interchangeable implementations of one operation may be `<operation>_<variant>`: `matmul_cublas`.
