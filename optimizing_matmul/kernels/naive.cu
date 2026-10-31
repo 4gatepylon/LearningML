@@ -3,7 +3,6 @@
  * @brief `naive.cu` defines `matmul_naive`, a kernel that gives each thread one element of C.
  *
  * @par Interface
- * - `matmul_naive_kernel`: Computes one element of C per thread.
  * - `matmul_naive`: Launches `matmul_naive_kernel`; it has the `matmul_fn_t` signature.
  *
  * @par Example
@@ -14,6 +13,8 @@
 #include <cstdint>
 
 #include "common/matmul.h"
+
+namespace {
 
 constexpr int BLOCK_COL_COUNT = 32;
 constexpr int BLOCK_ROW_COUNT = 8;
@@ -50,6 +51,8 @@ __global__ void matmul_naive_kernel(const bf16_t* A_device, const bf16_t* B_devi
   }
   C_device[(i * N) + j] = __float2bfloat16(C_ij_fp32);
 }
+
+}  // namespace
 
 /**
  * @brief `matmul_naive` launches `matmul_naive_kernel` with one thread per element of C.
