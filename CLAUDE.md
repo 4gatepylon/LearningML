@@ -149,6 +149,16 @@ a function or a file, or that a decision depends on, spells out its meaning.
 - **No magic numbers:** every literal with a meaning gets a named constant: `constexpr` in C++, a
   module-level constant in Python, `#define` only where a constant can't work. Bare `0` and `1` as
   start values, identities or increments are fine.
+- **Macros:** a `#define` goes at the top of its file, after the includes, unless there is a good
+  reason to put it elsewhere. A macro anywhere else gets a one-line comment right above it that
+  says why it is there and where it is used:
+  `// TILE_SIZE is here because only tile_rows uses it; no other file includes it.`
+- **Privacy:** everything that is not part of the interface of a module, file or class is private,
+  so that only the interface can be imported. Keep as much private as possible.
+  - Python: private module names, attributes and methods start with `_`: `_load_batch`.
+  - C++ and CUDA: names used by only one `.cc` or `.cu` file go in an anonymous namespace there,
+    headers declare only the interface, and class members outside the interface are `private:`,
+    with data members ending in `_` (Google style): `batch_count_`.
 - **Declared types:** write the type when declaring a variable, in Python too
   (`timeout_ms: float = ...`). Use C++ `auto` only where the type can't be written (lambdas).
 
@@ -174,8 +184,8 @@ For a unit the table lacks, build the suffix the same way, from lowercase unit n
 
 ### Comments
 
-Code has no comments except docstrings and DANGEROUS comments. Tool directives such as
-`// NOLINT(...)`, `# noqa`, `#pragma` and shebangs aren't comments for this rule.
+Code has no comments except docstrings, DANGEROUS comments and macro comments (see Macros). Tool
+directives such as `// NOLINT(...)`, `# noqa`, `#pragma` and shebangs aren't comments for this rule.
 
 - **Docstrings:** every file, class and function has one docstring, in the template for its
   language below. It gives the purpose, the interface, an example and, optionally, what a reader
