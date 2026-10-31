@@ -38,14 +38,25 @@ Python projects:
 
 ML training projects: the Python targets, plus:
 
-- `make reset-artifacts`: deletes `.artifacts/` (weights, checkpoints, logs, results) after the
-  user types `yes` to a warning that recreating it may mean rerunning costly experiments:
+- `make reset-artifacts`: deletes `.artifacts/` (weights, checkpoints, logs, results). Like any
+  destructive CLI (`clis` skill), it fails by default with a warning that recreating
+  `.artifacts/` may mean rerunning costly experiments. `YES_TO_RESET_ARTIFACTS=1` deletes it
+  without asking; `INTERACTIVE=1` asks, and deletes only if the user types `yes`:
 
 ```make
+RESET_ARTIFACTS_WARNING := This deletes .artifacts/ (weights, checkpoints, logs, results). \
+  Recreating it may mean rerunning costly experiments. \
+  To skip this question, pass YES_TO_RESET_ARTIFACTS=1.
+
 reset-artifacts:
-	@printf "This deletes .artifacts/. Recreating it may mean rerunning costly experiments.\n"
-	@printf "Type yes to continue: "; read answer; [ "$$answer" = yes ]
+ifeq ($(YES_TO_RESET_ARTIFACTS),1)
 	rm -rf .artifacts
+else ifeq ($(INTERACTIVE),1)
+	@printf '%s\nType yes to confirm: ' "$(RESET_ARTIFACTS_WARNING)"; read answer; [ "$$answer" = yes ]
+	rm -rf .artifacts
+else
+	@printf '%s\nTo be asked instead, pass INTERACTIVE=1.\n' "$(RESET_ARTIFACTS_WARNING)" >&2; exit 2
+endif
 ```
 
 ## Target names

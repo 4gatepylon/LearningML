@@ -77,10 +77,17 @@ By project type:
 
 - **Kernel folders:** `.build/` and `.artifacts/` (profiler reports, raw benchmark output, plots).
 - **ML training projects:** `.data/`, `.artifacts/`, and `.build/` if anything is compiled.
-  `make reset-artifacts` deletes `.artifacts/` only after the user types `yes` to a warning that
-  recreating it may mean rerunning costly experiments.
+  `make reset-artifacts` deletes `.artifacts/`. Like every destructive command, it fails with a
+  warning unless it gets `YES_TO_RESET_ARTIFACTS=1`, or `INTERACTIVE=1` and the user types `yes`.
 - **Other software projects:** there is no rule yet. Before creating any git-ignored folder, tell
   the user there is no guidance for this project type and ask for it.
+
+## Command-line interfaces
+
+Write every script's and main's command-line interface with the `clis` skill
+(`.claude/skills/clis/`): click in Python, `getopt_long` in C and C++, non-interactive and
+idempotent by default, `--yes-to-<action>` and `--interactive` for destructive actions, and one
+vocabulary of flags across the repo.
 
 ## Kernel folders
 
