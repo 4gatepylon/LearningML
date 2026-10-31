@@ -9,6 +9,7 @@
  * reference.
  * - `matmul.matches_cublas_large_random_normal`: Checks every kernel against cuBLAS at a large N.
  * - `matmul.sign_*`: One test per part of the sign partitioning (see Coverage).
+ * - `matmul.magnitude_*`: Tests for the tiny and huge parts of the magnitude partitioning.
  *
  * @par Coverage
  * Every kernel is checked against the CPU reference on one exemplar per part.
@@ -18,6 +19,12 @@
  * | | Non-negative, some positive | `matmul.sign_non_negative` |
  * | | Non-positive, some negative | `matmul.sign_non_positive` |
  * | | Both signs | `matmul.sign_mixed`, `matmul.matches_reference_random_normal` |
+ * | Largest abs value m in A and B | Tiny: 0 < m < 2^-63 | `matmul.magnitude_tiny_*` |
+ * | | Normal: m = 0, or 2^-63 <= m <= 2^64 | `matmul.matches_reference_random_normal` |
+ * | | Huge: m > 2^64 | `matmul.magnitude_huge_*` |
+ *
+ * The magnitude limits are the square roots of bf16's smallest normal (2^-126) and largest value
+ * (about 2^128): below and above them, products of two inputs leave bf16's normal range.
  *
  * @par Must know
  * - Gotchas:
@@ -38,6 +45,11 @@ namespace {
 constexpr float UNWRITTEN_SENTINEL = -1.0F;
 constexpr double BF16_UNIT_ROUNDOFF = 0x1p-8;
 constexpr double FP32_UNIT_ROUNDOFF = 0x1p-24;
+constexpr double BF16_HALF_MIN_SUBNORMAL = 0x1p-134;
+constexpr float BF16_MIN_NORMAL = 0x1p-126F;
+constexpr float BF16_MAX = 0x1.fep127F;
+constexpr float TINY_MAGNITUDE_LIMIT = 0x1p-63F;
+constexpr float HUGE_MAGNITUDE_LIMIT = 0x1p64F;
 constexpr int REFERENCE_N = 96;
 constexpr int LARGE_N = 4096;
 constexpr unsigned A_SEED = 1;
@@ -164,7 +176,8 @@ Reference compute_reference(const std::vector<float>& A_host, const std::vector<
  * @param[in] C_exact The exact value of one element of C.
  * @param[in] abs_product_sum The sum over k of |A[i][k] * B[k][j]| for that element.
  * @param[in] K Length of the dot product.
- * @return Rounding to bf16 (twice, to cover the input side) plus fp32 accumulation over K terms.
+ * @return Rounding to bf16 (twice, to cover the input side) plus fp32 accumulation over K terms,
+ *         plus half of bf16's smallest subnormal for outputs that round to subnormals.
  *
  * @par Example
  * @code
@@ -174,7 +187,7 @@ Reference compute_reference(const std::vector<float>& A_host, const std::vector<
 double compute_tolerance(double C_exact, double abs_product_sum, int K) {
   constexpr double rounding_count = 2.0;
   return (rounding_count * BF16_UNIT_ROUNDOFF * std::abs(C_exact)) +
-         (K * FP32_UNIT_ROUNDOFF * abs_product_sum);
+         (K * FP32_UNIT_ROUNDOFF * abs_product_sum) + BF16_HALF_MIN_SUBNORMAL;
 }
 
 /**
@@ -202,6 +215,47 @@ void expect_close_to_reference(const std::vector<float>& A_host, const std::vect
           << ", reference = " << reference.C[e];
     }
   }
+}
+
+/**
+ * @brief `find_max_abs_value` returns the largest absolute value in A and B.
+ *
+ * @param[in] A_host Left factor.
+ * @param[in] B_host Right factor.
+ * @return The largest absolute value, which picks the part of the magnitude partitioning.
+ *
+ * @par Example
+ * @code
+ * ASSERT_LT(find_max_abs_value(A_host, B_host), TINY_MAGNITUDE_LIMIT);
+ * @endcode
+ */
+float find_max_abs_value(const std::vector<float>& A_host, const std::vector<float>& B_host) {
+  float max_abs_value = 0.0F;
+  for (const std::vector<float>* X_host : {&A_host, &B_host}) {
+    for (const float x : *X_host) {
+      max_abs_value = std::max(max_abs_value, std::abs(x));
+    }
+  }
+  return max_abs_value;
+}
+
+/**
+ * @brief `make_identity_matrix` returns the N x N identity matrix.
+ *
+ * @param[in] N Matrix size.
+ * @return The identity, row-major.
+ *
+ * @par Example
+ * @code
+ * std::vector<float> B_host = make_identity_matrix(N);
+ * @endcode
+ */
+std::vector<float> make_identity_matrix(int N) {
+  std::vector<float> I_host(static_cast<size_t>(N) * N, 0.0F);
+  for (int i = 0; i < N; ++i) {
+    I_host[(i * N) + i] = 1.0F;
+  }
+  return I_host;
 }
 
 }  // namespace
@@ -327,4 +381,79 @@ TEST(matmul, sign_mixed) {
   expect_close_to_reference(make_random_matrix(REFERENCE_N, A_SEED, draw_minus_one_zero_or_one),
                             make_random_matrix(REFERENCE_N, B_SEED, draw_minus_one_zero_or_one),
                             REFERENCE_N);
+}
+
+/**
+ * @brief `matmul.magnitude_tiny_near_limit` covers the tiny part with +-{1, 2, 3} * 2^-65.
+ *
+ * @par Must know
+ * - Gotchas:
+ *   - Products of 2^-130 to 9 * 2^-130 are fp32 subnormals, so this checks subnormal accumulation.
+ */
+TEST(matmul, magnitude_tiny_near_limit) {
+  constexpr float tiny_scale = 0x1p-65F;
+  const auto draw_tiny = [&](std::mt19937& rng) {
+    return tiny_scale * static_cast<float>(std::uniform_int_distribution<int>(-3, 3)(rng));
+  };
+  const std::vector<float> A_host = make_random_matrix(REFERENCE_N, A_SEED, draw_tiny);
+  const std::vector<float> B_host = make_random_matrix(REFERENCE_N, B_SEED, draw_tiny);
+  ASSERT_LT(find_max_abs_value(A_host, B_host), TINY_MAGNITUDE_LIMIT);
+  expect_close_to_reference(A_host, B_host, REFERENCE_N);
+}
+
+/**
+ * @brief `matmul.magnitude_tiny_at_bf16_min` covers the tiny part with +-bf16's smallest normal.
+ *
+ * @par Must know
+ * - Gotchas:
+ *   - Every product underflows, so every kernel must return zeros, not garbage or NaN.
+ */
+TEST(matmul, magnitude_tiny_at_bf16_min) {
+  const auto draw_signed_min_normal = [](std::mt19937& rng) {
+    return std::bernoulli_distribution()(rng) ? BF16_MIN_NORMAL : -BF16_MIN_NORMAL;
+  };
+  const std::vector<float> A_host = make_random_matrix(REFERENCE_N, A_SEED, draw_signed_min_normal);
+  const std::vector<float> B_host = make_random_matrix(REFERENCE_N, B_SEED, draw_signed_min_normal);
+  ASSERT_LT(find_max_abs_value(A_host, B_host), TINY_MAGNITUDE_LIMIT);
+  expect_close_to_reference(A_host, B_host, REFERENCE_N);
+}
+
+/**
+ * @brief `matmul.magnitude_huge_few_large_values` covers the huge part with a few +-2^100 values.
+ *
+ * @par Must know
+ * - Gotchas:
+ *   - A is normal except for `outlier_count` entries of +-2^100, so C stays finite.
+ */
+TEST(matmul, magnitude_huge_few_large_values) {
+  constexpr float outlier_value = 0x1p100F;
+  constexpr int outlier_count = 8;
+  constexpr unsigned outlier_seed = 3;
+  std::vector<float> A_host = make_random_matrix(REFERENCE_N, A_SEED, draw_standard_normal);
+  std::mt19937 outlier_rng(outlier_seed);  // NOLINT(bugprone-random-generator-seed)
+  std::uniform_int_distribution<size_t> outlier_index_distribution(0, A_host.size() - 1);
+  for (int outlier = 0; outlier < outlier_count; ++outlier) {
+    const bool is_negative = std::bernoulli_distribution()(outlier_rng);
+    A_host[outlier_index_distribution(outlier_rng)] = is_negative ? -outlier_value : outlier_value;
+  }
+  const std::vector<float> B_host = make_random_matrix(REFERENCE_N, B_SEED, draw_standard_normal);
+  ASSERT_GT(find_max_abs_value(A_host, B_host), HUGE_MAGNITUDE_LIMIT);
+  expect_close_to_reference(A_host, B_host, REFERENCE_N);
+}
+
+/**
+ * @brief `matmul.magnitude_huge_at_bf16_max` covers the huge part with +-bf16's largest value.
+ *
+ * @par Must know
+ * - Gotchas:
+ *   - B is the identity, so C = A must reproduce bf16's largest value exactly, without overflow.
+ */
+TEST(matmul, magnitude_huge_at_bf16_max) {
+  const auto draw_signed_max = [](std::mt19937& rng) {
+    return std::bernoulli_distribution()(rng) ? BF16_MAX : -BF16_MAX;
+  };
+  const std::vector<float> A_host = make_random_matrix(REFERENCE_N, A_SEED, draw_signed_max);
+  const std::vector<float> B_host = make_identity_matrix(REFERENCE_N);
+  ASSERT_GT(find_max_abs_value(A_host, B_host), HUGE_MAGNITUDE_LIMIT);
+  expect_close_to_reference(A_host, B_host, REFERENCE_N);
 }
