@@ -80,6 +80,7 @@ else is required.
 └── .build/                      # build outputs (git-ignored)
 ```
 
+- Name Makefile targets with the `make-target-names` skill (`.claude/skills/make-target-names/`).
 - Before committing, run `make fmt` (clang-format and ruff) and `make tidy` (clang-tidy and ruff).
   Both must come back clean for the folder's own files.
 - Never hardcode host-specific settings (CUDA version or path, GPU architecture). Take them from
