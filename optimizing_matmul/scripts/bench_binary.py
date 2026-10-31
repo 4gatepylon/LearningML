@@ -10,7 +10,7 @@ Example:
 
 Must know:
     Gotchas:
-        - `.build/bench` must be built first; `make bench` builds it.
+        - `.build/bench` must be built first; `make bench-kernels` builds it.
 """
 
 import subprocess
