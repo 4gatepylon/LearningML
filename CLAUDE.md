@@ -337,12 +337,13 @@ to check.
 
 1. **Input space:** write down everything the code under test takes as input. For a matmul, that's
    the sizes `M`, `N` and `K` and the values in `A` and `B`.
-2. **Partitionings:** split the input space along one property at a time. Each partitioning is a
+2. **Partitionings:** split the input space along a small number of properties at a time. Usually this will
+   be along one or two properties at most at a time. Each partitioning is a
    set of parts that don't overlap and together cover the whole space, usually a tree or a grid of
    conditions. For a matmul, one partitioning is the sign of the values: all zero, non-negative,
    non-positive, or mixed.
 3. **Coverage:** pick tests (exemplars) so that every part of every partitioning is covered by at
-   least one test. One test covers one part of each partitioning at once, so the minimum number
+   least one test. One test might cover multiple parts (from multiple partitionings) at once, so the minimum number
    of tests is the largest partitioning's part count, not the size of their Cartesian product.
 4. **Coverage table:** the test file's docstring lists each partitioning, its parts, and which tests
    cover each part, so a reviewer can check that no part is missing.
