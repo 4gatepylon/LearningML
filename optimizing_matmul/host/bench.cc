@@ -1,26 +1,25 @@
 /**
  * @file
- * @brief `bench.cc` times `trial_count` calls of each kernel and prints one CSV line per call.
+ * @brief `bench.cc` times `trial_count` batches of `batch_size` calls per kernel, one line each.
  *
  * @par Interface
- * - Arguments: `N warmup_iteration_count trial_count`.
- * - Output: one `name,elapsed_ms_according_to_cuda_events` line per timed call on stdout.
+ * - Arguments: `N warmup_iteration_count trial_count batch_size`.
+ * - Output: one `name,ms_per_call_according_to_cuda_events` line per batch on stdout.
  *
  * @par Example
  * @code
- * .build/bench 8192 1 20
+ * .build/bench 8192 1 3 100
  * @endcode
  *
  * @par Must know
  * - Gotchas:
  *   - The first timed cuBLAS call includes cuBLAS setup when `warmup_iteration_count` is 0.
  *   - Inputs are normal with sigma `INPUT_SIGMA` and never all zeros, which cuBLAS runs faster.
- *   - Each call is timed alone with CUDA events, so launch overhead inflates small-N times.
- *   - This timing method is provisional and may need to change, e.g. to timing batches of calls.
- *   - Times are burst times; sustained load hits the 310 W cap and slows cuBLAS to ~3.0 ms.
- *   - Adding or removing kernels changes the gaps between calls, and so every kernel's times.
+ *   - A batch's stubs overlap GPU work, so only its first stub and launch are in its time.
+ *   - Calls in a batch run back to back, so long batches reach the 310 W cap's throttled clocks.
+ *   - Adding or removing kernels changes the gaps between batches, and so the kernels' times.
  * - Performance:
- *   - Trials run trial-major (each kernel once per trial), so kernels don't run back to back.
+ *   - Trials run trial-major (each kernel's batch once per trial), so batches interleave.
  */
 #include <cstdio>
 #include <cstdlib>
@@ -33,14 +32,16 @@
 
 namespace {
 
-constexpr int EXPECTED_ARG_COUNT = 4;
+constexpr int EXPECTED_ARG_COUNT = 5;
 constexpr int PROGRAM_NAME_ARG_INDEX = 0;
 constexpr int N_ARG_INDEX = 1;
 constexpr int WARMUP_ITERATION_COUNT_ARG_INDEX = 2;
 constexpr int TRIAL_COUNT_ARG_INDEX = 3;
+constexpr int BATCH_SIZE_ARG_INDEX = 4;
 constexpr int MIN_N = 1;
 constexpr int MIN_WARMUP_ITERATION_COUNT = 0;
 constexpr int MIN_TRIAL_COUNT = 1;
+constexpr int MIN_BATCH_SIZE = 1;
 constexpr unsigned RNG_SEED = 0;
 constexpr float INPUT_MEAN = 0.0F;
 constexpr float INPUT_SIGMA = 1.0F;
@@ -95,22 +96,24 @@ bf16_t* upload_random_matrix(std::mt19937& rng, std::vector<float>& temp_X_host)
 }  // namespace
 
 /**
- * @brief `main` warms up every kernel, then times `trial_count` interleaved calls of each.
+ * @brief `main` warms up every kernel, then times `trial_count` interleaved batches of each.
  *
  * @param[in] argc Argument count, `EXPECTED_ARG_COUNT`.
  * @param[in] argv Program name, `N` (at least `MIN_N`), `warmup_iteration_count` (at least
- *                 `MIN_WARMUP_ITERATION_COUNT`) and `trial_count` (at least `MIN_TRIAL_COUNT`).
+ *                 `MIN_WARMUP_ITERATION_COUNT`), `trial_count` (at least `MIN_TRIAL_COUNT`) and
+ *                 `batch_size` (at least `MIN_BATCH_SIZE`).
  * @return `EXIT_SUCCESS`, or `EXIT_FAILURE` after a usage error such as a negative argument.
  *
  * @par Example
  * @code
- * .build/bench 8192 1 20
+ * .build/bench 8192 1 3 100
  * @endcode
  */
 int main(int argc, char** argv) {
   int N = 0;
   int warmup_iteration_count = 0;
   int trial_count = 0;
+  int batch_size = 0;
   try {
     if (argc != EXPECTED_ARG_COUNT) {
       throw std::invalid_argument("wrong argument count");
@@ -119,11 +122,13 @@ int main(int argc, char** argv) {
     warmup_iteration_count =
         parse_int_at_least(argv[WARMUP_ITERATION_COUNT_ARG_INDEX], MIN_WARMUP_ITERATION_COUNT);
     trial_count = parse_int_at_least(argv[TRIAL_COUNT_ARG_INDEX], MIN_TRIAL_COUNT);
+    batch_size = parse_int_at_least(argv[BATCH_SIZE_ARG_INDEX], MIN_BATCH_SIZE);
   } catch (const std::logic_error&) {
     std::fprintf(stderr,
-                 "usage: %s N warmup_iteration_count trial_count (N >= %d, "
-                 "warmup_iteration_count >= %d, trial_count >= %d)\n",
-                 argv[PROGRAM_NAME_ARG_INDEX], MIN_N, MIN_WARMUP_ITERATION_COUNT, MIN_TRIAL_COUNT);
+                 "usage: %s N warmup_iteration_count trial_count batch_size (N >= %d, "
+                 "warmup_iteration_count >= %d, trial_count >= %d, batch_size >= %d)\n",
+                 argv[PROGRAM_NAME_ARG_INDEX], MIN_N, MIN_WARMUP_ITERATION_COUNT, MIN_TRIAL_COUNT,
+                 MIN_BATCH_SIZE);
     return EXIT_FAILURE;
   }
   std::mt19937 rng(RNG_SEED);  // NOLINT(bugprone-random-generator-seed)
@@ -145,13 +150,17 @@ int main(int argc, char** argv) {
   for (int trial = 0; trial < trial_count; ++trial) {
     for (const Kernel& kernel : KERNELS) {
       CHECK(cudaEventRecord(start_event));
-      kernel.matmul_fn(A_device, B_device, C_device, N);
+      for (int i = 0; i < batch_size; ++i) {
+        kernel.matmul_fn(A_device, B_device, C_device, N);
+      }
       CHECK(cudaEventRecord(stop_event));
       CHECK(cudaEventSynchronize(stop_event));
       CHECK(cudaGetLastError());
-      float elapsed_ms_according_to_cuda_events = 0.0F;
-      CHECK(cudaEventElapsedTime(&elapsed_ms_according_to_cuda_events, start_event, stop_event));
-      std::printf("%s,%.4f\n", kernel.name, elapsed_ms_according_to_cuda_events);
+      float batch_ms_according_to_cuda_events = 0.0F;
+      CHECK(cudaEventElapsedTime(&batch_ms_according_to_cuda_events, start_event, stop_event));
+      const float ms_per_call_according_to_cuda_events =
+          batch_ms_according_to_cuda_events / static_cast<float>(batch_size);
+      std::printf("%s,%.6f\n", kernel.name, ms_per_call_according_to_cuda_events);
     }
   }
   return EXIT_SUCCESS;

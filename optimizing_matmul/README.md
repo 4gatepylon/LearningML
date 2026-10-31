@@ -56,13 +56,14 @@ WGMMA) is capped near 51 TFLOPS.
 time at N = 8192: 1.0995e12 / 756.4e12 = 1.45 ms (realistic), / 819.5e12 = 1.34 ms (max clock)
 ```
 
-`make bench` times 20 calls of each kernel, interleaved across kernels, on normal random inputs
-(mean 0, sigma 1). It never uses all-zero inputs, which cuBLAS multiplies faster than real data.
+`make bench` times 3 trials per kernel, interleaved across kernels. Each trial is a batch of 100
+back-to-back calls timed with one pair of CUDA events, and its time is divided by 100. Inputs are
+normal random values (mean 0, sigma 1), never all zeros, which cuBLAS multiplies faster.
 
 **cuBLAS reference** (`cublasGemmEx`, bf16, fp32 accumulate, `N = 8192`, `make bench`): median
-2.31 ms, 476 TFLOPS, about 63% of the 756 TFLOPS ceiling. This is the bar to approach. It is a
-burst time: each cuBLAS call follows a long naive call, so clocks are not yet throttled. Back to
-back, the 310 W power cap lowers SM clocks to about 900 MHz and cuBLAS takes about 3.0 ms.
+2.62 ms per call, 420 TFLOPS, about 55% of the 756 TFLOPS ceiling. This is the bar to approach.
+A batch runs long enough for the 310 W power cap to lower SM clocks. A lone call on idle clocks
+takes about 2.3 ms.
 
 ## Notes
 
