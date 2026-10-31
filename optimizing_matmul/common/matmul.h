@@ -15,12 +15,12 @@
  *
  * @par Example
  * @code
- * for (const Kernel& kernel : KERNELS) kernel.matmul_fn(A_device, B_device, C_device, N);
+ * for (const Kernel& kernel : KERNELS) kernel.matmul_fn(A_device, B_device, C_device, M, N, K);
  * @endcode
  *
  * @par Must know
  * - Limitations:
- *   - Every kernel computes C = A * B for N x N row-major bf16 matrices, accumulating in fp32.
+ *   - Every kernel computes C = A * B (A: M x K, B: K x N, row-major bf16), accumulating in fp32.
  * - Gotchas:
  *   - A new kernel needs a declaration here and an entry in `KERNELS`, or nothing runs it.
  */
@@ -37,7 +37,7 @@
 
 using bf16_t = __nv_bfloat16;
 using matmul_fn_t = void (*)(const bf16_t* A_device, const bf16_t* B_device, bf16_t* C_device,
-                             int N);
+                             int M, int N, int K);
 
 /**
  * @brief `check_status` prints the failed call and aborts if `status_code` is not a success.
@@ -66,8 +66,10 @@ inline void check_status(int status_code, const char* call_text, const char* fil
   }
 }
 
-void matmul_cublas(const bf16_t* A_device, const bf16_t* B_device, bf16_t* C_device, int N);
-void matmul_naive(const bf16_t* A_device, const bf16_t* B_device, bf16_t* C_device, int N);
+void matmul_cublas(const bf16_t* A_device, const bf16_t* B_device, bf16_t* C_device, int M, int N,
+                   int K);
+void matmul_naive(const bf16_t* A_device, const bf16_t* B_device, bf16_t* C_device, int M, int N,
+                  int K);
 
 /**
  * @brief `Kernel` pairs a kernel's name with its function.
