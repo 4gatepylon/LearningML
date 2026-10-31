@@ -21,6 +21,8 @@ from pathlib import Path
 BENCH_BINARY_PATH: Path = Path(__file__).resolve().parent.parent / ".build" / "bench"
 DEFAULT_N: int = 8192
 DEFAULT_WARMUP_ITERATION_COUNT: int = 1
+MIN_N: int = 1
+MIN_WARMUP_ITERATION_COUNT: int = 0
 FLOP_PER_MULTIPLY_ADD: int = 2
 DRAM_CROSSING_MATRIX_COUNT: int = 3
 BF16_BYTES: int = 2
@@ -47,6 +49,10 @@ def main() -> None:
         "--warmup-iteration-count", type=int, default=DEFAULT_WARMUP_ITERATION_COUNT
     )
     args: argparse.Namespace = parser.parse_args()
+    if args.N < MIN_N:
+        parser.error(f"-N must be at least {MIN_N}")
+    if args.warmup_iteration_count < MIN_WARMUP_ITERATION_COUNT:
+        parser.error(f"--warmup-iteration-count must be at least {MIN_WARMUP_ITERATION_COUNT}")
     N: int = args.N
 
     peak_dense_bf16_tflops_according_to_nvidia_spec: float = float(

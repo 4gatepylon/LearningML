@@ -29,7 +29,32 @@ constexpr int EXPECTED_ARG_COUNT = 3;
 constexpr int PROGRAM_NAME_ARG_INDEX = 0;
 constexpr int N_ARG_INDEX = 1;
 constexpr int WARMUP_ITERATION_COUNT_ARG_INDEX = 2;
+constexpr int MIN_N = 1;
+constexpr int MIN_WARMUP_ITERATION_COUNT = 0;
 constexpr unsigned RNG_SEED = 0;
+
+/**
+ * @brief `parse_int_at_least` parses all of `text` as a base-10 int that is at least `min_value`.
+ *
+ * @param[in] text Text to parse.
+ * @param[in] min_value Smallest value to accept.
+ * @return The parsed value.
+ * @throws std::invalid_argument `text` is not a whole integer, or its value is below `min_value`.
+ * @throws std::out_of_range `text` does not fit in an `int`.
+ *
+ * @par Example
+ * @code
+ * int N = parse_int_at_least("8192", MIN_N);
+ * @endcode
+ */
+static int parse_int_at_least(const std::string& text, int min_value) {
+  size_t parsed_char_count = 0;
+  const int value = std::stoi(text, &parsed_char_count);
+  if (parsed_char_count != text.size() || value < min_value) {
+    throw std::invalid_argument(text);
+  }
+  return value;
+}
 
 /**
  * @brief `upload_random_matrix` fills `temp_X_host` with N(0, 1) samples and copies them over.
@@ -59,8 +84,9 @@ static bf16_t* upload_random_matrix(std::mt19937& rng, std::vector<float>& temp_
  * @brief `main` times one call of each kernel after `warmup_iteration_count` untimed calls.
  *
  * @param[in] argc Argument count, `EXPECTED_ARG_COUNT`.
- * @param[in] argv Program name, `N` and `warmup_iteration_count`.
- * @return `EXIT_SUCCESS`, or `EXIT_FAILURE` after a usage error.
+ * @param[in] argv Program name, `N` (at least `MIN_N`) and `warmup_iteration_count` (at least
+ *                 `MIN_WARMUP_ITERATION_COUNT`).
+ * @return `EXIT_SUCCESS`, or `EXIT_FAILURE` after a usage error such as a negative argument.
  *
  * @par Example
  * @code
@@ -74,10 +100,13 @@ int main(int argc, char** argv) {
     if (argc != EXPECTED_ARG_COUNT) {
       throw std::invalid_argument("wrong argument count");
     }
-    N = std::stoi(argv[N_ARG_INDEX]);
-    warmup_iteration_count = std::stoi(argv[WARMUP_ITERATION_COUNT_ARG_INDEX]);
+    N = parse_int_at_least(argv[N_ARG_INDEX], MIN_N);
+    warmup_iteration_count =
+        parse_int_at_least(argv[WARMUP_ITERATION_COUNT_ARG_INDEX], MIN_WARMUP_ITERATION_COUNT);
   } catch (const std::logic_error&) {
-    std::fprintf(stderr, "usage: %s N warmup_iteration_count\n", argv[PROGRAM_NAME_ARG_INDEX]);
+    std::fprintf(stderr,
+                 "usage: %s N warmup_iteration_count (N >= %d, warmup_iteration_count >= %d)\n",
+                 argv[PROGRAM_NAME_ARG_INDEX], MIN_N, MIN_WARMUP_ITERATION_COUNT);
     return EXIT_FAILURE;
   }
   std::mt19937 rng(RNG_SEED);  // NOLINT(bugprone-random-generator-seed)
