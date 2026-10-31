@@ -5,7 +5,7 @@
  * @par Interface
  * - `bf16_t`: The element type of every matrix.
  * - `matmul_fn_t`: The signature that every kernel has.
- * - `Kernel`: A kernel's name and function.
+ * - `Kernel`: A kernel's name, function and size multiple.
  * - `KERNELS`: Every kernel that the tests and the benchmark run.
  * - `matmul_cublas`: The cuBLAS reference kernel, defined in `kernels/cublas.cu`.
  * - `matmul_naive`: The one-thread-per-element kernel, defined in `kernels/naive.cu`.
@@ -72,19 +72,26 @@ void matmul_naive(const bf16_t* A_device, const bf16_t* B_device, bf16_t* C_devi
                   int K);
 
 /**
- * @brief `Kernel` pairs a kernel's name with its function.
+ * @brief `Kernel` holds a kernel's name, its function and the sizes it supports.
  *
  * @par Example
  * @code
- * Kernel kernel = {"cublas", matmul_cublas};
+ * Kernel kernel = {"cublas", matmul_cublas, 1};
  * @endcode
+ *
+ * @par Must know
+ * - Limitations:
+ *   - The kernel supports every M, N and K that is a multiple of `size_multiple`, a power of two.
+ * - Gotchas:
+ *   - The tests round every size up to `size_multiple`, so a kernel with 1 runs every size.
  */
 struct Kernel {
   const char* name;
   matmul_fn_t matmul_fn;
+  int size_multiple;
 };
 
-inline constexpr Kernel KERNELS[] = {{"cublas", matmul_cublas}, {"naive", matmul_naive}};
+inline constexpr Kernel KERNELS[] = {{"cublas", matmul_cublas, 1}, {"naive", matmul_naive, 1}};
 
 /**
  * @brief `copy_to_device` copies a host array into a new device buffer, rounding to bf16.
