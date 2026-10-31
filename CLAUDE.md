@@ -81,6 +81,7 @@ a function or a file, or that a decision depends on, spells out its meaning. The
 code; don't rename existing code only to follow them. `cuda_book/` keeps its own conventions.
 
 - **Intent:** say what the value is for, not what type it is: `active_user_count`, not `count`.
+- **Number:** collections are plural, scalars singular: `for kernel in kernels`.
 - **Units:** end every quantity that has a unit in a suffix from the table below: `elapsed_ms`,
   `bus_width_bits`.
 - **Source:** a measured value, or one taken from a document, says where it comes from with
@@ -93,19 +94,28 @@ code; don't rename existing code only to follow them. `cuda_book/` keeps its own
 - **Booleans:** read as a yes/no question, starting with a verb such as `is_`, `has_`, `can_` or
   `should_`: `is_too_big`, not `too_big`.
 - **Temporaries:** a throwaway value starts with `temp_`: `temp_sum`.
-- **Functions:** `<verb>_<noun>`, the action and what it acts on: `copy_to_device`, `parse_args`.
-  Interchangeable implementations of one operation may be `<operation>_<variant>`: `matmul_cublas`.
-- **Types:** classes, structs and type aliases end in `_t` and name the object, not the action:
-  `dataloader_t`, not `dataload_t`; `bf16_t`, `matmul_fn_t`.
+- **Functions:** `<verb>_<noun>`, the action and what it acts on, optionally followed by context:
+  `copy_to_device`, `move_box_outside`. Interchangeable implementations of one operation may be
+  `<operation>_<variant>`: `matmul_cublas`.
+- **Dangerous functions:** a function that is dangerous to call ends in
+  `_DANGEROUS_DANGEROUS_DANGEROUS_BECAUSE_<REASON>`:
+  `free_buffer_DANGEROUS_DANGEROUS_DANGEROUS_BECAUSE_KERNELS_MAY_STILL_READ_IT`.
+- **Dangerous code:** every line of a section that is dangerous to change is preceded by
+  `// DANGEROUS DANGEROUS DANGEROUS IF YOU CHANGE THIS THEN <CONSEQUENCE> WILL HAPPEN` (`#` in
+  Python), the same comment before each line.
+- **Types:** classes and structs are nouns for the object, not the action: `Dataloader`, not
+  `Dataload`. Type aliases end in `_t`: `bf16_t`, `matmul_fn_t`.
 - **Math letters:** arrays, matrices and tensors are capitals (`A`, `B`, `C`, `D`); vectors are
   lowercase (`x`, `b`); sizes and lengths are capitals (`N`, `M`, `K`); loop indices are `i`, `j`,
   `k`; spatial coordinates and quaternion parts are `x`, `y`, `z`, `w`.
 - **Location:** data ends in where it lives, `_host` or `_device` (`A_host`, `A_device`), with
   `_device0`, `_device1`, ... when there are several devices and it matters which.
 - **Order:** `<what>_<unit>_according_to_<source>`, then the location suffix.
-- **Case:** snake_case for everything, in every language; never CamelCase or camelCase. Globals and
-  global constants are UPPER_SNAKE_CASE (`KERNELS`, `DEFAULT_N`), and so are macros and environment
-  variables. The math letters above keep their case.
+- **Case:** snake_case for variables and free functions, in every language. Classes are the
+  exception, and their rules take precedence: class and struct names are UpperCamelCase
+  (`Dataloader`), methods are lowerCamelCase (`moveBoxOutside`), and static constructors are
+  UpperCamelCase (`Dataloader::FromFiles`). Globals, global constants, macros and environment
+  variables are UPPER_SNAKE_CASE (`KERNELS`, `DEFAULT_N`). The math letters above keep their case.
 - **No magic numbers:** every literal with a meaning gets a named constant: `constexpr` in C++, a
   module-level constant in Python, `#define` only where a constant can't work. Bare `0` and `1` as
   start values, identities or increments are fine.
