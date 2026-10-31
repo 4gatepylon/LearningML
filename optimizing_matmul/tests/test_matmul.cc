@@ -7,7 +7,7 @@
  *
  * @par Example
  * @code
- * $ make test
+ * make test
  * @endcode
  */
 #include <gtest/gtest.h>
@@ -15,6 +15,8 @@
 #include <vector>
 
 #include "common/matmul.h"
+
+namespace {
 
 constexpr float UNWRITTEN_SENTINEL = -1.0F;
 
@@ -36,8 +38,8 @@ constexpr float UNWRITTEN_SENTINEL = -1.0F;
  * - Gotchas:
  *   - C starts as `UNWRITTEN_SENTINEL`, so entries that a kernel never writes come back wrong.
  */
-static std::vector<float> run_kernel(matmul_fn_t matmul_fn, const std::vector<float>& A_host,
-                                     const std::vector<float>& B_host, int N) {
+std::vector<float> run_kernel(matmul_fn_t matmul_fn, const std::vector<float>& A_host,
+                              const std::vector<float>& B_host, int N) {
   bf16_t* A_device = copy_to_device(A_host);
   bf16_t* B_device = copy_to_device(B_host);
   bf16_t* C_device = copy_to_device(std::vector<float>(A_host.size(), UNWRITTEN_SENTINEL));
@@ -51,6 +53,8 @@ static std::vector<float> run_kernel(matmul_fn_t matmul_fn, const std::vector<fl
   }
   return {C_host.begin(), C_host.end()};
 }
+
+}  // namespace
 
 /**
  * @brief `matmul.known_2x2` checks every kernel on a hand-computed 2x2 product, exactly.

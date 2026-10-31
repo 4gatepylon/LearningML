@@ -8,7 +8,6 @@
  * - `Kernel`: A kernel's name and function.
  * - `KERNELS`: Every kernel that the tests and the benchmark run.
  * - `matmul_cublas`: The cuBLAS reference kernel, defined in `kernels/cublas.cu`.
- * - `CUDA_AND_CUBLAS_SUCCESS_STATUS_CODE`: The status that CUDA and cuBLAS return on success.
  * - `check_status`: Aborts on a failed CUDA or cuBLAS call.
  * - `CHECK`: Calls `check_status` with the call's text, file and line.
  * - `copy_to_device`: Copies a host array into a new device buffer.
@@ -33,11 +32,11 @@
 #include <cstdlib>
 #include <vector>
 
+#define CHECK(call) check_status(static_cast<int>(call), #call, __FILE__, __LINE__)
+
 using bf16_t = __nv_bfloat16;
 using matmul_fn_t = void (*)(const bf16_t* A_device, const bf16_t* B_device, bf16_t* C_device,
                              int N);
-
-constexpr int CUDA_AND_CUBLAS_SUCCESS_STATUS_CODE = 0;
 
 /**
  * @brief `check_status` prints the failed call and aborts if `status_code` is not a success.
@@ -58,13 +57,13 @@ constexpr int CUDA_AND_CUBLAS_SUCCESS_STATUS_CODE = 0;
  */
 inline void check_status(int status_code, const char* call_text, const char* file_name,
                          int line_number) {
-  if (status_code != CUDA_AND_CUBLAS_SUCCESS_STATUS_CODE) {
+  constexpr int success_status_code = 0;
+  if (status_code != success_status_code) {
     std::fprintf(stderr, "%s:%d: %s failed with status %d\n", file_name, line_number, call_text,
                  status_code);
     std::abort();
   }
 }
-#define CHECK(call) check_status(static_cast<int>(call), #call, __FILE__, __LINE__)
 
 void matmul_cublas(const bf16_t* A_device, const bf16_t* B_device, bf16_t* C_device, int N);
 

@@ -3,13 +3,12 @@
  * @brief `bench.cc` times one call of each kernel and prints one CSV line per kernel.
  *
  * @par Interface
- * - `N`: Matrix size.
- * - `warmup_iteration_count`: Untimed calls per kernel before the timed one.
- * - stdout: One `name,elapsed_ms_according_to_cuda_events` line per kernel.
+ * - Arguments: `N warmup_iteration_count`.
+ * - Output: one `name,elapsed_ms_according_to_cuda_events` line per kernel on stdout.
  *
  * @par Example
  * @code
- * $ .build/bench 8192 1
+ * .build/bench 8192 1
  * @endcode
  *
  * @par Must know
@@ -24,6 +23,8 @@
 #include <vector>
 
 #include "common/matmul.h"
+
+namespace {
 
 constexpr int EXPECTED_ARG_COUNT = 3;
 constexpr int PROGRAM_NAME_ARG_INDEX = 0;
@@ -47,7 +48,7 @@ constexpr unsigned RNG_SEED = 0;
  * int N = parse_int_at_least("8192", MIN_N);
  * @endcode
  */
-static int parse_int_at_least(const std::string& text, int min_value) {
+int parse_int_at_least(const std::string& text, int min_value) {
   size_t parsed_char_count = 0;
   const int value = std::stoi(text, &parsed_char_count);
   if (parsed_char_count != text.size() || value < min_value) {
@@ -72,13 +73,15 @@ static int parse_int_at_least(const std::string& text, int min_value) {
  * - Side effects:
  *   - The caller owns the returned buffer and must `cudaFree` it.
  */
-static bf16_t* upload_random_matrix(std::mt19937& rng, std::vector<float>& temp_X_host) {
+bf16_t* upload_random_matrix(std::mt19937& rng, std::vector<float>& temp_X_host) {
   std::normal_distribution<float> standard_normal;
   for (float& x : temp_X_host) {
     x = standard_normal(rng);
   }
   return copy_to_device(temp_X_host);
 }
+
+}  // namespace
 
 /**
  * @brief `main` times one call of each kernel after `warmup_iteration_count` untimed calls.
@@ -90,7 +93,7 @@ static bf16_t* upload_random_matrix(std::mt19937& rng, std::vector<float>& temp_
  *
  * @par Example
  * @code
- * $ .build/bench 8192 1
+ * .build/bench 8192 1
  * @endcode
  */
 int main(int argc, char** argv) {
