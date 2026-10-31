@@ -8,6 +8,16 @@
  * - `matmul.matches_reference_random_normal`: Checks every kernel, cuBLAS too, against the
  * reference.
  * - `matmul.matches_cublas_large_random_normal`: Checks every kernel against cuBLAS at a large N.
+ * - `matmul.sign_*`: One test per part of the sign partitioning (see Coverage).
+ *
+ * @par Coverage
+ * Every kernel is checked against the CPU reference on one exemplar per part.
+ * | Partitioning | Part | Tests |
+ * | --- | --- | --- |
+ * | Sign of every value in A and B | All zero | `matmul.sign_all_zero` |
+ * | | Non-negative, some positive | `matmul.sign_non_negative` |
+ * | | Non-positive, some negative | `matmul.sign_non_positive` |
+ * | | Both signs | `matmul.sign_mixed`, `matmul.matches_reference_random_normal` |
  *
  * @par Must know
  * - Gotchas:
@@ -17,6 +27,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <functional>
 #include <random>
 #include <vector>
 
@@ -67,26 +78,40 @@ std::vector<float> run_kernel(matmul_fn_t matmul_fn, const std::vector<float>& A
 }
 
 /**
- * @brief `make_random_normal_matrix` returns an N x N matrix of N(0, 1) samples rounded to bf16.
+ * @brief `make_random_matrix` returns an N x N matrix of values from `draw_value`, rounded to bf16.
  *
  * @param[in] N Matrix size.
  * @param[in] seed Seed for the random number generator.
+ * @param[in] draw_value Draws one value from the random number generator.
  * @return The matrix, row-major, with every value exactly representable in bf16.
  *
  * @par Example
  * @code
- * std::vector<float> A_host = make_random_normal_matrix(N, A_SEED);
+ * std::vector<float> A_host = make_random_matrix(N, A_SEED, draw_standard_normal);
  * @endcode
  */
-std::vector<float> make_random_normal_matrix(int N, unsigned seed) {
+std::vector<float> make_random_matrix(int N, unsigned seed,
+                                      const std::function<float(std::mt19937&)>& draw_value) {
   std::mt19937 rng(seed);
-  std::normal_distribution<float> standard_normal;
   std::vector<float> X_host(static_cast<size_t>(N) * N);
   for (float& x : X_host) {
-    x = static_cast<float>(static_cast<bf16_t>(standard_normal(rng)));
+    x = static_cast<float>(static_cast<bf16_t>(draw_value(rng)));
   }
   return X_host;
 }
+
+/**
+ * @brief `draw_standard_normal` draws one N(0, 1) sample.
+ *
+ * @param[in,out] rng Random number generator.
+ * @return The sample.
+ *
+ * @par Example
+ * @code
+ * std::vector<float> A_host = make_random_matrix(N, A_SEED, draw_standard_normal);
+ * @endcode
+ */
+float draw_standard_normal(std::mt19937& rng) { return std::normal_distribution<float>()(rng); }
 
 /**
  * @brief `Reference` holds the exact product C = A * B and, per element, the sum of |A||B|.
@@ -218,8 +243,9 @@ TEST(matmul, reference_matches_known_2x2) {
  *   - cuBLAS is in `KERNELS`, so this also checks cuBLAS against the reference.
  */
 TEST(matmul, matches_reference_random_normal) {
-  expect_close_to_reference(make_random_normal_matrix(REFERENCE_N, A_SEED),
-                            make_random_normal_matrix(REFERENCE_N, B_SEED), REFERENCE_N);
+  expect_close_to_reference(make_random_matrix(REFERENCE_N, A_SEED, draw_standard_normal),
+                            make_random_matrix(REFERENCE_N, B_SEED, draw_standard_normal),
+                            REFERENCE_N);
 }
 
 /**
@@ -231,8 +257,8 @@ TEST(matmul, matches_reference_random_normal) {
  *   - The tolerance bounds the sum of |A||B| by the row norm of A times the column norm of B.
  */
 TEST(matmul, matches_cublas_large_random_normal) {
-  const std::vector<float> A_host = make_random_normal_matrix(LARGE_N, A_SEED);
-  const std::vector<float> B_host = make_random_normal_matrix(LARGE_N, B_SEED);
+  const std::vector<float> A_host = make_random_matrix(LARGE_N, A_SEED, draw_standard_normal);
+  const std::vector<float> B_host = make_random_matrix(LARGE_N, B_SEED, draw_standard_normal);
   std::vector<double> A_row_norms(LARGE_N);
   std::vector<double> B_col_norms(LARGE_N);
   for (int i = 0; i < LARGE_N; ++i) {
@@ -258,4 +284,47 @@ TEST(matmul, matches_cublas_large_random_normal) {
           << ", cuBLAS = " << C_cublas_host[e];
     }
   }
+}
+
+/**
+ * @brief `matmul.sign_all_zero` covers the all-zero part: A and B are all zeros, so C must be too.
+ */
+TEST(matmul, sign_all_zero) {
+  const std::vector<float> zero_matrix(static_cast<size_t>(REFERENCE_N) * REFERENCE_N, 0.0F);
+  expect_close_to_reference(zero_matrix, zero_matrix, REFERENCE_N);
+}
+
+/**
+ * @brief `matmul.sign_non_negative` covers the non-negative part with random 0s and 1s.
+ */
+TEST(matmul, sign_non_negative) {
+  const auto draw_zero_or_one = [](std::mt19937& rng) {
+    return static_cast<float>(std::uniform_int_distribution<int>(0, 1)(rng));
+  };
+  expect_close_to_reference(make_random_matrix(REFERENCE_N, A_SEED, draw_zero_or_one),
+                            make_random_matrix(REFERENCE_N, B_SEED, draw_zero_or_one), REFERENCE_N);
+}
+
+/**
+ * @brief `matmul.sign_non_positive` covers the non-positive part with minus absolute normals.
+ */
+TEST(matmul, sign_non_positive) {
+  const auto draw_non_positive = [](std::mt19937& rng) {
+    return -std::abs(draw_standard_normal(rng));
+  };
+  expect_close_to_reference(make_random_matrix(REFERENCE_N, A_SEED, draw_non_positive),
+                            make_random_matrix(REFERENCE_N, B_SEED, draw_non_positive),
+                            REFERENCE_N);
+}
+
+/**
+ * @brief `matmul.sign_mixed` covers the mixed-sign part with random -1s, 0s and 1s.
+ */
+TEST(matmul, sign_mixed) {
+  const auto draw_minus_one_zero_or_one = [](std::mt19937& rng) {
+    return static_cast<float>(std::uniform_int_distribution<int>(-1, 1)(rng));
+  };
+  expect_close_to_reference(make_random_matrix(REFERENCE_N, A_SEED, draw_minus_one_zero_or_one),
+                            make_random_matrix(REFERENCE_N, B_SEED, draw_minus_one_zero_or_one),
+                            REFERENCE_N);
 }
