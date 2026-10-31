@@ -2,7 +2,8 @@
 #
 # Interface:
 #     make test: build and run the GoogleTest tests.
-#     make bench-kernels [BENCH_ARGS="-N 4096"]: build the benchmark and print its table.
+#     make bench [BENCH_ARGS="-N 4096"]: build the benchmark and print its table.
+#     make scan [SCAN_ARGS="--kernel cublas"]: time a range of batch sizes and fit the fixed cost.
 #     make fmt, make tidy: format and lint with clang-format, clang-tidy and ruff.
 #     make clean: remove .build/.
 #
@@ -24,13 +25,16 @@ KERNEL_SOURCES := $(wildcard kernels/*.cu)
 HEADER_FILES := $(wildcard common/*.h)
 HOST_SOURCES := $(wildcard host/*.cc tests/*.cc)
 
-.PHONY: test bench-kernels fmt tidy clean
+.PHONY: test bench scan fmt tidy clean
 
 test: $(BUILD_DIR)/test
 	$(BUILD_DIR)/test
 
-bench-kernels: $(BUILD_DIR)/bench
+bench: $(BUILD_DIR)/bench
 	uv run scripts/bench.py $(BENCH_ARGS)
+
+scan: $(BUILD_DIR)/bench
+	uv run scripts/scan_batch_size.py $(SCAN_ARGS)
 
 $(BUILD_DIR)/test: tests/test_matmul.cc $(KERNEL_SOURCES) $(HEADER_FILES)
 	@mkdir -p $(BUILD_DIR)

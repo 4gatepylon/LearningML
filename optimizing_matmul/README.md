@@ -17,6 +17,7 @@ GPU 2 of 4, selected with `CUDA_VISIBLE_DEVICES=2` (set by `.env`).
 | Item | Value |
 | --- | --- |
 | GPU | NVIDIA H100 PCIe, compute capability 9.0 (`sm_90`), 114 SMs, 1755 MHz max SM clock |
+| Power limit | 310 W (the default) |
 | Memory | 80 GB HBM2e, 5120-bit bus, 1593 MHz |
 | OS / CPU | Ubuntu 22.04.5, kernel 5.15.0-176, AMD EPYC 7543, 1 TiB RAM |
 | Driver / CUDA | 545.23.08 / toolkit 12.8 (`nvcc` 12.8.93, with `ncu` and `nsys`) |
@@ -27,11 +28,12 @@ version is per host) and `source .env`.
 ## Running it
 
 ```bash
-cp .env.example .env && source .env     # nvcc on PATH, GPU 2
-make test                               # build and run the GoogleTest tests
-make bench-kernels                      # time each kernel at N = 8192
-make bench-kernels BENCH_ARGS="-N 4096" # pass flags; list them with `uv run scripts/bench.py -h`
-make fmt && make tidy                   # format and lint
+cp .env.example .env && source .env    # nvcc on PATH, GPU 2
+make test                              # build and run the GoogleTest tests
+make bench                             # time each kernel at N = 8192
+make bench BENCH_ARGS="-N 4096"        # pass flags; list them with `uv run scripts/bench.py -h`
+make scan SCAN_ARGS="--kernel cublas"  # time a range of batch sizes; fit the fixed cost per batch
+make fmt && make tidy                  # format and lint
 ```
 
 Every kernel in `KERNELS` (`common/matmul.h`) is tested and benchmarked.
@@ -55,10 +57,14 @@ WGMMA) is capped near 51 TFLOPS.
 time at N = 8192: 1.0995e12 / 756.4e12 = 1.45 ms (realistic), / 819.5e12 = 1.34 ms (max clock)
 ```
 
-Benchmarks loop many iterations rather than timing one call.
+`make bench` times 3 trials per kernel, interleaved across kernels. Each trial is a batch of 100
+back-to-back calls timed with one pair of CUDA events, and its time is divided by 100. Inputs are
+normal random values (mean 0, sigma 1), never all zeros, which cuBLAS multiplies faster.
 
-**cuBLAS reference** (`cublasGemmEx`, bf16, fp32 accumulate, `N = 8192`, 100 iterations): 1.68-1.72 ms,
-640-653 TFLOPS, about 85% of the ceiling. This is the bar to approach.
+**cuBLAS reference** (`cublasGemmEx`, bf16, fp32 accumulate, `N = 8192`, `make bench`): median
+2.62 ms per call, 420 TFLOPS, about 55% of the 756 TFLOPS ceiling. This is the bar to approach.
+A batch runs long enough for the 310 W power cap to lower SM clocks. A lone call on idle clocks
+takes about 2.3 ms.
 
 ## Notes
 
