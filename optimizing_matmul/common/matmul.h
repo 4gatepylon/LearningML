@@ -66,6 +66,7 @@ inline void check_status(int status_code, const char* call_text, const char* fil
 }
 
 void matmul_cublas(const bf16_t* A_device, const bf16_t* B_device, bf16_t* C_device, int N);
+void matmul_naive(const bf16_t* A_device, const bf16_t* B_device, bf16_t* C_device, int N);
 
 /**
  * @brief `Kernel` pairs a kernel's name with its function.
@@ -80,7 +81,7 @@ struct Kernel {
   matmul_fn_t matmul_fn;
 };
 
-inline constexpr Kernel KERNELS[] = {{"cublas", matmul_cublas}};
+inline constexpr Kernel KERNELS[] = {{"cublas", matmul_cublas}, {"naive", matmul_naive}};
 
 /**
  * @brief `copy_to_device` copies a host array into a new device buffer, rounding to bf16.
