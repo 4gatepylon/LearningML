@@ -2,7 +2,7 @@
 #
 # Interface:
 #     make test: build and run the GoogleTest tests.
-#     make bench [BENCH_ARGS="-N 4096"]: build the benchmark and print its table.
+#     make bench-kernels [BENCH_ARGS="-N 4096"]: build the benchmark and print its table.
 #     make fmt, make tidy: format and lint with clang-format, clang-tidy and ruff.
 #     make clean: remove .build/.
 #
@@ -24,12 +24,12 @@ KERNEL_SOURCES := $(wildcard kernels/*.cu)
 HEADER_FILES := $(wildcard common/*.h)
 HOST_SOURCES := $(wildcard host/*.cc tests/*.cc)
 
-.PHONY: test bench fmt tidy clean
+.PHONY: test bench-kernels fmt tidy clean
 
 test: $(BUILD_DIR)/test
 	$(BUILD_DIR)/test
 
-bench: $(BUILD_DIR)/bench
+bench-kernels: $(BUILD_DIR)/bench
 	uv run scripts/bench.py $(BENCH_ARGS)
 
 $(BUILD_DIR)/test: tests/test_matmul.cc $(KERNEL_SOURCES) $(HEADER_FILES)

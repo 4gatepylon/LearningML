@@ -9,7 +9,7 @@ Interface:
     --warmup-iteration-count: Untimed calls per kernel before the timed one (default 1, at least 0).
 
 Example:
-    $ make bench BENCH_ARGS="-N 4096 --warmup-iteration-count 0"
+    $ make bench-kernels BENCH_ARGS="-N 4096 --warmup-iteration-count 0"
 
 Must know:
     Gotchas:
