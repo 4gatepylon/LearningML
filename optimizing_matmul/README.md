@@ -34,10 +34,14 @@ make test                                         # build and run the GoogleTest
 make bench-kernels                                # time each kernel at N = 8192
 make bench-kernels BENCH_ARGS="-N 4096"           # pass flags; list them with `uv run scripts/bench.py -h`
 make scan-batch-sizes SCAN_ARGS="--kernel cublas" # time a range of batch sizes; fit the fixed cost per batch
+make sweep-options SWEEP_ARGS="--kernel K --option O --value 2 --value 4"  # time K per value of option O
 make fmt && make tidy                             # format and lint
 ```
 
 Every kernel in `KERNELS` (`common/matmul.h`) is tested and benchmarked.
+
+`make sweep-options` builds and tests the kernel once per value in `.build/sweep_options/`, and
+writes each run's command and timings to `.artifacts/sweep_options/<run_id>/`.
 
 ## What the hardware can do
 

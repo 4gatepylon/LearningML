@@ -5,6 +5,7 @@
 #     make test: build and run the GoogleTest tests.
 #     make bench-kernels [BENCH_ARGS="-N 4096"]: build the benchmark and print its table.
 #     make scan-batch-sizes [SCAN_ARGS="--kernel cublas"]: time a range of batch sizes and fit the fixed cost.
+#     make sweep-options SWEEP_ARGS="--kernel K --option O --value V ...": time a kernel per option value.
 #     make fmt, make tidy: format and lint with clang-format, clang-tidy and ruff.
 #     make clean: remove .build/.
 #
@@ -17,6 +18,7 @@
 #         - The dev tools come from uv; set CLANG_FORMAT, CLANG_TIDY or RUFF to use others.
 NVCC ?= nvcc
 NVCCFLAGS ?= -std=c++17 -O2 -arch=native -Xcompiler=-Wall,-Wextra -I.
+NVCC_DEFINES ?=
 BUILD_DIR := .build
 CLANG_FORMAT ?= uv run clang-format
 CLANG_TIDY ?= uv run clang-tidy
@@ -26,7 +28,7 @@ KERNEL_SOURCES := $(wildcard kernels/*.cu)
 HEADER_FILES := $(wildcard common/*.h)
 HOST_SOURCES := $(wildcard host/*.cc tests/*.cc)
 
-.PHONY: help test bench-kernels scan-batch-sizes fmt tidy clean
+.PHONY: help test bench-kernels scan-batch-sizes sweep-options fmt tidy clean
 
 help:
 	@echo "Targets:"
@@ -34,12 +36,13 @@ help:
 	@echo "  make test                                   Build and run the GoogleTest tests"
 	@echo "  make bench-kernels [BENCH_ARGS=\"-N 4096\"]   Time each kernel and print a table"
 	@echo "  make scan-batch-sizes [SCAN_ARGS=\"...\"]     Time a range of batch sizes; fit the fixed cost"
+	@echo "  make sweep-options SWEEP_ARGS=\"...\"         Time one kernel per value of a compile-time option"
 	@echo "  make fmt                                    Format C++/CUDA (clang-format) and Python (ruff)"
 	@echo "  make tidy                                   Lint C++/CUDA (clang-tidy) and Python (ruff)"
 	@echo "  make clean                                  Remove $(BUILD_DIR)/"
 	@echo ""
 	@echo "Example: source .env && make bench-kernels BENCH_ARGS=\"--kernel cublas\""
-	@echo "Flags for BENCH_ARGS and SCAN_ARGS: uv run scripts/bench.py -h, uv run scripts/scan_batch_size.py -h"
+	@echo "Flags: uv run scripts/bench.py -h, scripts/scan_batch_size.py -h, scripts/sweep_options.py -h"
 
 test: $(BUILD_DIR)/test
 	$(BUILD_DIR)/test
@@ -50,13 +53,16 @@ bench-kernels: $(BUILD_DIR)/bench
 scan-batch-sizes: $(BUILD_DIR)/bench
 	uv run scripts/scan_batch_size.py $(SCAN_ARGS)
 
+sweep-options: $(BUILD_DIR)/bench
+	uv run scripts/sweep_options.py $(SWEEP_ARGS)
+
 $(BUILD_DIR)/test: tests/test_matmul.cc $(KERNEL_SOURCES) $(HEADER_FILES)
 	@mkdir -p $(BUILD_DIR)
-	$(NVCC) $(NVCCFLAGS) $(filter-out %.h,$^) -o $@ -lcublas -lgtest -lgtest_main -lpthread
+	$(NVCC) $(NVCCFLAGS) $(NVCC_DEFINES) $(filter-out %.h,$^) -o $@ -lcublas -lgtest -lgtest_main -lpthread
 
 $(BUILD_DIR)/bench: host/bench.cc $(KERNEL_SOURCES) $(HEADER_FILES)
 	@mkdir -p $(BUILD_DIR)
-	$(NVCC) $(NVCCFLAGS) $(filter-out %.h,$^) -o $@ -lcublas
+	$(NVCC) $(NVCCFLAGS) $(NVCC_DEFINES) $(filter-out %.h,$^) -o $@ -lcublas
 
 fmt:
 	$(CLANG_FORMAT) -i $(KERNEL_SOURCES) $(HEADER_FILES) $(HOST_SOURCES)
