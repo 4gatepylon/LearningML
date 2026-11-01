@@ -60,11 +60,11 @@ sweep-options: $(BUILD_DIR)/bench
 
 $(BUILD_DIR)/test: tests/test_matmul.cc $(KERNEL_SOURCES) $(HEADER_FILES)
 	@mkdir -p $(BUILD_DIR)
-	$(NVCC) $(NVCCFLAGS) $(NVCC_DEFINES) $(filter-out %.h,$^) -o $@ -lcublas -lgtest -lgtest_main -lpthread
+	$(NVCC) $(NVCCFLAGS) $(NVCC_DEFINES) $(filter-out %.h,$^) -o $@ -lcublas -lcuda -lgtest -lgtest_main -lpthread
 
 $(BUILD_DIR)/bench: host/bench.cc $(KERNEL_SOURCES) $(HEADER_FILES)
 	@mkdir -p $(BUILD_DIR)
-	$(NVCC) $(NVCCFLAGS) $(NVCC_DEFINES) $(filter-out %.h,$^) -o $@ -lcublas
+	$(NVCC) $(NVCCFLAGS) $(NVCC_DEFINES) $(filter-out %.h,$^) -o $@ -lcublas -lcuda
 
 fmt:
 	$(CLANG_FORMAT) -i $(KERNEL_SOURCES) $(HEADER_FILES) $(HOST_SOURCES)
