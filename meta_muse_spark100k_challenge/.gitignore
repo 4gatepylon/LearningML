@@ -1,0 +1,5 @@
+# `.gitignore` ignores this challenge folder's run outputs.
+#
+# Interface:
+#     .artifacts/: each okc run's files, written by `4gatepylon_official_work/scripts/okc_runs.py`.
+.artifacts/
