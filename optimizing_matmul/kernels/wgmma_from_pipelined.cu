@@ -246,6 +246,7 @@ __device__ __forceinline__ void store_accumulators(const float (&C_fp32)[ACCUMUL
   constexpr int half_rows_per_warp = 8;
   const int lane = static_cast<int>(threadIdx.x) % THREADS_PER_WARP;
   const int warp = (static_cast<int>(threadIdx.x) % THREADS_PER_WARPGROUP) / THREADS_PER_WARP;
+#pragma unroll
   for (int r = 0; r < ACCUMULATOR_COUNT; r += 2) {
     const int tile_row =
         (warp * rows_per_warp) + (lane / lanes_per_row) + (((r / 2) % 2) * half_rows_per_warp);
@@ -326,9 +327,11 @@ __global__ void __launch_bounds__(THREAD_COUNT, 1)
     const uint32_t A_address =
         get_shared_address(stage_bytes) + (warpgroup * WGMMA_M * SWIZZLE_BYTES);
     const uint32_t B_address = get_shared_address(stage_bytes + A_TILE_BYTES);
+#pragma unroll
     for (int k = 0; k < BLOCK_TILE_K; k += WGMMA_K) {
       const uint64_t A_descriptor = make_descriptor(
           A_address + (k * static_cast<int>(sizeof(bf16_t))), 16, SWIZZLE_ATOM_BYTES);
+#pragma unroll
       for (int n = 0; n < WGMMAS_PER_ROW; ++n) {
         const uint32_t B_slice_address =
             B_address + (n * (WGMMA_N / BF16_PER_SWIZZLE_ROW) * B_BOX_BYTES) + (k * SWIZZLE_BYTES);
@@ -346,6 +349,7 @@ __global__ void __launch_bounds__(THREAD_COUNT, 1)
                         (step + STAGE_COUNT) * BLOCK_TILE_K);
     }
   }
+#pragma unroll
   for (int n = 0; n < WGMMAS_PER_ROW; ++n) {
     store_accumulators(C_fp32[n], C_device, M, N, block_i + (warpgroup * WGMMA_M),
                        block_j + (n * WGMMA_N));
