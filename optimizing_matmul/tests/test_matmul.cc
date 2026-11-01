@@ -5,6 +5,7 @@
  * @par Interface
  * - `matmul/KernelTest.known_2x2/<kernel>`: Checks a hand-computed 2x2 product.
  * - `matmul/KernelTest.random_square/<kernel>`: Checks random 0/1 matrices, 200 x 200.
+ * - `matmul/KernelTest.large_sparse/<kernel>`: Checks the benchmark shape, 8192 cubed.
  * - `matmul/ShapeTest.matches_reference/<ordering>_<kernel>`: Checks one shape per ordering.
  *
  * @par Example
@@ -77,6 +78,7 @@ constexpr uint32_t A_SEED = 1;
 constexpr uint32_t B_SEED = 2;
 constexpr size_t REPORTED_MISMATCH_COUNT = 5;
 constexpr size_t REPORTED_DIFFERENCE_COUNT = 8;
+constexpr int LARGE_N = 8192;
 
 /**
  * @brief `Shape` names one ordering of M, N and K and the sizes that cover it.
@@ -209,11 +211,12 @@ std::vector<double> compute_reference_matmul_on_cpu(const std::vector<float>& A_
 }
 
 /**
- * @brief `expect_kernel_output_matches_reference` checks a kernel's output against the reference.
+ * @brief `expect_kernel_output_matches_given_reference` checks a kernel against a reference.
  *
  * @param[in] matmul_fn Kernel to run.
  * @param[in] A_host Left factor, M x K, row-major, 0/1.
  * @param[in] B_host Right factor, K x N, row-major, 0/1.
+ * @param[in] C_reference_host `compute_reference_matmul_on_cpu` of A and B, M x N, row-major.
  * @param[in] M Rows of A and C.
  * @param[in] N Columns of B and C.
  * @param[in] K Columns of A and rows of B.
@@ -223,10 +226,11 @@ std::vector<double> compute_reference_matmul_on_cpu(const std::vector<float>& A_
  *   - It first asserts that no reference output passes 255, so a test can't break the cap.
  *   - A failure prints the mismatch count, the first mismatches and the differences got - expected.
  */
-void expect_kernel_output_matches_reference(matmul_fn_t matmul_fn, const std::vector<float>& A_host,
-                                            const std::vector<float>& B_host, int M, int N, int K) {
-  const std::vector<double> C_reference_host =
-      compute_reference_matmul_on_cpu(A_host, B_host, M, N, K);
+void expect_kernel_output_matches_given_reference(matmul_fn_t matmul_fn,
+                                                  const std::vector<float>& A_host,
+                                                  const std::vector<float>& B_host,
+                                                  const std::vector<double>& C_reference_host,
+                                                  int M, int N, int K) {
   ASSERT_LE(*std::max_element(C_reference_host.begin(), C_reference_host.end()), MAX_OUTPUT_VALUE);
   const std::vector<float> C_host = run_kernel(matmul_fn, A_host, B_host, M, N, K);
   size_t mismatch_count = 0;
@@ -249,6 +253,22 @@ void expect_kernel_output_matches_reference(matmul_fn_t matmul_fn, const std::ve
                   [&](double difference) { report << " " << difference; });
   EXPECT_EQ(mismatch_count, 0U) << mismatch_count << " of " << C_host.size()
                                 << " outputs differ:" << report.str();
+}
+
+/**
+ * @brief `expect_kernel_output_matches_reference` computes the reference, then checks against it.
+ *
+ * @param[in] matmul_fn Kernel to run.
+ * @param[in] A_host Left factor, M x K, row-major, 0/1.
+ * @param[in] B_host Right factor, K x N, row-major, 0/1.
+ * @param[in] M Rows of A and C.
+ * @param[in] N Columns of B and C.
+ * @param[in] K Columns of A and rows of B.
+ */
+void expect_kernel_output_matches_reference(matmul_fn_t matmul_fn, const std::vector<float>& A_host,
+                                            const std::vector<float>& B_host, int M, int N, int K) {
+  expect_kernel_output_matches_given_reference(
+      matmul_fn, A_host, B_host, compute_reference_matmul_on_cpu(A_host, B_host, M, N, K), M, N, K);
 }
 
 /**
@@ -317,6 +337,27 @@ TEST_P(KernelTest, random_square) {
   expect_kernel_output_matches_reference(
       GetParam().matmul_fn, make_random_A_with_at_most_255_ones_per_row(N, N, A_SEED),
       make_random_B_with_half_ones_on_average(N, N, B_SEED), N, N, N);
+}
+
+/**
+ * @brief `KernelTest.large_sparse` checks the benchmark's shape, 8192 cubed, with sparse ones in A.
+ *
+ * @par Must know
+ * - Gotchas:
+ *   - Its 4096 output tiles of 128 x 128 outnumber the 114 SMs, so it runs several waves.
+ * - Performance:
+ *   - Each row of A has 255 ones of 8192, so the reference costs M * N * 255, not M * N * K.
+ *   - A, B and the reference are built once, by the first kernel's run, and shared by the rest.
+ */
+TEST_P(KernelTest, large_sparse) {
+  constexpr int N = LARGE_N;
+  static const std::vector<float> A_host =
+      make_random_A_with_at_most_255_ones_per_row(N, N, A_SEED);
+  static const std::vector<float> B_host = make_random_B_with_half_ones_on_average(N, N, B_SEED);
+  static const std::vector<double> C_reference_host =
+      compute_reference_matmul_on_cpu(A_host, B_host, N, N, N);
+  expect_kernel_output_matches_given_reference(GetParam().matmul_fn, A_host, B_host,
+                                               C_reference_host, N, N, N);
 }
 
 INSTANTIATE_TEST_SUITE_P(matmul, KernelTest, testing::ValuesIn(KERNELS),
