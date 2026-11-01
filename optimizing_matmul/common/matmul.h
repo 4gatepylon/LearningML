@@ -9,6 +9,7 @@
  * - `KERNELS`: Every kernel that the tests and the benchmark run.
  * - `matmul_cublas`: The cuBLAS reference kernel, defined in `kernels/cublas.cu`.
  * - `matmul_naive`: The one-thread-per-element kernel, defined in `kernels/naive.cu`.
+ * - `matmul_tiled_from_naive`: Shared-memory tiles, defined in `kernels/tiled_from_naive.cu`.
  * - `check_status`: Aborts on a failed CUDA or cuBLAS call.
  * - `CHECK`: Calls `check_status` with the call's text, file and line.
  * - `copy_to_device`: Copies a host array into a new device buffer.
@@ -70,6 +71,9 @@ void matmul_cublas(const bf16_t* A_device, const bf16_t* B_device, bf16_t* C_dev
                    int K);
 void matmul_naive(const bf16_t* A_device, const bf16_t* B_device, bf16_t* C_device, int M, int N,
                   int K);
+template <int TILE_SIZE>
+void matmul_tiled_from_naive(const bf16_t* A_device, const bf16_t* B_device, bf16_t* C_device,
+                             int M, int N, int K);
 
 /**
  * @brief `Kernel` holds a kernel's name, its function and the sizes it supports.
@@ -91,7 +95,14 @@ struct Kernel {
   int size_multiple;
 };
 
-inline constexpr Kernel KERNELS[] = {{"cublas", matmul_cublas, 1}, {"naive", matmul_naive, 1}};
+inline constexpr Kernel KERNELS[] = {
+    {"cublas", matmul_cublas, 1},
+    {"naive", matmul_naive, 1},
+    {"tiled4_from_naive", matmul_tiled_from_naive<4>, 1},
+    {"tiled8_from_naive", matmul_tiled_from_naive<8>, 1},
+    {"tiled16_from_naive", matmul_tiled_from_naive<16>, 1},
+    {"tiled32_from_naive", matmul_tiled_from_naive<32>, 1},
+};
 
 /**
  * @brief `copy_to_device` copies a host array into a new device buffer, rounding to bf16.
