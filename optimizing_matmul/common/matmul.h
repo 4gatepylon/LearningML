@@ -13,6 +13,7 @@
  * - `matmul_blocktile1d_from_tiled32`: 8 outputs per thread, in its own file under `kernels/`.
  * - `matmul_blocktile2d_from_blocktile1d`: 8 x 8 outputs per thread, in its own file too.
  * - `matmul_vectorized_from_blocktile2d`: 16-byte loads and stores, in its own file too.
+ * - `matmul_wmma_from_vectorized`: Tensor cores through WMMA, in its own file too.
  * - `check_status`: Aborts on a failed CUDA or cuBLAS call.
  * - `CHECK`: Calls `check_status` with the call's text, file and line.
  * - `copy_to_device`: Copies a host array into a new device buffer.
@@ -83,6 +84,8 @@ void matmul_blocktile2d_from_blocktile1d(const bf16_t* A_device, const bf16_t* B
                                          bf16_t* C_device, int M, int N, int K);
 void matmul_vectorized_from_blocktile2d(const bf16_t* A_device, const bf16_t* B_device,
                                         bf16_t* C_device, int M, int N, int K);
+void matmul_wmma_from_vectorized(const bf16_t* A_device, const bf16_t* B_device, bf16_t* C_device,
+                                 int M, int N, int K);
 
 /**
  * @brief `Kernel` holds a kernel's name, its function and the sizes it supports.
@@ -114,6 +117,7 @@ inline constexpr Kernel KERNELS[] = {
     {"blocktile1d_from_tiled32", matmul_blocktile1d_from_tiled32, 1},
     {"blocktile2d_from_blocktile1d", matmul_blocktile2d_from_blocktile1d, 1},
     {"vectorized_from_blocktile2d", matmul_vectorized_from_blocktile2d, 8},
+    {"wmma_from_vectorized", matmul_wmma_from_vectorized, 8},
 };
 
 /**
