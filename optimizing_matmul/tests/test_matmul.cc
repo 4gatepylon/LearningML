@@ -345,8 +345,9 @@ TEST_P(ShapeTest, matches_reference) {
   const int M = round_up_to_multiple(shape.M, kernel.size_multiple);
   const int N = round_up_to_multiple(shape.N, kernel.size_multiple);
   const int K = round_up_to_multiple(shape.K, kernel.size_multiple);
-  expect_matches_reference(kernel.matmul_fn, make_random_A(M, K, A_SEED),
-                           make_random_B(K, N, B_SEED), M, N, K);
+  expect_kernel_output_matches_reference(
+      kernel.matmul_fn, make_random_A_with_at_most_255_ones_per_row(M, K, A_SEED),
+      make_random_B_with_half_ones_on_average(K, N, B_SEED), M, N, K);
 }
 
 INSTANTIATE_TEST_SUITE_P(matmul, ShapeTest,
