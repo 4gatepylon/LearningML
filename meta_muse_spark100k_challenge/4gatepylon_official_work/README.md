@@ -24,3 +24,9 @@ okc submit submission.py --json   # the same run, scored on the leaderboard
 ```
 
 Both write the run's profile and log to `profiles/` beside `submission.py`, which is git-ignored.
+
+`make regenerate-starters` (`scripts/regenerate_starters.py`) reruns `okc init` for every problem
+into a temporary folder and compares its files with ours: it writes missing files, leaves identical
+ones alone, and lists the ones that differ, overwriting them only with
+`YES_TO_OVERWRITE_CHANGED_FILES=1`. On unedited starters it reports every file as matching and
+changes nothing. It needs `okc` on PATH, signed in, and `uv`.
