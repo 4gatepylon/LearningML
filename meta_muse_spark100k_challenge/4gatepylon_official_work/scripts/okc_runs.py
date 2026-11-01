@@ -18,10 +18,14 @@ Interface:
         --dry-run, --json.
     get RUN_ID: Waits for the run's job, saves `result.json` and `summary.json`, prints the summary.
         --no-wait, --json.
+    list: Prints one row per run (run id, problem, mode, job, sha256, status, speedup, minutes).
+        --limit: Newest runs to show (default 20).
+        --json.
 
 Example:
     $ uv run --script scripts/okc_runs.py create muse_bf16_proj/submission.py --label tiled
     $ uv run --script scripts/okc_runs.py get 20261101-003443-muse_bf16_proj-tiled
+    $ uv run --script scripts/okc_runs.py list
 
 Must know:
     Gotchas:
@@ -51,6 +55,7 @@ PROBLEM_LINE_PATTERN: re.Pattern = re.compile(r"^# okc: problem=(\w+)$")
 LABEL_PATTERN: re.Pattern = re.compile(r"^[A-Za-z0-9_.-]+$")
 US_PER_NS: float = 1e-3
 S_PER_MIN: float = 60.0
+SHA256_PREFIX_LENGTH: int = 12
 
 
 def _run_okc(args: list[str], cwd: Path | None = None) -> dict:
@@ -161,7 +166,7 @@ def _confirm_destructive_action(
 
 @click.group()
 def cli() -> None:
-    """`cli` groups the `create` and `get` commands."""
+    """`cli` groups the `create`, `get` and `list` commands."""
 
 
 @cli.command(epilog="Example: okc_runs.py create muse_bf16_proj/submission.py --label tiled")
@@ -296,6 +301,39 @@ def get(run_id: str, no_wait: bool, should_print_json: bool) -> None:
         )
     if summary["first_failure"]:
         click.echo(f"first failure: {summary['first_failure']}")
+
+
+@cli.command("list", epilog="Example: okc_runs.py list --limit 5")
+@click.option("--limit", type=click.IntRange(min=1), default=20, show_default=True)
+@click.option("--json", "should_print_json", is_flag=True, help="Print the rows as JSON.")
+def list_runs(limit: int, should_print_json: bool) -> None:
+    """`list_runs` prints one row per run, newest last, from `run.json` and `summary.json`."""
+    rows: list[dict] = []
+    for run_path in sorted(ARTIFACTS_DIR.glob("*/run.json")):
+        run: dict = json.loads(run_path.read_text())
+        summary_path: Path = run_path.parent / "summary.json"
+        summary: dict = json.loads(summary_path.read_text()) if summary_path.exists() else {}
+        rows.append(
+            {
+                **{key: run[key] for key in ("run_id", "problem", "mode", "job_id")},
+                "sha256": run["sha256"][:SHA256_PREFIX_LENGTH],
+                **{key: summary.get(key) for key in ("status", "speedup", "queue_min", "run_min")},
+            }
+        )
+    shown_rows: list[dict] = rows[-limit:]
+    if should_print_json:
+        click.echo(json.dumps({"runs": shown_rows, "total": len(rows)}))
+        return
+    if shown_rows:
+        click.echo("  ".join(shown_rows[0]))
+    for row in shown_rows:
+        click.echo(
+            "  ".join(
+                f"{value:.3f}" if isinstance(value, float) else str(value) for value in row.values()
+            )
+        )
+    if len(rows) > limit:
+        click.echo(f"Showed the newest {limit} of {len(rows)} runs; pass --limit to see more.")
 
 
 if __name__ == "__main__":
