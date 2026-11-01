@@ -75,18 +75,18 @@ std::vector<float> run_kernel(matmul_fn_t matmul_fn, const std::vector<float>& A
 }
 
 /**
- * @brief `make_random_A` makes an M x K 0/1 matrix with min(ceil(K / 2), 255) ones in each row.
+ * @brief `make_random_A_with_at_most_255_ones_per_row` makes a random 0/1 M x K matrix.
  *
  * @param[in] M Rows.
  * @param[in] K Columns.
  * @param[in] seed Seed for the choice of columns.
- * @return A, M x K, row-major, with each row's ones in random distinct columns.
+ * @return A, M x K, row-major: each row has min(ceil(K / 2), 255) ones, in random columns.
  *
  * @par Must know
  * - Gotchas:
  *   - C[i][j] is at most the count of ones in row i of A, so every output is at most 255.
  */
-std::vector<float> make_random_A(int M, int K, uint32_t seed) {
+std::vector<float> make_random_A_with_at_most_255_ones_per_row(int M, int K, uint32_t seed) {
   const int ones_per_row = std::min((K + 1) / 2, MAX_OUTPUT_VALUE);
   std::mt19937 rng(seed);
   std::vector<int> columns(K);
@@ -100,14 +100,14 @@ std::vector<float> make_random_A(int M, int K, uint32_t seed) {
 }
 
 /**
- * @brief `make_random_B` makes a K x N 0/1 matrix whose entries are 1 with probability 1/2.
+ * @brief `make_random_B_with_half_ones_on_average` makes a random 0/1 K x N matrix.
  *
  * @param[in] K Rows.
  * @param[in] N Columns.
  * @param[in] seed Seed for the entries.
- * @return B, K x N, row-major.
+ * @return B, K x N, row-major: each entry is 1 with probability 1/2.
  */
-std::vector<float> make_random_B(int K, int N, uint32_t seed) {
+std::vector<float> make_random_B_with_half_ones_on_average(int K, int N, uint32_t seed) {
   std::mt19937 rng(seed);
   std::bernoulli_distribution draw_is_one(B_ONE_PROBABILITY);
   std::vector<float> B_host(static_cast<size_t>(K) * N);
@@ -116,32 +116,34 @@ std::vector<float> make_random_B(int K, int N, uint32_t seed) {
 }
 
 /**
- * @brief `compute_reference` computes C = A * B exactly on the CPU, in integers.
+ * @brief `compute_reference_matmul_on_cpu` computes C = A * B on the CPU in double precision.
  *
- * @param[in] A_host Left factor, M x K, row-major, integer-valued.
- * @param[in] B_host Right factor, K x N, row-major, integer-valued.
+ * @param[in] A_host Left factor, M x K, row-major.
+ * @param[in] B_host Right factor, K x N, row-major.
  * @param[in] M Rows of A and C.
  * @param[in] N Columns of B and C.
  * @param[in] K Columns of A and rows of B.
  * @return C = A * B, M x N, row-major.
  *
  * @par Must know
+ * - Gotchas:
+ *   - On 0/1 inputs every partial sum is a small integer, which double holds exactly.
  * - Performance:
  *   - It skips the zeros of A, so it costs M * N times the ones per row of A, not M * N * K.
+ *   - It loops i, k, j so it reads rows of B; a dot product per output is 10x slower at 8192.
  */
-std::vector<int32_t> compute_reference(const std::vector<float>& A_host,
-                                       const std::vector<float>& B_host, int M, int N, int K) {
-  const std::vector<int32_t> A_int32_host(A_host.begin(), A_host.end());
-  const std::vector<int32_t> B_int32_host(B_host.begin(), B_host.end());
-  std::vector<int32_t> C_host(static_cast<size_t>(M) * N, 0);
+std::vector<double> compute_reference_matmul_on_cpu(const std::vector<float>& A_host,
+                                                    const std::vector<float>& B_host, int M, int N,
+                                                    int K) {
+  std::vector<double> C_host(static_cast<size_t>(M) * N, 0.0);
   for (int64_t i = 0; i < M; ++i) {
     for (int64_t k = 0; k < K; ++k) {
-      const int32_t A_ik = A_int32_host[(i * K) + k];
-      if (A_ik == 0) {
+      const double A_ik = A_host[(i * K) + k];
+      if (A_ik == 0.0) {
         continue;
       }
       for (int64_t j = 0; j < N; ++j) {
-        C_host[(i * N) + j] += A_ik * B_int32_host[(k * N) + j];
+        C_host[(i * N) + j] += A_ik * B_host[(k * N) + j];
       }
     }
   }
@@ -149,7 +151,7 @@ std::vector<int32_t> compute_reference(const std::vector<float>& A_host,
 }
 
 /**
- * @brief `expect_matches_reference` runs a kernel and expects every output to equal the reference.
+ * @brief `expect_kernel_output_matches_reference` checks a kernel's output against the reference.
  *
  * @param[in] matmul_fn Kernel to run.
  * @param[in] A_host Left factor, M x K, row-major, 0/1.
@@ -163,16 +165,17 @@ std::vector<int32_t> compute_reference(const std::vector<float>& A_host,
  *   - It first asserts that no reference output passes 255, so a test can't break the cap.
  *   - A failure prints the mismatch count, the first mismatches and the differences got - expected.
  */
-void expect_matches_reference(matmul_fn_t matmul_fn, const std::vector<float>& A_host,
-                              const std::vector<float>& B_host, int M, int N, int K) {
-  const std::vector<int32_t> C_reference_host = compute_reference(A_host, B_host, M, N, K);
+void expect_kernel_output_matches_reference(matmul_fn_t matmul_fn, const std::vector<float>& A_host,
+                                            const std::vector<float>& B_host, int M, int N, int K) {
+  const std::vector<double> C_reference_host =
+      compute_reference_matmul_on_cpu(A_host, B_host, M, N, K);
   ASSERT_LE(*std::max_element(C_reference_host.begin(), C_reference_host.end()), MAX_OUTPUT_VALUE);
   const std::vector<float> C_host = run_kernel(matmul_fn, A_host, B_host, M, N, K);
   size_t mismatch_count = 0;
-  std::set<float> differences;
+  std::set<double> differences;
   std::ostringstream report;
   for (size_t e = 0; e < C_host.size(); ++e) {
-    const float C_expected = static_cast<float>(C_reference_host[e]);
+    const double C_expected = C_reference_host[e];
     if (C_host[e] == C_expected) {
       continue;
     }
@@ -185,7 +188,7 @@ void expect_matches_reference(matmul_fn_t matmul_fn, const std::vector<float>& A
   }
   report << " differences:";
   std::for_each_n(differences.begin(), std::min(differences.size(), REPORTED_DIFFERENCE_COUNT),
-                  [&](float difference) { report << " " << difference; });
+                  [&](double difference) { report << " " << difference; });
   EXPECT_EQ(mismatch_count, 0U) << mismatch_count << " of " << C_host.size()
                                 << " outputs differ:" << report.str();
 }
@@ -234,8 +237,9 @@ TEST_P(KernelTest, known_2x2) {
  */
 TEST_P(KernelTest, random_square) {
   constexpr int N = 200;
-  expect_matches_reference(GetParam().matmul_fn, make_random_A(N, N, A_SEED),
-                           make_random_B(N, N, B_SEED), N, N, N);
+  expect_kernel_output_matches_reference(
+      GetParam().matmul_fn, make_random_A_with_at_most_255_ones_per_row(N, N, A_SEED),
+      make_random_B_with_half_ones_on_average(N, N, B_SEED), N, N, N);
 }
 
 INSTANTIATE_TEST_SUITE_P(matmul, KernelTest, testing::ValuesIn(KERNELS),
