@@ -13,8 +13,9 @@ These rules apply to `optimizing_matmul/`, on top of the root `CLAUDE.md`.
 - **Compile-time options:** a kernel's tunable sizes (tile sizes, threads per block, pipeline
   depth) are compile-time options of that one kernel, never separate kernels. Each is a macro with
   a default, named after the kernel (`WMMA_FROM_VECTORIZED_BLOCK_TILE_K`), that `-D` overrides.
-  The PR that adds the kernel sweeps its options, sets the defaults to the best values and
-  reports the sweep. (`tiled4_from_naive` to `tiled32_from_naive` predate this rule.)
+  The PR that adds the kernel sweeps its options with `make sweep-options`, sets the defaults
+  to the best values and reports the sweep. (`tiled4_from_naive` to `tiled32_from_naive` predate
+  this rule.)
 - **Where the name appears:** in `KERNELS` (`"blocktile1d_from_tiled32"`), in the function name
   (`matmul_<new>_from_<old>`) and in the file name (`kernels/<new>_from_<old>.cu`).
 - **Experimental PRs:** an optimization that Claude tries on its own goes in a PR whose title
