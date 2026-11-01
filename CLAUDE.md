@@ -128,6 +128,13 @@ else is required.
 > NOTE: `cuda_book/` is separate from this template and doesn't necessarily follow it. It keeps its
 > own layout and rules (see `cuda_book/CLAUDE.md`).
 
+## Open Kernel Challenge
+
+Work on the Open Kernel Challenge (https://openkernelchallenge.dev, the `okc` CLI) goes in
+`meta_muse_spark100k_challenge/4gatepylon_official_work/`, one folder per `okc` problem. That
+folder follows `okc`'s layout, not the kernel-folder template above; read
+`meta_muse_spark100k_challenge/CLAUDE.md` before working there.
+
 ## Code practices
 
 These rules are for new code in every language; don't rewrite existing code only to follow them.

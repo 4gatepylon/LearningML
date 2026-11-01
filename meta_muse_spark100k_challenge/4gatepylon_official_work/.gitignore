@@ -1,0 +1,5 @@
+# `.gitignore` ignores what `okc check` and `okc submit` write beside a submission.
+#
+# Interface:
+#     profiles/: each run's profile and log, in every problem folder.
+profiles/
