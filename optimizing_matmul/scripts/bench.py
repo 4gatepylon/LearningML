@@ -43,7 +43,7 @@ _DRAM_CROSSING_MATRIX_COUNT: int = 3
 _BYTES_PER_BF16: int = 2
 _MS_PER_S: float = 1e3
 _FLOP_PER_TFLOP: float = 1e12
-_ROW_FORMAT: str = "{:<8}{:>6}{:>8}{:>7}{:>10}{:>11}{:>10}{:>10}{:>9}{:>10}{:>7}"
+_ROW_FORMAT: str = "{:<28}{:>6}{:>8}{:>7}{:>10}{:>11}{:>10}{:>10}{:>9}{:>10}{:>7}"
 
 
 @click.command(
