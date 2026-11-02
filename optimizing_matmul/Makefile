@@ -15,9 +15,11 @@
 # Must know:
 #     Gotchas:
 #         - nvcc comes from PATH, so `source .env` must run first.
+#         - The architecture comes from NVCC_ARCH (default native); .env sets sm_90a.
 #         - The dev tools come from uv; set CLANG_FORMAT, CLANG_TIDY or RUFF to use others.
 NVCC ?= nvcc
-NVCCFLAGS ?= -std=c++17 -O2 -arch=native -Xcompiler=-Wall,-Wextra -I.
+NVCC_ARCH ?= native
+NVCCFLAGS ?= -std=c++17 -O2 -arch=$(NVCC_ARCH) -Xcompiler=-Wall,-Wextra -I.
 NVCC_DEFINES ?=
 BUILD_DIR := .build
 CLANG_FORMAT ?= uv run clang-format
