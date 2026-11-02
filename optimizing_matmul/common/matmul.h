@@ -19,6 +19,7 @@
  * - `matmul_specialized_from_wgmma`: wgmma with producer and consumer warpgroups, likewise.
  * - `matmul_rasterized_from_specialized`: the same in grouped block order, likewise.
  * - `matmul_multicast_from_rasterized`: the same with clusters sharing B by TMA multicast.
+ * - `matmul_wide_from_multicast`: the same with one 64 x 256 wgmma per 16 of K.
  * - `check_status`: Aborts on a failed CUDA or cuBLAS call.
  * - `CHECK`: Calls `check_status` with the call's text, file and line.
  * - `copy_to_device`: Copies a host array into a new device buffer.
@@ -101,6 +102,8 @@ void matmul_rasterized_from_specialized(const bf16_t* A_device, const bf16_t* B_
                                         bf16_t* C_device, int M, int N, int K);
 void matmul_multicast_from_rasterized(const bf16_t* A_device, const bf16_t* B_device,
                                       bf16_t* C_device, int M, int N, int K);
+void matmul_wide_from_multicast(const bf16_t* A_device, const bf16_t* B_device, bf16_t* C_device,
+                                int M, int N, int K);
 
 /**
  * @brief `Kernel` holds a kernel's name, its function and the sizes it supports.
@@ -138,6 +141,7 @@ inline constexpr Kernel KERNELS[] = {
     {"specialized_from_wgmma", matmul_specialized_from_wgmma, 8},
     {"rasterized_from_specialized", matmul_rasterized_from_specialized, 8},
     {"multicast_from_rasterized", matmul_multicast_from_rasterized, 8},
+    {"wide_from_multicast", matmul_wide_from_multicast, 8},
 };
 
 /**
