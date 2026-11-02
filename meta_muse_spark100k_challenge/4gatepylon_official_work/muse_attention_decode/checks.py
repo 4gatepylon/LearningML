@@ -18,7 +18,7 @@ ROW_NORM_FLOOR = 0.1
 
 
 def relative_l2(a: torch.Tensor, b: torch.Tensor) -> float:
-    """|a - b| / |b|."""
+    """|a - b|_2 / |b|_2."""
     return float((a.float() - b.float()).norm() / b.float().norm().clamp(min=1e-12))
 
 
@@ -29,6 +29,17 @@ def query_precision_bound(e4m3_err: float, factor: float, floor: float, cap: flo
 
 
 def compare(output, ref: torch.Tensor, tol: float) -> tuple[bool, str]:
+    """Calculates whether these last two conditions are met:
+
+        1. ‖out - ref‖₂ / ‖ref‖₂ ≤ tol, over every element of the tensor.
+        2. For every row r (a row is a slice along the last dim, so there are numel / shape[-1] rows):
+           ‖out_r - ref_r‖₂ / max(‖ref_r‖₂, ROW_NORM_FLOOR · mean_r ‖ref_r‖₂) ≤ ROW_FACTOR · tol.
+
+    In muse_attention_decode, `check_implementation` calls this on the output [B, L, Hq*64], where
+    a row is one token's every head, and on the new K and V cache entries [B, L, Hkv, 64], where a
+    row is one head's 64 values. Hkv is the number of key/value heads (in the real model, this is 16;
+    Hq is the number of query heads (in the real model, this is 128).
+    """
     if not isinstance(output, torch.Tensor):
         return False, f"expected a tensor, got {type(output).__name__}"
     if output.shape != ref.shape or output.dtype != ref.dtype:
