@@ -16,6 +16,7 @@
  * - `hopper::get_cluster_rank`, `hopper::arrive_cluster_barrier`, `hopper::sync_cluster`: Thread
  *   block cluster operations.
  * - `hopper::wgmma_64x128x16`: One wgmma, A K-major and B N-major, both from shared memory.
+ * - `hopper::wgmma_64x256x16`: The same, 256 columns wide.
  * - `hopper::fence_wgmma`, `hopper::commit_wgmma_group`, `hopper::wait_wgmma_groups`: wgmma
  *   ordering.
  * - `hopper::set_max_registers`: Changes the warpgroup's register count (`setmaxnreg`).
@@ -420,6 +421,73 @@ __device__ __forceinline__ void wgmma_64x128x16(float (&C_fp32)[WGMMA_ACCUMULATO
         "+f"(C_fp32[50]), "+f"(C_fp32[51]), "+f"(C_fp32[52]), "+f"(C_fp32[53]), "+f"(C_fp32[54]),
         "+f"(C_fp32[55]), "+f"(C_fp32[56]), "+f"(C_fp32[57]), "+f"(C_fp32[58]), "+f"(C_fp32[59]),
         "+f"(C_fp32[60]), "+f"(C_fp32[61]), "+f"(C_fp32[62]), "+f"(C_fp32[63])
+      : "l"(A_descriptor), "l"(B_descriptor));
+}
+
+/**
+ * @brief `wgmma_64x256x16` adds A (64 x 16, K-major) times B (16 x 256, N-major) to the
+ * warpgroup's 64 x 256 accumulators.
+ *
+ * @param[in,out] C_fp32 This thread's 128 accumulators, laid out as two 64 x 128 tiles' would be.
+ * @param[in] A_descriptor Descriptor of A's 64 x 16 slice.
+ * @param[in] B_descriptor Descriptor of B's 16 x 256 slice, read transposed (N-major).
+ *
+ * @par Example
+ * @code
+ * hopper::wgmma_64x256x16(C_fp32, A_descriptor, B_descriptor);
+ * @endcode
+ *
+ * @par Must know
+ * - Gotchas:
+ *   - It only starts the multiply; `commit_wgmma_group` and `wait_wgmma_groups` finish it.
+ * - Performance:
+ *   - It reads A's slice once for all 256 columns, where two 64 x 128 wgmmas read it twice.
+ */
+__device__ __forceinline__ void wgmma_64x256x16(float (&C_fp32)[2 * WGMMA_ACCUMULATOR_COUNT],
+                                                uint64_t A_descriptor, uint64_t B_descriptor) {
+  asm volatile(
+      "{\n"
+      "wgmma.mma_async.sync.aligned.m64n256k16.f32.bf16.bf16 "
+      "{"
+      "%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, "
+      "%16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31, "
+      "%32, %33, %34, %35, %36, %37, %38, %39, %40, %41, %42, %43, %44, %45, %46, %47, "
+      "%48, %49, %50, %51, %52, %53, %54, %55, %56, %57, %58, %59, %60, %61, %62, %63, "
+      "%64, %65, %66, %67, %68, %69, %70, %71, %72, %73, %74, %75, %76, %77, %78, %79, "
+      "%80, %81, %82, %83, %84, %85, %86, %87, %88, %89, %90, %91, %92, %93, %94, %95, "
+      "%96, %97, %98, %99, %100, %101, %102, %103, %104, %105, %106, %107, %108, %109, %110, %111, "
+      "%112, %113, %114, %115, %116, %117, %118, %119, %120, %121, %122, %123, %124, %125, %126, "
+      "%127"
+      "}, "
+      "%128, %129, 1, 1, 1, 0, 1;\n"
+      "}\n"
+      : "+f"(C_fp32[0]), "+f"(C_fp32[1]), "+f"(C_fp32[2]), "+f"(C_fp32[3]), "+f"(C_fp32[4]),
+        "+f"(C_fp32[5]), "+f"(C_fp32[6]), "+f"(C_fp32[7]), "+f"(C_fp32[8]), "+f"(C_fp32[9]),
+        "+f"(C_fp32[10]), "+f"(C_fp32[11]), "+f"(C_fp32[12]), "+f"(C_fp32[13]), "+f"(C_fp32[14]),
+        "+f"(C_fp32[15]), "+f"(C_fp32[16]), "+f"(C_fp32[17]), "+f"(C_fp32[18]), "+f"(C_fp32[19]),
+        "+f"(C_fp32[20]), "+f"(C_fp32[21]), "+f"(C_fp32[22]), "+f"(C_fp32[23]), "+f"(C_fp32[24]),
+        "+f"(C_fp32[25]), "+f"(C_fp32[26]), "+f"(C_fp32[27]), "+f"(C_fp32[28]), "+f"(C_fp32[29]),
+        "+f"(C_fp32[30]), "+f"(C_fp32[31]), "+f"(C_fp32[32]), "+f"(C_fp32[33]), "+f"(C_fp32[34]),
+        "+f"(C_fp32[35]), "+f"(C_fp32[36]), "+f"(C_fp32[37]), "+f"(C_fp32[38]), "+f"(C_fp32[39]),
+        "+f"(C_fp32[40]), "+f"(C_fp32[41]), "+f"(C_fp32[42]), "+f"(C_fp32[43]), "+f"(C_fp32[44]),
+        "+f"(C_fp32[45]), "+f"(C_fp32[46]), "+f"(C_fp32[47]), "+f"(C_fp32[48]), "+f"(C_fp32[49]),
+        "+f"(C_fp32[50]), "+f"(C_fp32[51]), "+f"(C_fp32[52]), "+f"(C_fp32[53]), "+f"(C_fp32[54]),
+        "+f"(C_fp32[55]), "+f"(C_fp32[56]), "+f"(C_fp32[57]), "+f"(C_fp32[58]), "+f"(C_fp32[59]),
+        "+f"(C_fp32[60]), "+f"(C_fp32[61]), "+f"(C_fp32[62]), "+f"(C_fp32[63]), "+f"(C_fp32[64]),
+        "+f"(C_fp32[65]), "+f"(C_fp32[66]), "+f"(C_fp32[67]), "+f"(C_fp32[68]), "+f"(C_fp32[69]),
+        "+f"(C_fp32[70]), "+f"(C_fp32[71]), "+f"(C_fp32[72]), "+f"(C_fp32[73]), "+f"(C_fp32[74]),
+        "+f"(C_fp32[75]), "+f"(C_fp32[76]), "+f"(C_fp32[77]), "+f"(C_fp32[78]), "+f"(C_fp32[79]),
+        "+f"(C_fp32[80]), "+f"(C_fp32[81]), "+f"(C_fp32[82]), "+f"(C_fp32[83]), "+f"(C_fp32[84]),
+        "+f"(C_fp32[85]), "+f"(C_fp32[86]), "+f"(C_fp32[87]), "+f"(C_fp32[88]), "+f"(C_fp32[89]),
+        "+f"(C_fp32[90]), "+f"(C_fp32[91]), "+f"(C_fp32[92]), "+f"(C_fp32[93]), "+f"(C_fp32[94]),
+        "+f"(C_fp32[95]), "+f"(C_fp32[96]), "+f"(C_fp32[97]), "+f"(C_fp32[98]), "+f"(C_fp32[99]),
+        "+f"(C_fp32[100]), "+f"(C_fp32[101]), "+f"(C_fp32[102]), "+f"(C_fp32[103]),
+        "+f"(C_fp32[104]), "+f"(C_fp32[105]), "+f"(C_fp32[106]), "+f"(C_fp32[107]),
+        "+f"(C_fp32[108]), "+f"(C_fp32[109]), "+f"(C_fp32[110]), "+f"(C_fp32[111]),
+        "+f"(C_fp32[112]), "+f"(C_fp32[113]), "+f"(C_fp32[114]), "+f"(C_fp32[115]),
+        "+f"(C_fp32[116]), "+f"(C_fp32[117]), "+f"(C_fp32[118]), "+f"(C_fp32[119]),
+        "+f"(C_fp32[120]), "+f"(C_fp32[121]), "+f"(C_fp32[122]), "+f"(C_fp32[123]),
+        "+f"(C_fp32[124]), "+f"(C_fp32[125]), "+f"(C_fp32[126]), "+f"(C_fp32[127])
       : "l"(A_descriptor), "l"(B_descriptor));
 }
 
