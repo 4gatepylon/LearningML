@@ -1,10 +1,12 @@
 """Output checks shared by every problem's reference.py.
 
 compare(out, ref, tol) passes when:
-- the whole output's relative L2 error, |out - ref| / |ref|, is at most tol;
+- the whole output's relative L2 error, |out - ref|_2 / |ref|_2, is at most tol;
 - every row's is at most ROW_FACTOR * tol. A row is the last dimension. A row's error is
   taken against its own norm, or against ROW_NORM_FLOOR times the average row norm if
   that's larger.
+
+This is used by `reference.py` to check the output of the submission.
 """
 
 from __future__ import annotations
@@ -23,8 +25,10 @@ def relative_l2(a: torch.Tensor, b: torch.Tensor) -> float:
 
 
 def query_precision_bound(e4m3_err: float, factor: float, floor: float, cap: float, slack: float = 0.0) -> float:
-    """Attention's bound for one case: `factor` times the reference's own error with queries
-    rounded to FP8 E4M3 (`e4m3_err`), plus `slack`, within [floor, cap]."""
+    """This is used to calculate attention error's bound for one generated input (case).
+    
+    It's vlaue is `factor` times the reference's own error with queries
+    (rounded to FP8 E4M3 (`e4m3_err`) plus `slack`, within [floor, cap])."""
     return min(cap, max(floor, factor * e4m3_err + slack))
 
 
