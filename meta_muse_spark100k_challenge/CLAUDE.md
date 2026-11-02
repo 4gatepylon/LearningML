@@ -1,7 +1,8 @@
 These rules apply to `meta_muse_spark100k_challenge/`, our work on the Open Kernel Challenge
 (https://openkernelchallenge.dev).
 
-- Our own work goes in `4gatepylon_official_work/<problem>/`, one folder per `okc` problem.
+- Our own work goes in `4gatepylon_official_work/<problem>/`, one folder per `okc` problem. Store
+  and review kernel versions the way `4gatepylon_official_work/KERNELS.md` says.
 - Before working on a problem, read its folder's `AGENTS.md` (notes for coding agents from the
   challenge), then its `TASK.md` (the problem, rules, scoring and how to submit). Follow both.
 - `lee_101_openkernels_example/` is a read-only copy of someone else's entries, for reference. Don't
