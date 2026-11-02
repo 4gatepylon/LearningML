@@ -22,6 +22,7 @@
  * - `matmul_wide_from_multicast`: the same with one 64 x 256 wgmma per 16 of K.
  * - `matmul_persistent_from_wide`: the same as a persistent kernel looping over tiles.
  * - `matmul_tmastore_from_persistent`: the same, storing C through shared memory with TMA.
+ * - `matmul_quad_from_tmastore`: the same with 2 x 2 clusters sharing A and B.
  * - `check_status`: Aborts on a failed CUDA or cuBLAS call.
  * - `CHECK`: Calls `check_status` with the call's text, file and line.
  * - `copy_to_device`: Copies a host array into a new device buffer.
@@ -110,6 +111,8 @@ void matmul_persistent_from_wide(const bf16_t* A_device, const bf16_t* B_device,
                                  int M, int N, int K);
 void matmul_tmastore_from_persistent(const bf16_t* A_device, const bf16_t* B_device,
                                      bf16_t* C_device, int M, int N, int K);
+void matmul_quad_from_tmastore(const bf16_t* A_device, const bf16_t* B_device, bf16_t* C_device,
+                               int M, int N, int K);
 
 /**
  * @brief `Kernel` holds a kernel's name, its function and the sizes it supports.
@@ -150,6 +153,7 @@ inline constexpr Kernel KERNELS[] = {
     {"wide_from_multicast", matmul_wide_from_multicast, 8},
     {"persistent_from_wide", matmul_persistent_from_wide, 8},
     {"tmastore_from_persistent", matmul_tmastore_from_persistent, 8},
+    {"quad_from_tmastore", matmul_quad_from_tmastore, 8},
 };
 
 /**
