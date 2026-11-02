@@ -15,6 +15,7 @@
  * - `matmul_vectorized_from_blocktile2d`: 16-byte loads and stores, in its own file too.
  * - `matmul_wmma_from_vectorized`: Tensor cores through WMMA, in its own file too.
  * - `matmul_pipelined_from_wmma`: WMMA with a `cp.async` pipeline, in its own file too.
+ * - `matmul_wgmma_from_pipelined`: TMA copies and wgmma (needs sm_90a), in its own file too.
  * - `check_status`: Aborts on a failed CUDA or cuBLAS call.
  * - `CHECK`: Calls `check_status` with the call's text, file and line.
  * - `copy_to_device`: Copies a host array into a new device buffer.
@@ -89,6 +90,8 @@ void matmul_wmma_from_vectorized(const bf16_t* A_device, const bf16_t* B_device,
                                  int M, int N, int K);
 void matmul_pipelined_from_wmma(const bf16_t* A_device, const bf16_t* B_device, bf16_t* C_device,
                                 int M, int N, int K);
+void matmul_wgmma_from_pipelined(const bf16_t* A_device, const bf16_t* B_device, bf16_t* C_device,
+                                 int M, int N, int K);
 
 /**
  * @brief `Kernel` holds a kernel's name, its function and the sizes it supports.
@@ -122,6 +125,7 @@ inline constexpr Kernel KERNELS[] = {
     {"vectorized_from_blocktile2d", matmul_vectorized_from_blocktile2d, 8},
     {"wmma_from_vectorized", matmul_wmma_from_vectorized, 8},
     {"pipelined_from_wmma", matmul_pipelined_from_wmma, 8},
+    {"wgmma_from_pipelined", matmul_wgmma_from_pipelined, 8},
 };
 
 /**
