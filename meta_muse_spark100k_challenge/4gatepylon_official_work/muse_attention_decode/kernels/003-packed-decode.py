@@ -1,7 +1,7 @@
 # okc: problem=muse_attention_decode
-"""`002-per-head-dots.py` attends each KV head with its own 2D dots and combines splits per row.
+"""`003-packed-decode.py` attends decode tokens with one block-diagonal dot per 128-byte key tile.
 
-Kernel 002's parent is 001. It computes, for each request b and block token j:
+Kernel 003's parent is 002. It computes, for each request b and block token j:
     q, k = rmsnorm(q) * qk_scale_factor, rmsnorm(k), with RoPE on sliding layers
     cache[cache_loc] = fp8(k), fp8(v)
     out = rmsnorm(softmax(q k^T / 8) v) * sigmoid(gate)
@@ -10,12 +10,13 @@ Interface:
     kernel_fn(data): Returns bfloat16 [B, L, Hq * 64] and writes the block's keys and values.
 
 Example:
-    $ okc check kernels/002-per-head-dots.py
+    $ okc check kernels/003-packed-decode.py
 
 Must know:
     Performance:
         - `_attend_split` gives each program two KV heads (128 contiguous cache bytes per token).
-        - `_attend_split` runs separate Q K^T and P V dots per head, at most [64, 64] each.
+        - `_attend_split` (verify) runs separate Q K^T and P V dots per head, [64, 64] each.
+        - `_attend_split_packed` (decode) packs both heads' 8 rows into one [16, 128] query.
         - Q K^T runs in FP8 (queries rounded to E4M3, as FA3 does); P V runs in bf16.
         - `_combine_splits` gives each query row its own program and reads splits in blocks.
 """
@@ -29,6 +30,8 @@ MIN_DOT_ROWS: int = 16
 BLOCK_N: int = 64
 SPLIT_BLOCK: int = 64
 PROGRAMS_PER_SM: int = 4
+PACKED_BLOCK_N_PER_LAYER: dict[str, int] = {"sliding": 64, "full": 128}
+PACKED_PROGRAMS_PER_SM_PER_LAYER: dict[str, int] = {"sliding": 4, "full": 8}
 ATTEND_WARPS: int = 4
 ATTEND_STAGES: int = 3
 RMS_EPS: float = 1e-5
@@ -171,6 +174,67 @@ def _attend_split(
 
 
 @triton.jit
+def _attend_split_packed(
+    qkv_ptr, k_cache_ptr, v_cache_ptr, page_table_ptr, seq_lens_ptr, inv_freq_ptr,
+    k_scale_ptr, part_acc_ptr, part_ml_ptr, page_table_stride, chunk,
+    G: tl.constexpr, HKV: tl.constexpr, D: tl.constexpr, PAGE: tl.constexpr, WINDOW: tl.constexpr,
+    HAS_ROPE: tl.constexpr, QKV_STRIDE: tl.constexpr, QK_LOG2_SCALE: tl.constexpr,
+    EPS: tl.constexpr, BLOCK_N: tl.constexpr,
+):
+    """`_attend_split_packed` attends one decode token's KV-head pair over one chunk of its keys.
+
+    It packs both heads' G query rows block-diagonally into one [2G, 2D] query, so each key tile is
+    one [BLOCK_N, 2D] load of 128-byte cache rows and one dot. It writes the same partials as
+    `_attend_split` with L = 1.
+    """
+    split, b, hg = tl.program_id(0), tl.program_id(1), tl.program_id(2)
+    seq = tl.load(seq_lens_ptr + b)
+    begin = tl.maximum(seq - WINDOW + 1, 0) if WINDOW > 0 else seq * 0
+    start = begin + split * chunk
+    stop_excl = tl.minimum(start + chunk, seq + 1)
+
+    r = tl.arange(0, 2 * G)
+    local_head = r // G
+    c = tl.arange(0, 2 * D)
+    col_dim = c % D
+    is_own_head = (c // D)[None, :] == local_head[:, None]
+    q_ptrs = qkv_ptr + b * QKV_STRIDE + ((2 * hg + local_head) * G + r % G)[:, None] * D
+    q = tl.load(q_ptrs + col_dim[None, :], mask=is_own_head, other=0.0).to(tl.float32)
+    inv_rms = tl.rsqrt(tl.sum(q * q, 1) / D + EPS)[:, None]
+    q = q * inv_rms
+    if HAS_ROPE:
+        q_partner = tl.load(q_ptrs + (col_dim ^ 1)[None, :], mask=is_own_head, other=0.0)
+        angle = seq.to(tl.float32) * tl.load(inv_freq_ptr + col_dim // 2)[None, :]
+        sign = tl.where(col_dim % 2 == 0, -1.0, 1.0)[None, :]
+        q = q * tl.cos(angle) + sign * q_partner.to(tl.float32) * inv_rms * tl.sin(angle)
+    q8 = q.to(tl.float8e4nv)
+    s_scale = QK_LOG2_SCALE * tl.load(k_scale_ptr)
+
+    m, l_sum = tl.full([2 * G], float("-inf"), tl.float32), tl.zeros([2 * G], tl.float32)
+    acc = tl.zeros([2 * G, 2 * D], tl.float32)
+    for tile_start in range(start, stop_excl, BLOCK_N):
+        t = tile_start + tl.arange(0, BLOCK_N)
+        is_valid = t < stop_excl
+        page = tl.load(page_table_ptr + b * page_table_stride + t // PAGE, mask=is_valid, other=0)
+        kv_ptrs = (page.to(tl.int64) * PAGE + t % PAGE)[:, None] * (HKV * D) + 2 * hg * D + c[None, :]
+        k = tl.load(k_cache_ptr + kv_ptrs, mask=is_valid[:, None], other=0.0)
+        s = tl.where(is_valid[None, :], tl.dot(q8, tl.trans(k)) * s_scale, float("-inf"))
+        m_new = tl.maximum(m, tl.max(s, 1))
+        m_safe = tl.where(m_new == float("-inf"), 0.0, m_new)
+        alpha, p = tl.exp2(m - m_safe), tl.exp2(s - m_safe[:, None])
+        l_sum = l_sum * alpha + tl.sum(p, 1)
+        v = tl.load(v_cache_ptr + kv_ptrs, mask=is_valid[:, None], other=0.0)
+        acc = acc * alpha[:, None] + tl.dot(p.to(tl.bfloat16), v.to(tl.bfloat16))
+        m = m_new
+
+    own = tl.sum(tl.where(is_own_head, acc, 0.0).reshape(2 * G, 2, D), 1)
+    row = ((split * tl.num_programs(1) + b) * HKV + 2 * hg) * G + r
+    tl.store(part_acc_ptr + row[:, None] * D + tl.arange(0, D)[None, :], own)
+    tl.store(part_ml_ptr + row * 2, m)
+    tl.store(part_ml_ptr + row * 2 + 1, l_sum)
+
+
+@triton.jit
 def _combine_splits(
     qkv_ptr, part_acc_ptr, part_ml_ptr, out_ptr, split_count, rows_per_split,
     L: tl.constexpr, G: tl.constexpr, HKV: tl.constexpr, D: tl.constexpr, HQ: tl.constexpr,
@@ -255,23 +319,34 @@ def kernel_fn(data: dict) -> torch.Tensor:
     )
     group_count: int = hkv // HEADS_PER_PROGRAM
     G: int = hq // hkv
+    is_packed: bool = L * G < MIN_DOT_ROWS
+    layer: str = "sliding" if window > 0 else "full"
+    block_n: int = PACKED_BLOCK_N_PER_LAYER[layer] if is_packed else BLOCK_N
+    programs_per_sm: int = PACKED_PROGRAMS_PER_SM_PER_LAYER[layer] if is_packed else PROGRAMS_PER_SM
     page_table: torch.Tensor = data["page_table"]
     span_tokens: int = window + L - 1 if window > 0 else page_table.shape[1] * page
     sm_count: int = torch.cuda.get_device_properties(qkv.device).multi_processor_count
-    split_count: int = max(1, min(triton.cdiv(sm_count * PROGRAMS_PER_SM, B * group_count),
-                                  triton.cdiv(span_tokens, BLOCK_N)))
-    chunk: int = triton.cdiv(triton.cdiv(span_tokens, split_count), BLOCK_N) * BLOCK_N
+    split_count: int = max(1, min(triton.cdiv(sm_count * programs_per_sm, B * group_count),
+                                  triton.cdiv(span_tokens, block_n)))
+    chunk: int = triton.cdiv(triton.cdiv(span_tokens, split_count), block_n) * block_n
     rows_per_split: int = B * hkv * L * G
     part_acc: torch.Tensor = torch.empty((split_count, rows_per_split, D), device=qkv.device)
     part_ml: torch.Tensor = torch.empty((split_count, rows_per_split, 2), device=qkv.device)
-    _attend_split[(split_count, B, group_count)](
-        qkv, data["k_cache"], data["v_cache"], page_table, data["seq_lens"], inv_freq,
-        data["k_scale"], part_acc, part_ml, page_table.stride(0), chunk,
-        L=L, G=G, HKV=hkv, D=D, RH=max(MIN_DOT_ROWS, L * G), PAGE=page,
-        WINDOW=window, HAS_ROPE=theta > 0, QKV_STRIDE=qkv_stride,
-        QK_LOG2_SCALE=cfg["qk_scale_factor"] * cfg["sm_scale"] * LOG2_E, EPS=RMS_EPS,
-        BLOCK_N=BLOCK_N, num_warps=ATTEND_WARPS, num_stages=ATTEND_STAGES,
-    )
+    common_args: tuple = (qkv, data["k_cache"], data["v_cache"], page_table, data["seq_lens"], inv_freq,
+                          data["k_scale"], part_acc, part_ml, page_table.stride(0), chunk)
+    qk_log2_scale: float = cfg["qk_scale_factor"] * cfg["sm_scale"] * LOG2_E
+    if is_packed:
+        _attend_split_packed[(split_count, B, group_count)](
+            *common_args, G=G, HKV=hkv, D=D, PAGE=page, WINDOW=window, HAS_ROPE=theta > 0,
+            QKV_STRIDE=qkv_stride, QK_LOG2_SCALE=qk_log2_scale, EPS=RMS_EPS, BLOCK_N=block_n,
+            num_warps=ATTEND_WARPS, num_stages=ATTEND_STAGES,
+        )
+    else:
+        _attend_split[(split_count, B, group_count)](
+            *common_args, L=L, G=G, HKV=hkv, D=D, RH=L * G, PAGE=page, WINDOW=window,
+            HAS_ROPE=theta > 0, QKV_STRIDE=qkv_stride, QK_LOG2_SCALE=qk_log2_scale, EPS=RMS_EPS,
+            BLOCK_N=block_n, num_warps=ATTEND_WARPS, num_stages=ATTEND_STAGES,
+        )
     out: torch.Tensor = torch.empty((B, L, hq * D), dtype=torch.bfloat16, device=qkv.device)
     _combine_splits[(rows_per_split,)](
         qkv, part_acc, part_ml, out, split_count, rows_per_split,
