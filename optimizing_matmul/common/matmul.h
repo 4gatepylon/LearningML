@@ -11,6 +11,7 @@
  * - `matmul_naive`: The one-thread-per-element kernel, defined in `kernels/naive.cu`.
  * - `matmul_tiled_from_naive`: Shared-memory tiles, defined in `kernels/tiled_from_naive.cu`.
  * - `matmul_blocktile1d_from_tiled32`: 8 outputs per thread, in its own file under `kernels/`.
+ * - `matmul_blocktile2d_from_blocktile1d`: 8 x 8 outputs per thread, in its own file too.
  * - `check_status`: Aborts on a failed CUDA or cuBLAS call.
  * - `CHECK`: Calls `check_status` with the call's text, file and line.
  * - `copy_to_device`: Copies a host array into a new device buffer.
@@ -77,6 +78,8 @@ void matmul_tiled_from_naive(const bf16_t* A_device, const bf16_t* B_device, bf1
                              int M, int N, int K);
 void matmul_blocktile1d_from_tiled32(const bf16_t* A_device, const bf16_t* B_device,
                                      bf16_t* C_device, int M, int N, int K);
+void matmul_blocktile2d_from_blocktile1d(const bf16_t* A_device, const bf16_t* B_device,
+                                         bf16_t* C_device, int M, int N, int K);
 
 /**
  * @brief `Kernel` holds a kernel's name, its function and the sizes it supports.
@@ -106,6 +109,7 @@ inline constexpr Kernel KERNELS[] = {
     {"tiled16_from_naive", matmul_tiled_from_naive<16>, 1},
     {"tiled32_from_naive", matmul_tiled_from_naive<32>, 1},
     {"blocktile1d_from_tiled32", matmul_blocktile1d_from_tiled32, 1},
+    {"blocktile2d_from_blocktile1d", matmul_blocktile2d_from_blocktile1d, 1},
 };
 
 /**
