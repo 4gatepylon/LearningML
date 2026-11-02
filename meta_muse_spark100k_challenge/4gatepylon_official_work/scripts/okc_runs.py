@@ -33,6 +33,9 @@ Must know:
         - `okc` must be on PATH and signed in (`okc login`).
     Side effects:
         - `okc status` rewrites profiles beside the file a job was first sent from.
+
+NOTE: this script may be subject to change and is merely a prototype to try and create a 
+tandard workflow for agents. If any agent finds bugs or runs into issues, they should tell the user.
 """
 
 import hashlib

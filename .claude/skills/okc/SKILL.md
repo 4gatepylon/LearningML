@@ -68,6 +68,8 @@ uv run --script scripts/okc_runs.py list
 
 Name runs with `--label` after what changed (`tiled`, `splitk4`), so `list` reads as a history.
 
+> NOTE: this script may be subject to change and is merely a prototype to try and create a standard workflow for agents. If any agent finds bugs or runs into issues, they should tell the user.
+
 ### Submit a kernel (only when the user asks)
 
 ```bash
