@@ -370,6 +370,22 @@ C++ and CUDA docstrings use Doxygen's Javadoc style:
 A C++ function that returns a value adds `@return <meaning>.` after its `@param` lines, and one that
 throws adds `@throws <type> <when>.`.
 
+### Failing fast
+
+Code is written for its correct inputs only, and fails at once, explicitly and obviously, on any
+input that breaks its preconditions. It doesn't guess a default, skip a bad value or carry on with
+partial data.
+
+- **Layers:** each function handles the correct inputs of its own layer of abstraction. It doesn't
+  defend against every way a caller or a lower layer might go wrong; anything else fails.
+- **Dictionaries:** Python reads a key with `d[key]`, never `d.get(key)`, so a missing key raises
+  `KeyError` where it is read. Where a key or a value may legitimately be missing, the code checks
+  for that case explicitly (`if key in d`, `if value is None`) and handles it on purpose.
+- **Fallbacks:** `x or {}`, `x or []` and broad `except` clauses don't stand in for a value that
+  should be there. A value that may be null is checked with `is None`.
+- **Errors:** a failed precondition raises an error that names the input and what was expected,
+  rather than letting a wrong value travel on and fail somewhere else.
+
 ### Why
 
 These practices aim for fewer bugs, code that reads quickly, and short code. They get there by

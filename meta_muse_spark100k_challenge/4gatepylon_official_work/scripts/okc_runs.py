@@ -17,7 +17,8 @@ Interface:
         --yes-to-spend-scored-run, --interactive: Confirm `--mode submit`.
         --dry-run, --json.
     get RUN_ID: Waits for the run's job, saves `result.json` and `summary.json`, prints the summary.
-        --no-wait, --json.
+        --no-wait: Prints an unfinished job's state and saves nothing.
+        --json.
     list: Prints one row per run (run id, problem, mode, job, sha256, status, speedup, minutes).
         --limit: Newest runs to show (default 20).
         --json.
@@ -56,6 +57,7 @@ LABEL_PATTERN: re.Pattern = re.compile(r"^[A-Za-z0-9_.-]+$")
 US_PER_NS: float = 1e-3
 S_PER_MIN: float = 60.0
 SHA256_PREFIX_LENGTH: int = 12
+LIST_SUMMARY_KEYS: tuple[str, ...] = ("status", "speedup", "queue_min", "run_min")
 
 
 def _run_okc(args: list[str], cwd: Path | None = None) -> dict:
@@ -88,49 +90,72 @@ def _run_okc(args: list[str], cwd: Path | None = None) -> dict:
         ) from error
 
 
+def _summarize_shape(record: dict) -> dict:
+    """`_summarize_shape` keeps one benchmarked shape: its times if it passed, its error if not.
+
+    Args:
+        record: One `"event": "benchmark"` record of okc's result.
+
+    Returns:
+        The shape's load, case and status, plus its times (pass) or its error (any other status).
+
+    Raises:
+        KeyError: `record` lacks a field okc sends for a benchmark with its status.
+
+    Example:
+        >>> shape = _summarize_shape(record)
+    """
+    shape: dict = {
+        "load": record["case"]["load"],
+        "case": {k: v for k, v in record["case"].items() if k not in ("seed", "load")},
+        "status": record["status"],
+    }
+    if record["status"] != "pass":
+        return {**shape, "error": record["error"]}
+    return {
+        **shape,
+        "baseline_us": record["baseline_ns"] * US_PER_NS,
+        "yours_us": record["median_ns"] * US_PER_NS,
+        "floor_us": record["speed_of_light_ns"] * US_PER_NS,
+        "speedup": record["speedup"],
+    }
+
+
 def _summarize_result(run: dict, job: dict) -> dict:
     """`_summarize_result` keeps the few KB of a judged job that a reader needs.
 
     Args:
         run: The run's `run.json`.
-        job: okc's status JSON for the job that holds the result.
+        job: okc's status JSON for a finished job that holds a result.
 
     Returns:
-        Status, speedup, timings, test counts and one row per timed shape.
+        Status, speedup, timings, test counts and one row per benchmarked shape.
+
+    Raises:
+        KeyError: `job` lacks a field okc sends for a finished job.
 
     Example:
         >>> summary = _summarize_result(run, job)
     """
-    result: dict = job.get("result") or {}
-    records: list[dict] = result.get("records") or []
+    result: dict = job["result"]
+    records: list[dict] = result["records"]
     tests: list[dict] = [record for record in records if record["event"] == "test"]
     failures: list[dict] = [test for test in tests if test["status"] != "pass"]
     shapes: list[dict] = [
-        {
-            "load": record["case"].get("load"),
-            "case": {k: v for k, v in record["case"].items() if k not in ("seed", "load")},
-            "baseline_us": record["baseline_ns"] * US_PER_NS,
-            "yours_us": record["median_ns"] * US_PER_NS,
-            "floor_us": record["speed_of_light_ns"] * US_PER_NS,
-            "speedup": record["speedup"],
-        }
-        for record in records
-        if record["event"] == "benchmark"
+        _summarize_shape(record) for record in records if record["event"] == "benchmark"
     ]
-    started_at: float | None = job.get("started_at")
-    finished_at: float | None = job.get("finished_at")
     return {
         **{key: run[key] for key in ("run_id", "problem", "mode", "job_id")},
-        "result_job_id": job.get("id"),
-        "status": job.get("status"),
-        "passed": result.get("passed"),
-        "speedup": result.get("speedup"),
-        "speedup_ci": result.get("speedup_ci"),
-        "score_us": result.get("score_us"),
-        "baseline_us": result.get("baseline_us"),
-        "error": result.get("error"),
-        "queue_min": started_at and (started_at - job["created_at"]) / S_PER_MIN,
-        "run_min": finished_at and started_at and (finished_at - started_at) / S_PER_MIN,
+        "result_job_id": job["id"],
+        "status": job["status"],
+        "passed": result["passed"],
+        "speedup": result["speedup"],
+        "speedup_ci": result["speedup_ci"],
+        "score_us": result["score_us"],
+        "baseline_us": result["baseline_us"] if result["passed"] else None,
+        "error": result["error"],
+        "queue_min": (job["started_at"] - job["created_at"]) / S_PER_MIN,
+        "run_min": (job["finished_at"] - job["started_at"]) / S_PER_MIN,
         "tests_passed": len(tests) - len(failures),
         "tests_total": len(tests),
         "first_failure": failures[0] if failures else None,
@@ -269,16 +294,23 @@ def get(run_id: str, no_wait: bool, should_print_json: bool) -> None:
     run: dict = json.loads((run_dir / "run.json").read_text())
     wait_args: list[str] = [] if no_wait else ["--wait"]
     job: dict = _run_okc(["status", run["job_id"], *wait_args, "--json"], cwd=run_dir)
-    if job.get("status") == "duplicate":
+    if job["status"] == "duplicate":
         job = _run_okc(["status", job["duplicate_of"], *wait_args, "--json"], cwd=run_dir)
-    if job.get("status") in FINAL_STATUSES:
-        (run_dir / "result.json").write_text(json.dumps(job, indent=2))
-        profile_reports: list[str] = [
-            f"profile {record['index']}: {record['case']}\n{record['report']}"
-            for record in (job.get("result") or {}).get("records") or []
-            if record["event"] == "profile"
-        ]
-        (run_dir / "profile.txt").write_text("\n\n".join(profile_reports))
+    if job["status"] not in FINAL_STATUSES:
+        state: dict = {"run_id": run_id, "job_id": job["id"], "status": job["status"]}
+        click.echo(json.dumps(state) if should_print_json else f"{run_id}: {job['status']}")
+        return
+    (run_dir / "result.json").write_text(json.dumps(job, indent=2))
+    if job["result"] is None:
+        raise click.ClickException(
+            f"Job {job['id']} is {job['status']} with no result; see {run_dir / 'result.json'}."
+        )
+    profile_reports: list[str] = [
+        f"profile {record['index']}: {record['case']}\n{record['report']}"
+        for record in job["result"]["records"]
+        if record["event"] == "profile"
+    ]
+    (run_dir / "profile.txt").write_text("\n\n".join(profile_reports))
     summary: dict = _summarize_result(run, job)
     (run_dir / "summary.json").write_text(json.dumps(summary, indent=2))
     if should_print_json:
@@ -288,17 +320,21 @@ def get(run_id: str, no_wait: bool, should_print_json: bool) -> None:
         key: round(value, 3) if isinstance(value, float) else value
         for key, value in summary.items()
     }
+    speedup_ci: list[float] | None = summary["speedup_ci"]
     click.echo(
-        f"{run_id}: {summary['status']}, passed {summary['passed']}, "
-        f"speedup {rounded['speedup']}, 95% {[round(x, 3) for x in summary['speedup_ci'] or []]}, "
+        f"{run_id}: {summary['status']}, passed {summary['passed']}, speedup {rounded['speedup']}, "
+        f"95% {None if speedup_ci is None else [round(x, 3) for x in speedup_ci]}, "
         f"tests {summary['tests_passed']}/{summary['tests_total']}, "
         f"queue {rounded['queue_min']} min, run {rounded['run_min']} min"
     )
     for shape in summary["shapes"]:
-        click.echo(
-            f"  {shape['load']:<12} {shape['baseline_us']:9.1f} us -> "
-            f"{shape['yours_us']:9.1f} us  {shape['speedup']:.3f}x  {shape['case']}"
+        timing: str = (
+            f"{shape['baseline_us']:9.1f} us -> {shape['yours_us']:9.1f} us  "
+            f"{shape['speedup']:.3f}x"
+            if shape["status"] == "pass"
+            else f"{shape['status']}: {shape['error']}"
         )
+        click.echo(f"  {shape['load']:<12} {timing}  {shape['case']}")
     if summary["first_failure"]:
         click.echo(f"first failure: {summary['first_failure']}")
 
@@ -312,12 +348,16 @@ def list_runs(limit: int, should_print_json: bool) -> None:
     for run_path in sorted(ARTIFACTS_DIR.glob("*/run.json")):
         run: dict = json.loads(run_path.read_text())
         summary_path: Path = run_path.parent / "summary.json"
-        summary: dict = json.loads(summary_path.read_text()) if summary_path.exists() else {}
+        summary: dict = (
+            json.loads(summary_path.read_text())
+            if summary_path.exists()
+            else dict.fromkeys(LIST_SUMMARY_KEYS)
+        )
         rows.append(
             {
                 **{key: run[key] for key in ("run_id", "problem", "mode", "job_id")},
                 "sha256": run["sha256"][:SHA256_PREFIX_LENGTH],
-                **{key: summary.get(key) for key in ("status", "speedup", "queue_min", "run_min")},
+                **{key: summary[key] for key in LIST_SUMMARY_KEYS},
             }
         )
     shown_rows: list[dict] = rows[-limit:]
