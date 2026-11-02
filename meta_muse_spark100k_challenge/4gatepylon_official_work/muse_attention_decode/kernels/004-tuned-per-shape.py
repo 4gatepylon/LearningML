@@ -1,7 +1,9 @@
 # okc: problem=muse_attention_decode
-"""`003-packed-decode.py` attends decode tokens with one block-diagonal dot per 128-byte key tile.
+"""`004-tuned-per-shape.py` is kernel 003 with its tile size, warps, stages and splits picked per case.
 
-Kernel 003's parent is 002. It computes, for each request b and block token j:
+Kernel 004's parent is 003. `ATTEND_TUNING_PER_CASE` holds the best settings an H200 sweep found
+for each (layer, verify or decode, batched or single request) case. It computes, for each request
+b and block token j:
     q, k = rmsnorm(q) * qk_scale_factor, rmsnorm(k), with RoPE on sliding layers
     cache[cache_loc] = fp8(k), fp8(v)
     out = rmsnorm(softmax(q k^T / 8) v) * sigmoid(gate)
@@ -10,7 +12,7 @@ Interface:
     kernel_fn(data): Returns bfloat16 [B, L, Hq * 64] and writes the block's keys and values.
 
 Example:
-    $ okc check kernels/003-packed-decode.py
+    $ okc check kernels/004-tuned-per-shape.py
 
 Must know:
     Performance:
@@ -27,13 +29,18 @@ import triton.language as tl
 
 HEADS_PER_PROGRAM: int = 2
 MIN_DOT_ROWS: int = 16
-BLOCK_N: int = 64
 SPLIT_BLOCK: int = 64
-PROGRAMS_PER_SM: int = 4
-PACKED_BLOCK_N_PER_LAYER: dict[str, int] = {"sliding": 64, "full": 128}
-PACKED_PROGRAMS_PER_SM_PER_LAYER: dict[str, int] = {"sliding": 4, "full": 8}
-ATTEND_WARPS: int = 4
-ATTEND_STAGES: int = 3
+MIN_BATCHED_REQUESTS: int = 4
+ATTEND_TUNING_PER_CASE: dict[tuple[str, bool, bool], tuple[int, int, int, int]] = {
+    ("sliding", False, False): (64, 4, 4, 4),
+    ("sliding", False, True): (64, 4, 3, 4),
+    ("full", False, False): (128, 8, 4, 2),
+    ("full", False, True): (32, 2, 4, 8),
+    ("sliding", True, False): (32, 8, 3, 2),
+    ("sliding", True, True): (32, 8, 3, 2),
+    ("full", True, False): (64, 4, 4, 2),
+    ("full", True, True): (64, 4, 3, 4),
+}
 RMS_EPS: float = 1e-5
 LOG2_E: float = 1.4426950408889634
 
@@ -321,8 +328,8 @@ def kernel_fn(data: dict) -> torch.Tensor:
     G: int = hq // hkv
     is_packed: bool = L * G < MIN_DOT_ROWS
     layer: str = "sliding" if window > 0 else "full"
-    block_n: int = PACKED_BLOCK_N_PER_LAYER[layer] if is_packed else BLOCK_N
-    programs_per_sm: int = PACKED_PROGRAMS_PER_SM_PER_LAYER[layer] if is_packed else PROGRAMS_PER_SM
+    case: tuple[str, bool, bool] = (layer, not is_packed, B >= MIN_BATCHED_REQUESTS)
+    block_n, warp_count, stage_count, programs_per_sm = ATTEND_TUNING_PER_CASE[case]
     page_table: torch.Tensor = data["page_table"]
     span_tokens: int = window + L - 1 if window > 0 else page_table.shape[1] * page
     sm_count: int = torch.cuda.get_device_properties(qkv.device).multi_processor_count
@@ -339,13 +346,13 @@ def kernel_fn(data: dict) -> torch.Tensor:
         _attend_split_packed[(split_count, B, group_count)](
             *common_args, G=G, HKV=hkv, D=D, PAGE=page, WINDOW=window, HAS_ROPE=theta > 0,
             QKV_STRIDE=qkv_stride, QK_LOG2_SCALE=qk_log2_scale, EPS=RMS_EPS, BLOCK_N=block_n,
-            num_warps=ATTEND_WARPS, num_stages=ATTEND_STAGES,
+            num_warps=warp_count, num_stages=stage_count,
         )
     else:
         _attend_split[(split_count, B, group_count)](
             *common_args, L=L, G=G, HKV=hkv, D=D, RH=L * G, PAGE=page, WINDOW=window,
             HAS_ROPE=theta > 0, QKV_STRIDE=qkv_stride, QK_LOG2_SCALE=qk_log2_scale, EPS=RMS_EPS,
-            BLOCK_N=block_n, num_warps=ATTEND_WARPS, num_stages=ATTEND_STAGES,
+            BLOCK_N=block_n, num_warps=warp_count, num_stages=stage_count,
         )
     out: torch.Tensor = torch.empty((B, L, hq * D), dtype=torch.bfloat16, device=qkv.device)
     _combine_splits[(rows_per_split,)](
