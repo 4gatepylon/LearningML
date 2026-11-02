@@ -3,7 +3,8 @@
 Interface:
     list_kernel_names: Returns the names of the kernels that `.build/bench` can run.
     check_kernel_names: Raises a click error that lists the valid names if any name is unknown.
-    run_bench: Runs `.build/bench` and returns each kernel's milliseconds per call, per trial.
+    run_bench: Runs `.build/bench`, or another build of it, and returns each kernel's
+        milliseconds per call, per trial.
 
 Example:
     >>> samples: dict[str, list[float]] = run_bench(8192, 1, 3, 100, ("cublas",))
@@ -67,6 +68,7 @@ def run_bench(
     trial_count: int,
     batch_size: int,
     kernel_names: tuple[str, ...],
+    bench_binary_path: Path = _BENCH_BINARY_PATH,
 ) -> dict[str, list[float]]:
     """`run_bench` runs `.build/bench` and returns each kernel's milliseconds per call, per trial.
 
@@ -76,18 +78,19 @@ def run_bench(
         trial_count: Timed batches per kernel.
         batch_size: Back-to-back calls per timed batch.
         kernel_names: Kernels to run; an empty tuple runs every kernel.
+        bench_binary_path: The binary to run (default `.build/bench`).
 
     Returns:
         A map from kernel name to its milliseconds per call according to CUDA events, one per trial.
 
     Raises:
-        subprocess.CalledProcessError: `.build/bench` failed; its error message went to stderr.
+        subprocess.CalledProcessError: The binary failed; its error message went to stderr.
 
     Example:
         >>> samples: dict[str, list[float]] = run_bench(8192, 1, 3, 100, ("cublas",))
     """
     bench_command: list[str] = [
-        str(_BENCH_BINARY_PATH),
+        str(bench_binary_path),
         str(N),
         str(warmup_iteration_count),
         str(trial_count),
