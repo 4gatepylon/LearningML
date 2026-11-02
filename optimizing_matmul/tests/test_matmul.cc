@@ -316,12 +316,24 @@ class KernelTest : public testing::TestWithParam<Kernel> {};
  * - Gotchas:
  *   - B * A, A^T * B, A * B^T and A^T * B^T all differ from A * B, so swaps and transposes fail.
  *   - Its inputs run from 1 to 8, the one exception to the 0/1 rule; its largest output is 50.
+ *   - A kernel with a larger `size_multiple` gets the product zero-padded to that size.
  */
 TEST_P(KernelTest, known_2x2) {
-  constexpr int N = 2;
-  const std::vector<float> A_host = {1, 2, 3, 4};
-  const std::vector<float> B_host = {5, 6, 7, 8};
-  const std::vector<float> C_expected_host = {19, 22, 43, 50};
+  constexpr int KNOWN_N = 2;
+  const std::vector<float> A_known_host = {1, 2, 3, 4};
+  const std::vector<float> B_known_host = {5, 6, 7, 8};
+  const std::vector<float> C_known_host = {19, 22, 43, 50};
+  const int N = round_up_to_multiple(KNOWN_N, GetParam().size_multiple);
+  std::vector<float> A_host(static_cast<size_t>(N) * N, 0.0F);
+  std::vector<float> B_host(A_host);
+  std::vector<float> C_expected_host(A_host);
+  for (int i = 0; i < KNOWN_N; ++i) {
+    for (int j = 0; j < KNOWN_N; ++j) {
+      A_host[(i * N) + j] = A_known_host[(i * KNOWN_N) + j];
+      B_host[(i * N) + j] = B_known_host[(i * KNOWN_N) + j];
+      C_expected_host[(i * N) + j] = C_known_host[(i * KNOWN_N) + j];
+    }
+  }
   EXPECT_EQ(run_kernel(GetParam().matmul_fn, A_host, B_host, N, N, N), C_expected_host);
 }
 
@@ -331,9 +343,11 @@ TEST_P(KernelTest, known_2x2) {
  * @par Must know
  * - Gotchas:
  *   - 200 spans several blocks and is a multiple of 8 but of no larger power of two.
+ *   - A kernel with a larger `size_multiple` runs 200 rounded up to it.
  */
 TEST_P(KernelTest, random_square) {
-  constexpr int N = 200;
+  constexpr int SQUARE_N = 200;
+  const int N = round_up_to_multiple(SQUARE_N, GetParam().size_multiple);
   expect_kernel_output_matches_reference(
       GetParam().matmul_fn, make_random_A_with_at_most_255_ones_per_row(N, N, A_SEED),
       make_random_B_with_half_ones_on_average(N, N, B_SEED), N, N, N);
@@ -351,6 +365,7 @@ TEST_P(KernelTest, random_square) {
  */
 TEST_P(KernelTest, large_sparse) {
   constexpr int N = LARGE_N;
+  ASSERT_EQ(N % GetParam().size_multiple, 0) << "8192 is not a multiple of size_multiple";
   static const std::vector<float> A_host =
       make_random_A_with_at_most_255_ones_per_row(N, N, A_SEED);
   static const std::vector<float> B_host = make_random_B_with_half_ones_on_average(N, N, B_SEED);
