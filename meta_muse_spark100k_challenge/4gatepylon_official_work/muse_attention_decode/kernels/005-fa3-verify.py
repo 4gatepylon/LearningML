@@ -1,10 +1,10 @@
 # okc: problem=muse_attention_decode
-"""`005-fa3-verify.py` attends batched verify blocks with FA3 between two fused kernels, the rest as 004.
+"""`005-fa3-verify.py` attends batched verify blocks with FA3 between two fused kernels.
 
-Kernel 005's parent is 004. For verify blocks (L > 1) of 4 or more requests, one kernel writes the new keys and values and
-the FP8 queries, FA3 (sgl_kernel, as SGLang uses it) attends, and one kernel norms and gates. It
-computes, for each request
-b and block token j:
+Kernel 005's parent is 004. For verify blocks (L > 1) of 4 or more requests, one kernel writes the
+new keys and values and the FP8 queries, FA3 (sgl_kernel, as SGLang uses it) attends, and one
+kernel norms and gates; everything else runs as in 004. It computes, for each request b and block
+token j:
     q, k = rmsnorm(q) * qk_scale_factor, rmsnorm(k), with RoPE on sliding layers
     cache[cache_loc] = fp8(k), fp8(v)
     out = rmsnorm(softmax(q k^T / 8) v) * sigmoid(gate)
