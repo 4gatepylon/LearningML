@@ -10,6 +10,7 @@ top entry is 3.339x (1,128.0 µs per decode step) as of 2026-11-02; SGLang is 3,
 | [003](003-packed-decode.py) | 002 | Decode blocks use 001's block-diagonal loop (one 128-byte-row load and one dot per tile) with 002's partials; tile size and splits per layer type (sliding 64 and 4 per SM, full 128 and 8) | 1.062x (1.046-1.079) | `20261102-201241-muse_attention_decode-003-packed-decode` |
 | [004](004-tuned-per-shape.py) | 003 | Tile size, warps, stages and splits per (layer, verify or decode, batched or not), from an H200 sweep | 1.256x (1.237-1.275) | `20261102-202500-muse_attention_decode-004-tuned-per-shape` |
 | [005](005-fa3-verify.py) | 004 | Verify blocks of 4+ requests: FA3 (sgl_kernel) between one fused new-KV-and-FP8-query kernel and one norm-and-gate kernel | 1.388x (1.368-1.414) | `20261102-203127-muse_attention_decode-005-fa3-verify` |
+| [006](006-decode-new-token-in-combine.py) | 005 | Decode: the combine kernel attends and stores the new token, so decode runs 2 kernels instead of 3 | 1.432x (1.410-1.459) | `20261102-204033-muse_attention_decode-diag-006-gather-ceiling` (this kernel's code plus a diagnostics tail that ran before the timed calls) |
 
 Local times are from `scripts/local_judge.py` on an H100 PCIe (2.0 TB/s), which hides some of
 the latency problems the judge's H200 (4.8 TB/s) shows, so a kernel's judge result decides.
