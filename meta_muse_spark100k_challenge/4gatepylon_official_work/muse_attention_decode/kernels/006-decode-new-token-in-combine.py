@@ -1,10 +1,10 @@
 # okc: problem=muse_attention_decode
-"""`005-fa3-verify.py` attends batched verify blocks with FA3 between two fused kernels.
+"""`006-decode-new-token-in-combine.py` handles decode's new token in the combine kernel.
 
-Kernel 005's parent is 004. For verify blocks (L > 1) of 4 or more requests, one kernel writes the
-new keys and values and the FP8 queries, FA3 (sgl_kernel, as SGLang uses it) attends, and one
-kernel norms and gates; everything else runs as in 004. It computes, for each request b and block
-token j:
+Kernel 006's parent is 005. For decode, the attend kernel reads cached positions only and
+`_finish_decode_row` normalizes, rotates, stores and attends the new token, so decode runs two
+kernels instead of three. Verify blocks of 4 or more requests run on FA3 between two fused
+kernels, as in 005. It computes, for each request b and block token j:
     q, k = rmsnorm(q) * qk_scale_factor, rmsnorm(k), with RoPE on sliding layers
     cache[cache_loc] = fp8(k), fp8(v)
     out = rmsnorm(softmax(q k^T / 8) v) * sigmoid(gate)
@@ -13,7 +13,7 @@ Interface:
     kernel_fn(data): Returns bfloat16 [B, L, Hq * 64] and writes the block's keys and values.
 
 Example:
-    $ okc check kernels/005-fa3-verify.py
+    $ okc check kernels/006-decode-new-token-in-combine.py
 
 Must know:
     Performance:
@@ -221,14 +221,14 @@ def _attend_split_packed(
     """`_attend_split_packed` attends one decode token's KV-head pair over one chunk of its keys.
 
     It packs both heads' G query rows block-diagonally into one [2G, 2D] query, so each key tile is
-    one [BLOCK_N, 2D] load of 128-byte cache rows and one dot. It writes the same partials as
-    `_attend_split` with L = 1.
+    one [BLOCK_N, 2D] load of 128-byte cache rows and one dot. It reads cached positions only (the
+    new token is `_finish_decode_row`'s) and writes the same partials as `_attend_split` with L = 1.
     """
     split, b, hg = tl.program_id(0), tl.program_id(1), tl.program_id(2)
     seq = tl.load(seq_lens_ptr + b)
     begin = tl.maximum(seq - WINDOW + 1, 0) if WINDOW > 0 else seq * 0
     start = begin + split * chunk
-    stop_excl = tl.minimum(start + chunk, seq + 1)
+    stop_excl = tl.minimum(start + chunk, seq)
 
     r = tl.arange(0, 2 * G)
     local_head = r // G
@@ -309,6 +309,68 @@ def _combine_splits(
     tl.store(out_ptr + token * (HQ * D) + q_head * D + d, (o * tl.sigmoid(gate)).to(tl.bfloat16))
 
 
+@triton.jit
+def _finish_decode_row(
+    qkv_ptr, seq_lens_ptr, cache_loc_ptr, inv_freq_ptr, k_scale_ptr, v_scale_ptr, k_cache_ptr, v_cache_ptr,
+    part_acc_ptr, part_ml_ptr, out_ptr, split_count, rows_per_split,
+    G: tl.constexpr, HKV: tl.constexpr, D: tl.constexpr, HQ: tl.constexpr, HAS_ROPE: tl.constexpr,
+    QKV_STRIDE: tl.constexpr, QK_LOG2_SCALE: tl.constexpr, EPS: tl.constexpr, SPLIT_BLOCK: tl.constexpr,
+):
+    """`_finish_decode_row` attends one decode query row to its new token, merges the cached splits, norms and gates.
+
+    The row's query head g = 0 also writes the new key and value of its KV head to the cache.
+    """
+    row = tl.program_id(0)
+    b = row // (HKV * G)
+    kv_head = (row // G) % HKV
+    q_head = kv_head * G + row % G
+    d = tl.arange(0, D)
+    token_ptr = qkv_ptr + b * QKV_STRIDE
+    gate = tl.load(token_ptr + (HQ + 2 * HKV) * D + q_head * D + d).to(tl.float32)
+    q = tl.load(token_ptr + q_head * D + d).to(tl.float32)
+    k = tl.load(token_ptr + (HQ + kv_head) * D + d).to(tl.float32)
+    v = tl.load(token_ptr + (HQ + HKV + kv_head) * D + d).to(tl.float32)
+    seq = tl.load(seq_lens_ptr + b)
+    k_scale, v_scale = tl.load(k_scale_ptr), tl.load(v_scale_ptr)
+    q_inv_rms = tl.rsqrt(tl.sum(q * q, 0) / D + EPS)
+    k_inv_rms = tl.rsqrt(tl.sum(k * k, 0) / D + EPS)
+    q, k = q * q_inv_rms, k * k_inv_rms
+    if HAS_ROPE:
+        angle = seq.to(tl.float32) * tl.load(inv_freq_ptr + d // 2)
+        sign = tl.where(d % 2 == 0, -1.0, 1.0)
+        q_partner = tl.load(token_ptr + q_head * D + (d ^ 1)).to(tl.float32) * q_inv_rms
+        k_partner = tl.load(token_ptr + (HQ + kv_head) * D + (d ^ 1)).to(tl.float32) * k_inv_rms
+        q = q * tl.cos(angle) + sign * q_partner * tl.sin(angle)
+        k = k * tl.cos(angle) + sign * k_partner * tl.sin(angle)
+    k8 = (k / k_scale).to(tl.float8e4nv)
+    v8 = (v / v_scale).to(tl.float8e4nv)
+    if row % G == 0:
+        cache_row = tl.load(cache_loc_ptr + b)
+        tl.store(k_cache_ptr + cache_row * (HKV * D) + kv_head * D + d, k8)
+        tl.store(v_cache_ptr + cache_row * (HKV * D) + kv_head * D + d, v8)
+    s_new = tl.sum(q.to(tl.float8e4nv).to(tl.float32) * k8.to(tl.float32), 0) * (QK_LOG2_SCALE * k_scale)
+
+    sp = tl.arange(0, SPLIT_BLOCK)
+    m_max = tl.full([SPLIT_BLOCK], float("-inf"), tl.float32)
+    for split_start in range(0, split_count, SPLIT_BLOCK):
+        part = (split_start + sp) * rows_per_split + row
+        m_max = tl.maximum(m_max, tl.load(part_ml_ptr + part * 2, mask=split_start + sp < split_count, other=float("-inf")))
+    m_all = tl.maximum(tl.max(m_max, 0), s_new)
+    p_new = tl.exp2(s_new - m_all)
+    l_total = p_new
+    acc = p_new * v8.to(tl.float32)
+    for split_start in range(0, split_count, SPLIT_BLOCK):
+        is_split = split_start + sp < split_count
+        part = (split_start + sp) * rows_per_split + row
+        weight = tl.exp2(tl.load(part_ml_ptr + part * 2, mask=is_split, other=float("-inf")) - m_all)
+        l_total += tl.sum(weight * tl.load(part_ml_ptr + part * 2 + 1, mask=is_split, other=0.0), 0)
+        part_acc = tl.load(part_acc_ptr + part[:, None] * D + d[None, :], mask=is_split[:, None], other=0.0)
+        acc += tl.sum(weight[:, None] * part_acc, 0)
+    o = acc / l_total
+    o = o * tl.rsqrt(tl.sum(o * o, 0) / D + EPS)
+    tl.store(out_ptr + b * (HQ * D) + q_head * D + d, (o * tl.sigmoid(gate)).to(tl.bfloat16))
+
+
 def _get_inv_freq(theta: float, head_dim: int, device: torch.device) -> torch.Tensor:
     """`_get_inv_freq` returns RoPE's inverse frequencies, computed as the reference does.
 
@@ -386,11 +448,12 @@ def kernel_fn(data: dict) -> torch.Tensor:
     is_packed: bool = L * G < MIN_DOT_ROWS
     uses_fa3: bool = not is_packed and B >= MIN_BATCHED_REQUESTS
     q8: torch.Tensor = torch.empty((B * L, hq, D), dtype=torch.float8_e4m3fn, device=qkv.device) if uses_fa3 else qkv
-    _write_new_kv[(B * L,)](
-        qkv, data["positions"], data["cache_loc"], inv_freq, data["k_cache"], data["v_cache"],
-        data["k_scale"], data["v_scale"], q8,
-        QKV_STRIDE=qkv_stride, HQ=hq, HKV=hkv, D=D, HAS_ROPE=theta > 0, EPS=RMS_EPS, WRITES_Q8=uses_fa3,
-    )
+    if not is_packed:
+        _write_new_kv[(B * L,)](
+            qkv, data["positions"], data["cache_loc"], inv_freq, data["k_cache"], data["v_cache"],
+            data["k_scale"], data["v_scale"], q8,
+            QKV_STRIDE=qkv_stride, HQ=hq, HKV=hkv, D=D, HAS_ROPE=theta > 0, EPS=RMS_EPS, WRITES_Q8=uses_fa3,
+        )
     if uses_fa3:
         return _attend_with_fa3(data, q8)
     group_count: int = hkv // HEADS_PER_PROGRAM
@@ -422,6 +485,14 @@ def kernel_fn(data: dict) -> torch.Tensor:
             BLOCK_N=block_n, num_warps=warp_count, num_stages=stage_count,
         )
     out: torch.Tensor = torch.empty((B, L, hq * D), dtype=torch.bfloat16, device=qkv.device)
+    if is_packed:
+        _finish_decode_row[(rows_per_split,)](
+            qkv, data["seq_lens"], data["cache_loc"], inv_freq, data["k_scale"], data["v_scale"],
+            data["k_cache"], data["v_cache"], part_acc, part_ml, out, split_count, rows_per_split,
+            G=G, HKV=hkv, D=D, HQ=hq, HAS_ROPE=theta > 0, QKV_STRIDE=qkv_stride,
+            QK_LOG2_SCALE=qk_log2_scale, EPS=RMS_EPS, SPLIT_BLOCK=SPLIT_BLOCK,
+        )
+        return out
     _combine_splits[(rows_per_split,)](
         qkv, part_acc, part_ml, out, split_count, rows_per_split,
         L=L, G=G, HKV=hkv, D=D, HQ=hq, QKV_STRIDE=qkv_stride,
