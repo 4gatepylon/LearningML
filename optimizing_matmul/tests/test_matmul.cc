@@ -5,19 +5,54 @@
  * @par Interface
  * - `matmul/KernelTest.known_2x2/<kernel>`: Checks a hand-computed 2x2 product.
  * - `matmul/KernelTest.random_square/<kernel>`: Checks random 0/1 matrices, 200 x 200.
+ * - `matmul/ShapeTest.matches_reference/<ordering>_<kernel>`: Checks one shape per ordering.
  *
  * @par Example
  * @code
  * make test
  * @endcode
  *
+ * @par Coverage
+ * A is M x K and B is K x N. One `ShapeTest` per ordering of M, N and K covers that ordering:
+ * | Ordering (13 parts) | M | N | K |
+ * | --- | --- | --- | --- |
+ * | `M_eq_N_eq_K` | 257 | 257 | 257 |
+ * | `M_gt_N_gt_K` | 384 | 96 | 7 |
+ * | `M_gt_K_gt_N` | 300 | 2 | 129 |
+ * | `N_gt_M_gt_K` | 101 | 512 | 32 |
+ * | `N_gt_K_gt_M` | 9 | 211 | 64 |
+ * | `K_gt_M_gt_N` | 48 | 5 | 513 |
+ * | `K_gt_N_gt_M` | 1 | 255 | 320 |
+ * | `M_eq_N_gt_K` | 192 | 192 | 31 |
+ * | `K_gt_M_eq_N` | 16 | 16 | 509 |
+ * | `M_eq_K_gt_N` | 127 | 100 | 127 |
+ * | `N_gt_M_eq_K` | 33 | 256 | 33 |
+ * | `N_eq_K_gt_M` | 3 | 128 | 128 |
+ * | `M_gt_N_eq_K` | 511 | 80 | 80 |
+ *
+ * The same tests cover four partitionings of each of M, N and K; a cell is a covering size.
+ * | Partitioning | Part | M | N | K |
+ * | --- | --- | --- | --- | --- |
+ * | Parity | Even | 384 | 96 | 32 |
+ * | | Odd | 257 | 257 | 7 |
+ * | Powers of two | A power of two | 16 | 512 | 32 |
+ * | | One off a power of two, not one itself | 257 | 255 | 7 |
+ * | | Neither | 384 | 96 | 320 |
+ * | H100 cache alignment | Multiple of 64: rows of whole 128-byte lines | 384 | 512 | 64 |
+ * | | Multiple of 16, not 64: rows of whole 32-byte sectors | 48 | 96 | 32 |
+ * | | Neither | 257 | 257 | 7 |
+ * | Primality | Prime | 257 | 257 | 7 |
+ * | | Not prime | 384 | 96 | 32 |
+ *
  * @par Must know
  * - Limitations:
  *   - Inputs are 0 or 1 outside `known_2x2`, so the tests check data movement, not rounding.
+ *   - The coverage holds for `size_multiple` 1; larger multiples round sizes up and merge parts.
  * - Gotchas:
  *   - Every output is an integer of at most 255, so bf16 holds it and the check is exact.
  *   - The cap is 255, not 256: bf16(257) is 256, so 256 would hide one extra product.
  *   - Every row of A has at most 255 ones, so every output is at most 255, whatever M, N and K.
+ *   - The cache-alignment sizes are for the H100 (128-byte lines, 32-byte sectors) only.
  */
 #include <gtest/gtest.h>
 
@@ -28,6 +63,7 @@
 #include <set>
 #include <sstream>
 #include <string>
+#include <tuple>
 #include <vector>
 
 #include "common/matmul.h"
@@ -41,6 +77,28 @@ constexpr uint32_t A_SEED = 1;
 constexpr uint32_t B_SEED = 2;
 constexpr size_t REPORTED_MISMATCH_COUNT = 5;
 constexpr size_t REPORTED_DIFFERENCE_COUNT = 8;
+
+/**
+ * @brief `Shape` names one ordering of M, N and K and the sizes that cover it.
+ *
+ * @par Must know
+ * - Gotchas:
+ *   - The file docstring's Coverage tables list what each shape's sizes cover.
+ */
+struct Shape {
+  const char* name;
+  int M;
+  int N;
+  int K;
+};
+
+constexpr Shape SHAPES[] = {
+    {"M_eq_N_eq_K", 257, 257, 257}, {"M_gt_N_gt_K", 384, 96, 7},   {"M_gt_K_gt_N", 300, 2, 129},
+    {"N_gt_M_gt_K", 101, 512, 32},  {"N_gt_K_gt_M", 9, 211, 64},   {"K_gt_M_gt_N", 48, 5, 513},
+    {"K_gt_N_gt_M", 1, 255, 320},   {"M_eq_N_gt_K", 192, 192, 31}, {"K_gt_M_eq_N", 16, 16, 509},
+    {"M_eq_K_gt_N", 127, 100, 127}, {"N_gt_M_eq_K", 33, 256, 33},  {"N_eq_K_gt_M", 3, 128, 128},
+    {"M_gt_N_eq_K", 511, 80, 80},
+};
 
 /**
  * @brief `run_kernel` runs one kernel on host matrices and returns C = A * B as floats.
@@ -193,6 +251,25 @@ void expect_kernel_output_matches_reference(matmul_fn_t matmul_fn, const std::ve
                                 << " outputs differ:" << report.str();
 }
 
+/**
+ * @brief `round_up_to_multiple` rounds a size up to the nearest multiple of `multiple`.
+ *
+ * @param[in] size Size to round.
+ * @param[in] multiple Positive multiple to round to.
+ * @return The smallest multiple of `multiple` that is at least `size`.
+ */
+int round_up_to_multiple(int size, int multiple) {
+  return (size + multiple - 1) / multiple * multiple;
+}
+
+/**
+ * @brief `PrintTo` prints a shape as its name in gtest's messages.
+ *
+ * @param[in] shape Shape to print.
+ * @param[out] stream Stream to print to.
+ */
+void PrintTo(const Shape& shape, std::ostream* stream) { *stream << shape.name; }
+
 }  // namespace
 
 /**
@@ -245,4 +322,37 @@ TEST_P(KernelTest, random_square) {
 INSTANTIATE_TEST_SUITE_P(matmul, KernelTest, testing::ValuesIn(KERNELS),
                          [](const testing::TestParamInfo<Kernel>& info) {
                            return std::string(info.param.name);
+                         });
+
+/**
+ * @brief `ShapeTest` runs each test once per kernel in `KERNELS` and shape in `SHAPES`.
+ */
+class ShapeTest : public testing::TestWithParam<std::tuple<Kernel, Shape>> {};
+
+/**
+ * @brief `ShapeTest.matches_reference` checks random 0/1 matrices of one shape against the
+ * reference.
+ *
+ * @par Must know
+ * - Gotchas:
+ *   - Each size is rounded up to the kernel's `size_multiple`, so every kernel runs every shape.
+ */
+TEST_P(ShapeTest, matches_reference) {
+  const auto& [kernel, shape] = GetParam();
+  const unsigned size_multiple = static_cast<unsigned>(kernel.size_multiple);
+  ASSERT_TRUE(size_multiple > 0 && (size_multiple & (size_multiple - 1)) == 0)
+      << kernel.name << "'s size_multiple " << size_multiple << " is not a power of two";
+  const int M = round_up_to_multiple(shape.M, kernel.size_multiple);
+  const int N = round_up_to_multiple(shape.N, kernel.size_multiple);
+  const int K = round_up_to_multiple(shape.K, kernel.size_multiple);
+  expect_kernel_output_matches_reference(
+      kernel.matmul_fn, make_random_A_with_at_most_255_ones_per_row(M, K, A_SEED),
+      make_random_B_with_half_ones_on_average(K, N, B_SEED), M, N, K);
+}
+
+INSTANTIATE_TEST_SUITE_P(matmul, ShapeTest,
+                         testing::Combine(testing::ValuesIn(KERNELS), testing::ValuesIn(SHAPES)),
+                         [](const testing::TestParamInfo<std::tuple<Kernel, Shape>>& info) {
+                           return std::string(std::get<1>(info.param).name) + "_" +
+                                  std::get<0>(info.param).name;
                          });
