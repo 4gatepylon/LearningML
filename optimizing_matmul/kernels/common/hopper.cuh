@@ -12,6 +12,9 @@
  * - `hopper::init_barrier`, `hopper::arrive_barrier`, `hopper::expect_barrier_bytes`,
  *   `hopper::wait_barrier`: mbarrier operations.
  * - `hopper::load_tile_async`: A 2D TMA copy that completes on an mbarrier.
+ * - `hopper::load_tile_multicast_async`: The same copy, landing in several blocks of a cluster.
+ * - `hopper::get_cluster_rank`, `hopper::arrive_cluster_barrier`, `hopper::sync_cluster`: Thread
+ *   block cluster operations.
  * - `hopper::wgmma_64x128x16`: One wgmma, A K-major and B N-major, both from shared memory.
  * - `hopper::fence_wgmma`, `hopper::commit_wgmma_group`, `hopper::wait_wgmma_groups`: wgmma
  *   ordering.
@@ -229,6 +232,88 @@ __device__ __forceinline__ void load_tile_async(const CUtensorMap& tensor_map, u
       " [%0], [%1, {%2, %3}], [%4];\n" ::"r"(dst_address),
       "l"(&tensor_map), "r"(col), "r"(row), "r"(barrier_address)
       : "memory");
+}
+
+/**
+ * @brief `load_tile_multicast_async` starts a 2D TMA copy of one box into the same shared-memory
+ * offset of every block in `cta_mask`, completing on each block's mbarrier at the same offset.
+ *
+ * @param[in] tensor_map The source's TMA descriptor, a kernel parameter.
+ * @param[in] dst_address Shared-memory address of the box in this block, 1024-byte aligned.
+ * @param[in] barrier_address Shared-memory address of the mbarrier in this block.
+ * @param[in] col The box's first column (the inner coordinate).
+ * @param[in] row The box's first row.
+ * @param[in] cta_mask Bit r set: the box also lands in the cluster's block of rank r.
+ *
+ * @par Example
+ * @code
+ * hopper::load_tile_multicast_async(B_tensor_map, B_address, barrier_address, col, row, 0b11);
+ * @endcode
+ */
+__device__ __forceinline__ void load_tile_multicast_async(const CUtensorMap& tensor_map,
+                                                          uint32_t dst_address,
+                                                          uint32_t barrier_address, int col,
+                                                          int row, uint16_t cta_mask) {
+  asm volatile(
+      "cp.async.bulk.tensor.2d.shared::cluster.global.mbarrier::complete_tx::bytes"
+      ".multicast::cluster [%0], [%1, {%2, %3}], [%4], %5;\n" ::"r"(dst_address),
+      "l"(&tensor_map), "r"(col), "r"(row), "r"(barrier_address), "h"(cta_mask)
+      : "memory");
+}
+
+/**
+ * @brief `get_cluster_rank` returns this block's rank in its thread block cluster.
+ *
+ * @return The rank, from 0 to the cluster's size - 1.
+ *
+ * @par Example
+ * @code
+ * const int cluster_rank = hopper::get_cluster_rank();
+ * @endcode
+ */
+__device__ __forceinline__ int get_cluster_rank() {
+  uint32_t rank = 0;
+  asm volatile("mov.u32 %0, %%cluster_ctarank;\n" : "=r"(rank));
+  return static_cast<int>(rank);
+}
+
+/**
+ * @brief `arrive_cluster_barrier` arrives once on the mbarrier at the same offset in the cluster's
+ * block of rank `cta_rank`, which may be this block.
+ *
+ * @param[in] barrier_address Shared-memory address of the mbarrier in this block.
+ * @param[in] cta_rank Rank of the block whose mbarrier to arrive on.
+ *
+ * @par Example
+ * @code
+ * hopper::arrive_cluster_barrier(empty_barrier_address, peer_rank);
+ * @endcode
+ */
+__device__ __forceinline__ void arrive_cluster_barrier(uint32_t barrier_address, int cta_rank) {
+  asm volatile(
+      "{\n"
+      ".reg .b32 remote_address;\n"
+      "mapa.shared::cluster.u32 remote_address, %0, %1;\n"
+      "mbarrier.arrive.shared::cluster.b64 _, [remote_address];\n"
+      "}\n" ::"r"(barrier_address),
+      "r"(cta_rank)
+      : "memory");
+}
+
+/**
+ * @brief `sync_cluster` waits until every thread of every block in the cluster gets here.
+ *
+ * @par Example
+ * @code
+ * hopper::sync_cluster();
+ * @endcode
+ *
+ * @par Must know
+ * - Gotchas:
+ *   - Every thread of the cluster must call it, as with `__syncthreads`.
+ */
+__device__ __forceinline__ void sync_cluster() {
+  asm volatile("barrier.cluster.arrive.aligned;\nbarrier.cluster.wait.aligned;\n" ::: "memory");
 }
 
 /**
