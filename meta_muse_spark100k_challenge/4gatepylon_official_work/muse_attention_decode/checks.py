@@ -28,7 +28,9 @@ def query_precision_bound(e4m3_err: float, factor: float, floor: float, cap: flo
     """This is used to calculate attention error's bound for one generated input (case).
     
     It's vlaue is `factor` times the reference's own error with queries
-    (rounded to FP8 E4M3 (`e4m3_err`) plus `slack`, within [floor, cap])."""
+    (rounded to FP8 E4M3 (`e4m3_err`) plus `slack`, within [floor, cap]).
+
+    At commit 941491a (2026-11-02), `reference.py` calls it with factor 2.5, floor 0.03, cap 0.15 and slack 0.015."""
     return min(cap, max(floor, factor * e4m3_err + slack))
 
 
