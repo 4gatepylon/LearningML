@@ -50,8 +50,8 @@ _MIN_SAMPLE_COUNT: int = 2
 _LINEAR_SPACING: str = "linear"
 _EXPONENTIAL_SPACING: str = "exponential"
 _MAX_FIXED_COST_FRAC: float = 0.01
-_TIMING_ROW_FORMAT: str = "{:<8}{:>7}{:>8}{:>11}{:>11}{:>11}{:>11}"
-_FIT_ROW_FORMAT: str = "{:<8}{:>16}{:>12}{:>9}{:>26}"
+_TIMING_ROW_FORMAT: str = "{:<28}{:>7}{:>8}{:>11}{:>11}{:>11}{:>11}"
+_FIT_ROW_FORMAT: str = "{:<28}{:>16}{:>12}{:>9}{:>26}"
 
 
 def _compute_batch_sizes(
