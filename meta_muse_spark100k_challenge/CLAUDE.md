@@ -8,3 +8,6 @@ These rules apply to `meta_muse_spark100k_challenge/`, our work on the Open Kern
   edit it, and don't `okc submit` its kernels under our name; `okc check` keeps a run off the board.
 - `okc check` and `okc submit` spend a daily per-problem allowance, so ask the user before running
   either.
+- Use `okc` the way the `okc` skill (`.claude/skills/okc/`) says: send runs with
+  `4gatepylon_official_work/scripts/okc_runs.py`, which keeps each run's files in
+  `.artifacts/okc_runs/<run_id>/`.

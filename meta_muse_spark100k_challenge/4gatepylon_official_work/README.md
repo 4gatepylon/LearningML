@@ -30,3 +30,9 @@ into a temporary folder and compares its files with ours: it writes missing file
 ones alone, and lists the ones that differ, overwriting them only with
 `YES_TO_OVERWRITE_CHANGED_FILES=1`. On unedited starters it reports every file as matching and
 changes nothing. It needs `okc` on PATH, signed in, and `uv`.
+
+`scripts/okc_runs.py create <file>` sends a kernel to `okc check` (or, with `--mode submit` and
+`--yes-to-spend-scored-run`, to `okc submit`) from its own run folder,
+`../.artifacts/okc_runs/<run_id>/`, which keeps the file sent, `command.txt` and the job id. It
+refuses when 2 or fewer runs of that mode are left today (`--min-left`). Run it with
+`uv run --script scripts/okc_runs.py`.
