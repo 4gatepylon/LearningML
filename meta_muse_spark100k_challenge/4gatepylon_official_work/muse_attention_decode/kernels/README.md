@@ -11,6 +11,7 @@ top entry is 3.339x (1,128.0 µs per decode step) as of 2026-11-02; SGLang is 3,
 | [004](004-tuned-per-shape.py) | 003 | Tile size, warps, stages and splits per (layer, verify or decode, batched or not), from an H200 sweep | 1.256x (1.237-1.275) | `20261102-202500-muse_attention_decode-004-tuned-per-shape` |
 | [005](005-fa3-verify.py) | 004 | Verify blocks of 4+ requests: FA3 (sgl_kernel) between one fused new-KV-and-FP8-query kernel and one norm-and-gate kernel | 1.388x (1.368-1.414) | `20261102-203127-muse_attention_decode-005-fa3-verify` |
 | [006](006-decode-new-token-in-combine.py) | 005 | Decode: the combine kernel attends and stores the new token, so decode runs 2 kernels instead of 3 | 1.432x (1.410-1.459) | `20261102-204033-muse_attention_decode-diag-006-gather-ceiling` (this kernel's code plus a diagnostics tail that ran before the timed calls) |
+| [007](007-deep-pipeline-decode.py) | 006 | Batched decode on full layers: 16-token tiles, 1 warp, 6 pipeline stages, 8 programs per SM | 1.484x (1.462-1.506) | `20261102-205154-muse_attention_decode-007-deep-pipeline-decode` |
 
 Local times are from `scripts/local_judge.py` on an H100 PCIe (2.0 TB/s), which hides some of
 the latency problems the judge's H200 (4.8 TB/s) shows, so a kernel's judge result decides.
@@ -24,3 +25,5 @@ the latency problems the judge's H200 (4.8 TB/s) shows, so a kernel's judge resu
   002), since the last split's serial combine and the new-token work sit on the critical path.
 - New tokens attended in the combine kernel, plus prefetching the next key tile into registers: slower
   locally than 002 on five of six loads (0.72-1.01x).
+- Exponentials as `ex2.approx.f16x2` pairs, and P V in FP8 (P scaled by 256), in the verify loop: both slower
+  locally (verify-32 full 665 and 816 µs, against 634 µs), so exponentials aren't what limits it.
