@@ -1,8 +1,9 @@
 # okc: problem=muse_attention_decode
-"""`004-tuned-per-shape.py` is kernel 003 with its tile size, warps, stages and splits picked per case.
+"""`005-fa3-verify.py` attends batched verify blocks with FA3 between two fused kernels, the rest as 004.
 
-Kernel 004's parent is 003. `ATTEND_TUNING_PER_CASE` holds the best settings an H200 sweep found
-for each (layer, verify or decode, batched or single request) case. It computes, for each request
+Kernel 005's parent is 004. For verify blocks (L > 1) of 4 or more requests, one kernel writes the new keys and values and
+the FP8 queries, FA3 (sgl_kernel, as SGLang uses it) attends, and one kernel norms and gates. It
+computes, for each request
 b and block token j:
     q, k = rmsnorm(q) * qk_scale_factor, rmsnorm(k), with RoPE on sliding layers
     cache[cache_loc] = fp8(k), fp8(v)
@@ -12,7 +13,7 @@ Interface:
     kernel_fn(data): Returns bfloat16 [B, L, Hq * 64] and writes the block's keys and values.
 
 Example:
-    $ okc check kernels/004-tuned-per-shape.py
+    $ okc check kernels/005-fa3-verify.py
 
 Must know:
     Performance:
@@ -26,6 +27,7 @@ Must know:
 import torch
 import triton
 import triton.language as tl
+from sgl_kernel.flash_attn import flash_attn_with_kvcache
 
 HEADS_PER_PROGRAM: int = 2
 MIN_DOT_ROWS: int = 16
@@ -48,29 +50,57 @@ _inv_freq_per_theta: dict = {}
 
 
 @triton.jit
+def _rms_rope_rows(x_ptrs, d, pos, inv_freq_ptr, HAS_ROPE: tl.constexpr, D: tl.constexpr, EPS: tl.constexpr):
+    """`_rms_rope_rows` loads rows of heads, RMS-normalizes each row and applies RoPE at `pos`."""
+    x = tl.load(x_ptrs + d).to(tl.float32)
+    inv_rms = tl.rsqrt(tl.sum(x * x, 1, keep_dims=True) / D + EPS)
+    x = x * inv_rms
+    if HAS_ROPE:
+        x_partner = tl.load(x_ptrs + (d ^ 1)).to(tl.float32) * inv_rms
+        angle = pos.to(tl.float32) * tl.load(inv_freq_ptr + d // 2)
+        x = x * tl.cos(angle) + tl.where(d % 2 == 0, -1.0, 1.0) * x_partner * tl.sin(angle)
+    return x
+
+
+@triton.jit
 def _write_new_kv(
     qkv_ptr, positions_ptr, cache_loc_ptr, inv_freq_ptr, k_cache_ptr, v_cache_ptr,
-    k_scale_ptr, v_scale_ptr,
-    QKV_STRIDE: tl.constexpr, Q_WIDTH: tl.constexpr, HKV: tl.constexpr, D: tl.constexpr,
-    HAS_ROPE: tl.constexpr, EPS: tl.constexpr,
+    k_scale_ptr, v_scale_ptr, q8_ptr,
+    QKV_STRIDE: tl.constexpr, HQ: tl.constexpr, HKV: tl.constexpr, D: tl.constexpr,
+    HAS_ROPE: tl.constexpr, EPS: tl.constexpr, WRITES_Q8: tl.constexpr,
 ):
-    """`_write_new_kv` normalizes, rotates and stores one block token's keys and values as FP8."""
+    """`_write_new_kv` stores one block token's keys and values as FP8 and, if asked, its FP8 queries.
+
+    Keys and queries are RMS-normalized and rotated; queries are written without qk_scale_factor,
+    as FA3 takes them.
+    """
     token = tl.program_id(0)
+    pos = tl.load(positions_ptr + token)
+    d = tl.arange(0, D)[None, :]
     h = tl.arange(0, HKV)[:, None]
-    c = tl.arange(0, D)[None, :]
-    k_ptrs = qkv_ptr + token * QKV_STRIDE + Q_WIDTH + h * D
-    k = tl.load(k_ptrs + c).to(tl.float32)
-    inv_rms = tl.rsqrt(tl.sum(k * k, 1) / D + EPS)[:, None]
-    k = k * inv_rms
-    if HAS_ROPE:
-        k_partner = tl.load(k_ptrs + (c ^ 1)).to(tl.float32) * inv_rms
-        angle = tl.load(positions_ptr + token).to(tl.float32) * tl.load(inv_freq_ptr + c // 2)
-        sign = tl.where(c % 2 == 0, -1.0, 1.0)
-        k = k * tl.cos(angle) + sign * k_partner * tl.sin(angle)
-    v = tl.load(k_ptrs + HKV * D + c).to(tl.float32)
+    token_ptr = qkv_ptr + token * QKV_STRIDE
+    k = _rms_rope_rows(token_ptr + HQ * D + h * D, d, pos, inv_freq_ptr, HAS_ROPE, D, EPS)
+    v = tl.load(token_ptr + (HQ + HKV) * D + h * D + d).to(tl.float32)
     row = tl.load(cache_loc_ptr + token)
-    tl.store(k_cache_ptr + row * HKV * D + h * D + c, (k / tl.load(k_scale_ptr)).to(tl.float8e4nv))
-    tl.store(v_cache_ptr + row * HKV * D + h * D + c, (v / tl.load(v_scale_ptr)).to(tl.float8e4nv))
+    tl.store(k_cache_ptr + row * HKV * D + h * D + d, (k / tl.load(k_scale_ptr)).to(tl.float8e4nv))
+    tl.store(v_cache_ptr + row * HKV * D + h * D + d, (v / tl.load(v_scale_ptr)).to(tl.float8e4nv))
+    if WRITES_Q8:
+        hq = tl.arange(0, HQ)[:, None]
+        q = _rms_rope_rows(token_ptr + hq * D, d, pos, inv_freq_ptr, HAS_ROPE, D, EPS)
+        tl.store(q8_ptr + (token * HQ + hq) * D + d, q.to(tl.float8e4nv))
+
+
+@triton.jit
+def _norm_gate(attn_ptr, qkv_ptr, out_ptr, HQ: tl.constexpr, HKV: tl.constexpr, D: tl.constexpr,
+               QKV_STRIDE: tl.constexpr, EPS: tl.constexpr):
+    """`_norm_gate` writes rmsnorm(attention) * sigmoid(gate) for one block token's query heads."""
+    token = tl.program_id(0)
+    h = tl.arange(0, HQ)[:, None]
+    d = tl.arange(0, D)[None, :]
+    o = tl.load(attn_ptr + (token * HQ + h) * D + d).to(tl.float32)
+    o = o * tl.rsqrt(tl.sum(o * o, 1, keep_dims=True) / D + EPS)
+    gate = tl.load(qkv_ptr + token * QKV_STRIDE + (HQ + 2 * HKV) * D + h * D + d).to(tl.float32)
+    tl.store(out_ptr + (token * HQ + h) * D + d, (o * tl.sigmoid(gate)).to(tl.bfloat16))
 
 
 @triton.jit
@@ -300,6 +330,39 @@ def _get_inv_freq(theta: float, head_dim: int, device: torch.device) -> torch.Te
     return _inv_freq_per_theta[key]
 
 
+def _attend_with_fa3(data: dict, q8: torch.Tensor) -> torch.Tensor:
+    """`_attend_with_fa3` attends a verify block with FA3 on the FP8 queries, then norms and gates.
+
+    Args:
+        data: The judge's inputs, with the block's keys and values already in the cache.
+        q8: float8_e4m3fn [B * L, Hq, 64], the normalized, rotated queries.
+
+    Returns:
+        bfloat16 [B, L, Hq * 64].
+
+    Example:
+        >>> out = _attend_with_fa3(data, q8)
+    """
+    cfg: dict = data["config"]
+    B, L, hq, hkv = cfg["batch"], cfg["q_len"], cfg["num_q_heads"], cfg["num_kv_heads"]
+    D, window = cfg["head_dim"], cfg["window"]
+    descales: dict = {}
+    if cfg["kv_scale"] != 1.0:
+        descales = {"k_descale": data["k_scale"].reshape(1, 1).expand(B, hkv),
+                    "v_descale": data["v_scale"].reshape(1, 1).expand(B, hkv)}
+    attn: torch.Tensor = flash_attn_with_kvcache(
+        q=q8, k_cache=data["k_cache"], v_cache=data["v_cache"], page_table=data["page_table"],
+        cache_seqlens=data["cache_seqlens"], cu_seqlens_q=data["cu_seqlens_q"], max_seqlen_q=L,
+        softmax_scale=cfg["sm_scale"] * cfg["qk_scale_factor"], causal=True,
+        window_size=(window - 1, 0) if window else (-1, -1),
+        scheduler_metadata=data["scheduler_metadata"], **descales,
+    )
+    attn = attn[0] if isinstance(attn, tuple) else attn
+    out: torch.Tensor = torch.empty((B, L, hq * D), dtype=torch.bfloat16, device=q8.device)
+    _norm_gate[(B * L,)](attn, data["qkv"], out, HQ=hq, HKV=hkv, D=D, QKV_STRIDE=data["qkv"].shape[-1], EPS=RMS_EPS)
+    return out
+
+
 def kernel_fn(data: dict) -> torch.Tensor:
     """`kernel_fn` writes the block's keys and values to the cache and returns the gated attention.
 
@@ -319,14 +382,18 @@ def kernel_fn(data: dict) -> torch.Tensor:
     qkv: torch.Tensor = data["qkv"]
     qkv_stride: int = qkv.shape[-1]
     inv_freq: torch.Tensor = _get_inv_freq(theta, D, qkv.device)
-    _write_new_kv[(B * L,)](
-        qkv, data["positions"], data["cache_loc"], inv_freq, data["k_cache"], data["v_cache"],
-        data["k_scale"], data["v_scale"],
-        QKV_STRIDE=qkv_stride, Q_WIDTH=hq * D, HKV=hkv, D=D, HAS_ROPE=theta > 0, EPS=RMS_EPS,
-    )
-    group_count: int = hkv // HEADS_PER_PROGRAM
     G: int = hq // hkv
     is_packed: bool = L * G < MIN_DOT_ROWS
+    uses_fa3: bool = not is_packed and B >= MIN_BATCHED_REQUESTS
+    q8: torch.Tensor = torch.empty((B * L, hq, D), dtype=torch.float8_e4m3fn, device=qkv.device) if uses_fa3 else qkv
+    _write_new_kv[(B * L,)](
+        qkv, data["positions"], data["cache_loc"], inv_freq, data["k_cache"], data["v_cache"],
+        data["k_scale"], data["v_scale"], q8,
+        QKV_STRIDE=qkv_stride, HQ=hq, HKV=hkv, D=D, HAS_ROPE=theta > 0, EPS=RMS_EPS, WRITES_Q8=uses_fa3,
+    )
+    if uses_fa3:
+        return _attend_with_fa3(data, q8)
+    group_count: int = hkv // HEADS_PER_PROGRAM
     layer: str = "sliding" if window > 0 else "full"
     case: tuple[str, bool, bool] = (layer, not is_packed, B >= MIN_BATCHED_REQUESTS)
     block_n, warp_count, stage_count, programs_per_sm = ATTEND_TUNING_PER_CASE[case]
