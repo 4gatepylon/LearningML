@@ -15,6 +15,9 @@
  * - `hopper::load_tile_multicast_async`: The same copy, landing in several blocks of a cluster.
  * - `hopper::get_cluster_rank`, `hopper::arrive_cluster_barrier`, `hopper::sync_cluster`: Thread
  *   block cluster operations.
+ * - `hopper::store_tile_async`, `hopper::commit_bulk_stores`, `hopper::wait_bulk_stores_read`,
+ *   `hopper::wait_bulk_stores`, `hopper::fence_async_shared`: TMA stores from shared memory.
+ * - `hopper::sync_warpgroup`: A named barrier for the 128 threads of one warpgroup.
  * - `hopper::wgmma_64x128x16`: One wgmma, A K-major and B N-major, both from shared memory.
  * - `hopper::wgmma_64x256x16`: The same, 256 columns wide.
  * - `hopper::fence_wgmma`, `hopper::commit_wgmma_group`, `hopper::wait_wgmma_groups`: wgmma
@@ -315,6 +318,102 @@ __device__ __forceinline__ void arrive_cluster_barrier(uint32_t barrier_address,
  */
 __device__ __forceinline__ void sync_cluster() {
   asm volatile("barrier.cluster.arrive.aligned;\nbarrier.cluster.wait.aligned;\n" ::: "memory");
+}
+
+/**
+ * @brief `store_tile_async` starts a 2D TMA store of one box from shared memory to global memory.
+ *
+ * @param[in] tensor_map The destination's TMA descriptor, a kernel parameter.
+ * @param[in] src_address Shared-memory address of the box, 1024-byte aligned.
+ * @param[in] col The box's first column (the inner coordinate).
+ * @param[in] row The box's first row.
+ *
+ * @par Example
+ * @code
+ * hopper::store_tile_async(C_tensor_map, staging_address, block_j, block_i);
+ * @endcode
+ *
+ * @par Must know
+ * - Gotchas:
+ *   - Box elements outside the matrix are not written. Fence shared memory before it.
+ */
+__device__ __forceinline__ void store_tile_async(const CUtensorMap& tensor_map,
+                                                 uint32_t src_address, int col, int row) {
+  asm volatile(
+      "cp.async.bulk.tensor.2d.global.shared::cta.bulk_group [%0, {%1, %2}], [%3];\n" ::"l"(
+          &tensor_map),
+      "r"(col), "r"(row), "r"(src_address)
+      : "memory");
+}
+
+/**
+ * @brief `commit_bulk_stores` groups the TMA stores started since the last commit.
+ *
+ * @par Example
+ * @code
+ * hopper::commit_bulk_stores();
+ * @endcode
+ */
+__device__ __forceinline__ void commit_bulk_stores() {
+  asm volatile("cp.async.bulk.commit_group;\n" ::: "memory");
+}
+
+/**
+ * @brief `wait_bulk_stores_read` waits until at most `PENDING_COUNT` store groups may still read
+ * their shared memory.
+ *
+ * @tparam PENDING_COUNT Groups that may still read.
+ *
+ * @par Example
+ * @code
+ * hopper::wait_bulk_stores_read<0>();
+ * @endcode
+ */
+template <int PENDING_COUNT>
+__device__ __forceinline__ void wait_bulk_stores_read() {
+  asm volatile("cp.async.bulk.wait_group.read %0;\n" ::"n"(PENDING_COUNT) : "memory");
+}
+
+/**
+ * @brief `wait_bulk_stores` waits until at most `PENDING_COUNT` store groups are unfinished.
+ *
+ * @tparam PENDING_COUNT Groups that may still run.
+ *
+ * @par Example
+ * @code
+ * hopper::wait_bulk_stores<0>();
+ * @endcode
+ */
+template <int PENDING_COUNT>
+__device__ __forceinline__ void wait_bulk_stores() {
+  asm volatile("cp.async.bulk.wait_group %0;\n" ::"n"(PENDING_COUNT) : "memory");
+}
+
+/**
+ * @brief `fence_async_shared` makes this thread's shared-memory writes visible to TMA.
+ *
+ * @par Example
+ * @code
+ * hopper::fence_async_shared();
+ * @endcode
+ */
+__device__ __forceinline__ void fence_async_shared() {
+  asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
+}
+
+/**
+ * @brief `sync_warpgroup` waits until the 128 threads of one warpgroup reach named barrier
+ * `barrier_id`.
+ *
+ * @param[in] barrier_id Named barrier, 1 to 15; barrier 0 is `__syncthreads`'s.
+ *
+ * @par Example
+ * @code
+ * hopper::sync_warpgroup(1 + consumer);
+ * @endcode
+ */
+__device__ __forceinline__ void sync_warpgroup(int barrier_id) {
+  asm volatile("bar.sync %0, %1;\n" ::"r"(barrier_id), "n"(THREADS_PER_WARPGROUP) : "memory");
 }
 
 /**
