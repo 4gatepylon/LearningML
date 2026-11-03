@@ -32,6 +32,8 @@ out = rmsnorm(a) * sigmoid(gate)
 - The cache is FP8 E4M3. Its page size is 1 in the scored cases and 64 in most tests, so read config["page_size"]. Its scales are 1 in the scored cases and 1/64 in some tests.
 - Decode loads are SGLang serving with speculative decoding off; verify loads are its default recipe, which checks each request's 8-token draft in one step.
 
+> NOTE: "load" refers to a workload (a set of shapes), not dataloading.
+
 | load | shape | weight | floor |
 |---|---|---|---|
 | decode 1 | batch 1, ctx 80000, heads tp8, layer sliding, page 1, dist soft | 46 | 0.1 µs |

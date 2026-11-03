@@ -34,8 +34,15 @@ class Inputs(TypedDict):
     cu_seqlens_q: torch.Tensor   # int32 [B+1], 0, L, 2L, ...: the block's query offsets
     scheduler_metadata: torch.Tensor | None  # int32, FA3's tile schedule (get_scheduler_metadata) on
                                              # full-attention decode steps, else None
+
+    # KV Caches
+    #  Each token's cache is on a page (i.e. pages partition the set of token indices, but there can be empty slots).
     k_cache: torch.Tensor     # float8_e4m3fn [pages, page_size, Hkv, 64], written in place
     v_cache: torch.Tensor     # float8_e4m3fn [pages, page_size, Hkv, 64], written in place
+    
+    # KV Cache read metadata
+    #  These caches are stored quantized as fp8. However, for computation fp32 is used. The map is a _linear_ map
+    #  using these scales.
     k_scale: torch.Tensor     # float32 [], key = e4m3 * k_scale
     v_scale: torch.Tensor     # float32 [], value = e4m3 * v_scale
     page_table: torch.Tensor  # int32 [B, max_pages], physical page of each logical page (-1 unused)
