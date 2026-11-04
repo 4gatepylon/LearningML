@@ -362,6 +362,11 @@ __device__ float2 normalize_and_rotate(float2 x, float2 rotation) {
  * @code
  * write_gated_output(p, tile, b, kv_head, row_count, merge_rank, merger_count);
  * @endcode
+ *
+ * @par Must know
+ * - Performance:
+ *   - The scale and the gate use `__fdividef` and `__expf`: they round far below bf16's precision,
+ *     and avoid the IEEE slow paths in code that each merging block runs once.
  */
 __device__ void write_gated_output(const Params& p, const SharedTile& tile, int b, int kv_head,
                                    int row_count, int first_row, int row_step) {
@@ -374,7 +379,7 @@ __device__ void write_gated_output(const Params& p, const SharedTile& tile, int 
        warp_row += warp_count() * rows_per_warp) {
     const int row =
         first_row + min(warp_row + lane / kLanesPerOutputRow, my_row_count - 1) * row_step;
-    const float scale = tile.v_scale / tile.row_sum[row];
+    const float scale = __fdividef(tile.v_scale, tile.row_sum[row]);
     float o[kDimsPerOutputLane];
     float square_sum = 0.0f;
     for (int i = 0; i < kDimsPerOutputLane; ++i) {
@@ -389,8 +394,9 @@ __device__ void write_gated_output(const Params& p, const SharedTile& tile, int 
     __nv_bfloat162* outs = reinterpret_cast<__nv_bfloat162*>(&out_bits);
     for (int i = 0; i < kDimsPerOutputLane / 2; ++i) {
       const float2 g = __bfloat1622float2(gates[i]);
-      outs[i] = __float22bfloat162_rn(make_float2(o[2 * i] * inv_rms / (1.0f + expf(-g.x)),
-                                                  o[2 * i + 1] * inv_rms / (1.0f + expf(-g.y))));
+      outs[i] = __float22bfloat162_rn(
+          make_float2(__fdividef(o[2 * i] * inv_rms, 1.0f + __expf(-g.x)),
+                      __fdividef(o[2 * i + 1] * inv_rms, 1.0f + __expf(-g.y))));
     }
     if (warp_row + lane / kLanesPerOutputRow < my_row_count) {
       const int token = b * p.L + row / group_size;
@@ -1308,7 +1314,7 @@ __device__ void combine_warps(SharedTile& tile, int row_count, int m_tile_count,
     float merged_sum = 0.0f;
     for (int group = 0; group < key_group_count; ++group) {
       const int warp = group * m_tile_count + m_tile;
-      const float weight = exp2f(tile.warp_max[warp][row_in_tile] - safe_max);
+      const float weight = fast_exp2(tile.warp_max[warp][row_in_tile] - safe_max);
       merged_sum += weight * tile.warp_sum[warp][row_in_tile];
       tile.warp_max[warp][row_in_tile] = weight;
     }
@@ -1424,7 +1430,7 @@ __device__ void merge_slots(const Params& p, SharedTile& tile, int64_t first_slo
       merged_max = fmaxf(merged_max, __shfl_xor_sync(kFullWarpMask, merged_max, offset));
     }
     const float safe_max = merged_max == -INFINITY ? 0.0f : merged_max;
-    const float weight = is_slot ? exp2f(slot_max - safe_max) : 0.0f;
+    const float weight = is_slot ? fast_exp2(slot_max - safe_max) : 0.0f;
     if (is_slot) {
       tile.merge.split_weight[lane][row] = weight;
     }
@@ -1569,7 +1575,7 @@ __device__ void merge_rows(const Params& p, SharedTile& tile, int64_t first_slot
     float merged_sum = 0.0f;
     for (int s = lane; s < p.split_count; s += kWarpSize) {
       const int index = s * my_row_count + local_row;
-      const float weight = exp2f(tile.merge.row_weight[index] - safe_max);
+      const float weight = fast_exp2(tile.merge.row_weight[index] - safe_max);
       tile.merge.row_weight[index] = weight;
       merged_sum += weight * tile.merge.row_split_sum[index];
     }
@@ -2255,7 +2261,7 @@ def _get_extension() -> object:
     """
     if "module" not in _extension_cache:
         _extension_cache["module"] = load_inline(
-            name="muse_fused_attention_named_fields",
+            name="muse_fused_attention_fast_epilogue",
             cpp_sources=CPP_SOURCE,
             cuda_sources=CUDA_SOURCE,
             functions=["run", "resident_blocks_per_sm"],
