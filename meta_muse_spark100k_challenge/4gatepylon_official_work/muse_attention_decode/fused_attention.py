@@ -109,6 +109,8 @@ constexpr int kDimsPerOutputLane = kHeadDim / kLanesPerOutputRow;
 constexpr float kLog2e = 1.4426950408889634f;
 constexpr float kValueShiftScale = 256.0f;
 constexpr unsigned kFullWarpMask = 0xffffffffu;
+constexpr int kOutRowPadFloats = 4;
+constexpr int kOutRowFloats = 64 + kOutRowPadFloats;
 
 /**
  * @brief `Params` carries the kernel's inputs, outputs, shapes and workspace, built once by `run`.
@@ -213,12 +215,12 @@ struct SharedTile {
     StartTile start;
     // DANGEROUS DANGEROUS DANGEROUS IF YOU CHANGE THIS THEN WGMMA WILL READ WRONGLY SWIZZLED VALUES
     alignas(kValueAtomBytes) __half v[kStepKeys][kHeadDim];
-    float out[kMaxRows][kHeadDim];
+    float out[kMaxRows][kOutRowFloats];
   };
   union {
     RingTile ring;
     MergeTile merge;
-    float spill_out[kMaxRows][kHeadDim];
+    float spill_out[kMaxRows][kOutRowFloats];
   };
   float2 rotation[kMaxTokens][kHeadDim / 2];
   __nv_bfloat16 new_k_in[kMaxTokens][kHeadDim];
@@ -1461,7 +1463,7 @@ __device__ void combine_warps(SharedTile& tile, int row_count, int m_tile_count,
       merged = make_float4(merged.x + weight * x.x, merged.y + weight * x.y,
                            merged.z + weight * x.z, merged.w + weight * x.w);
     }
-    reinterpret_cast<float4*>(&tile.out[0][0])[vector] = merged;
+    reinterpret_cast<float4*>(tile.out[vector / kVectorsPerRow])[vector % kVectorsPerRow] = merged;
   }
 }
 
@@ -1483,7 +1485,8 @@ __device__ void publish_state(const Params& p, const SharedTile& tile, int64_t s
                               int row_count) {
   float4* slot_out = reinterpret_cast<float4*>(p.partial_out_device + slot * kMaxRows * kHeadDim);
   for (int vector = threadIdx.x; vector < row_count * kVectorsPerRow; vector += thread_count()) {
-    slot_out[vector] = reinterpret_cast<const float4*>(&tile.out[0][0])[vector];
+    slot_out[vector] =
+        reinterpret_cast<const float4*>(tile.out[vector / kVectorsPerRow])[vector % kVectorsPerRow];
   }
   for (int row = threadIdx.x; row < row_count; row += thread_count()) {
     p.partial_max_device[slot * kMaxRows + row] = tile.row_max[row];
@@ -1580,7 +1583,7 @@ __device__ void merge_slots(const Params& p, SharedTile& tile, int64_t first_slo
                              merged.z + weight * x.z, merged.w + weight * x.w);
       }
     }
-    reinterpret_cast<float4*>(&tile.out[0][0])[vector] = merged;
+    reinterpret_cast<float4*>(tile.out[vector / kVectorsPerRow])[vector % kVectorsPerRow] = merged;
   }
   __syncthreads();
 }
@@ -2179,9 +2182,9 @@ __device__ void combine_block_state(SharedTile& tile, const BlockWork& work, War
         tile.warp_sum[work.warp][row] = state.sum[half];
       }
       for (int d = 0; d < kDimTiles; ++d) {
-        warp_out_row(tile, work.warp, row)[d * kMmaCols + 2 * (lane % 4)] = state.out[d][2 * half];
-        warp_out_row(tile, work.warp, row)[d * kMmaCols + 2 * (lane % 4) + 1] =
-            state.out[d][2 * half + 1];
+        *reinterpret_cast<float2*>(
+            &warp_out_row(tile, work.warp, row)[d * kMmaCols + 2 * (lane % 4)]) =
+            make_float2(state.out[d][2 * half], state.out[d][2 * half + 1]);
       }
     }
   }
@@ -2549,7 +2552,7 @@ def _get_extension() -> object:
     """
     if "module" not in _extension_cache:
         _extension_cache["module"] = load_inline(
-            name="muse_fused_attention_fence_once",
+            name="muse_fused_attention_padded_out",
             cpp_sources=CPP_SOURCE,
             cuda_sources=CUDA_SOURCE,
             functions=["run", "resident_blocks_per_sm"],
