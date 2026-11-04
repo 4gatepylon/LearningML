@@ -138,7 +138,7 @@ struct Params {
   float* partial_max_device;
   float* partial_sum_device;
   int* arrival_count_device;
-  int split_count, max_split_count, keys_per_split;
+  int split_count, max_split_count, keys_per_split, first_split_keys;
   bool is_balanced;
 };
 
@@ -1823,8 +1823,12 @@ __device__ BlockWork describe_block(const Params& p) {
   work.is_active = work.key_group < work.key_group_count;
   work.seq_len = p.seq_lens_device[work.b];
   work.window_start_incl = p.window == 0 ? 0 : max(0, work.seq_len - p.window + 1);
-  work.first_position_incl = work.window_start_incl + work.split * keys_per_split;
-  work.end_position_excl = min(work.first_position_incl + keys_per_split, work.seq_len);
+  const int first_split_keys = p.is_balanced ? keys_per_split : p.first_split_keys;
+  const int split_keys = work.split == 0 ? first_split_keys : keys_per_split;
+  const int split_offset =
+      work.split == 0 ? 0 : first_split_keys + (work.split - 1) * keys_per_split;
+  work.first_position_incl = work.window_start_incl + split_offset;
+  work.end_position_excl = min(work.first_position_incl + split_keys, work.seq_len);
   return work;
 }
 
@@ -2215,6 +2219,8 @@ KernelBuild select_kernel(int64_t row_count, int64_t window, int64_t group_count
  * verify's parallel merge counts arrivals in counter 0 and finished mergers in 1.
  * @param[in] split_count Blocks per request and KV head.
  * @param[in] keys_per_split Cached keys per split, a multiple of 64, unless balanced.
+ * @param[in] first_split_keys Cached keys of split 0, which also attends the new tokens: a
+ * multiple of 64, at most `keys_per_split`; unused when balanced.
  * @param[in] is_balanced Whether verify splits the batch's keys evenly over its `split_count x B`
  * blocks per KV head (at most 32 requests); the workspace then holds each request's most splits.
  * @throws c10::Error A tensor has the wrong dtype, shape or layout, or the page size is not a power
@@ -2223,7 +2229,7 @@ KernelBuild select_kernel(int64_t row_count, int64_t window, int64_t group_count
  * @par Example
  * @code
  * run(qkv, k_cache, v_cache, page_table, seq_lens, cache_loc, k_scale, v_scale, inv_freq, out,
- *     2048, 5.473, 0.125, partial_out, partial_max, partial_sum, arrival_count, 8, 64, false);
+ *     2048, 5.473, 0.125, partial_out, partial_max, partial_sum, arrival_count, 8, 64, 64, false);
  * @endcode
  */
 void run(torch::Tensor qkv, torch::Tensor k_cache, torch::Tensor v_cache, torch::Tensor page_table,
@@ -2231,7 +2237,7 @@ void run(torch::Tensor qkv, torch::Tensor k_cache, torch::Tensor v_cache, torch:
          torch::Tensor v_scale, torch::Tensor inv_freq, torch::Tensor out, int64_t window,
          double qk_scale_factor, double sm_scale, torch::Tensor partial_out,
          torch::Tensor partial_max, torch::Tensor partial_sum, torch::Tensor arrival_count,
-         int64_t split_count, int64_t keys_per_split, bool is_balanced) {
+         int64_t split_count, int64_t keys_per_split, int64_t first_split_keys, bool is_balanced) {
   const int64_t q_head_count = out.size(2) / kHeadDim;
   TORCH_CHECK(qkv.is_contiguous() && k_cache.is_contiguous() && v_cache.is_contiguous() &&
                   page_table.is_contiguous() && out.is_contiguous(),
@@ -2243,6 +2249,10 @@ void run(torch::Tensor qkv, torch::Tensor k_cache, torch::Tensor v_cache, torch:
   TORCH_CHECK(keys_per_split > 0 && keys_per_split % kStepKeys == 0,
               "keys_per_split must be a positive multiple of ", kStepKeys, ", got ",
               keys_per_split);
+  TORCH_CHECK(first_split_keys >= 0 && first_split_keys <= keys_per_split &&
+                  first_split_keys % kStepKeys == 0,
+              "first_split_keys must be a multiple of ", kStepKeys, " in [0, keys_per_split], got ",
+              first_split_keys);
   TORCH_CHECK(qkv.size(1) == 1 || qkv.size(1) == kMaxTokens, "L must be 1 (decode) or ", kMaxTokens,
               " (verify), got ", qkv.size(1));
   TORCH_CHECK(partial_max.size(2) <= kMaxSplits, "at most ", kMaxSplits, " splits");
@@ -2286,6 +2296,7 @@ void run(torch::Tensor qkv, torch::Tensor k_cache, torch::Tensor v_cache, torch:
   p.split_count = static_cast<int>(split_count);
   p.max_split_count = static_cast<int>(partial_max.size(2));
   p.keys_per_split = static_cast<int>(keys_per_split);
+  p.first_split_keys = static_cast<int>(first_split_keys);
   p.is_balanced = is_balanced;
   const KernelBuild build = select_kernel(p.L * (p.q_head_count / p.kv_head_count), window,
                                           qkv.size(0) * p.kv_head_count);
@@ -2335,7 +2346,7 @@ CPP_SOURCE: str = (
     "torch::Tensor k_scale, torch::Tensor v_scale, torch::Tensor inv_freq, torch::Tensor out, "
     "int64_t window, double qk_scale_factor, double sm_scale, torch::Tensor partial_out, "
     "torch::Tensor partial_max, torch::Tensor partial_sum, torch::Tensor arrival_count, "
-    "int64_t split_count, int64_t keys_per_split, bool is_balanced); "
+    "int64_t split_count, int64_t keys_per_split, int64_t first_split_keys, bool is_balanced); "
     "int64_t resident_blocks_per_sm(int64_t row_count, int64_t window, int64_t group_count);"
 )
 _HEAD_DIM: int = 64
@@ -2362,7 +2373,7 @@ def _get_extension() -> object:
     """
     if "module" not in _extension_cache:
         _extension_cache["module"] = load_inline(
-            name="muse_fused_attention_online_merge",
+            name="muse_fused_attention_short_first_split",
             cpp_sources=CPP_SOURCE,
             cuda_sources=CUDA_SOURCE,
             functions=["run", "resident_blocks_per_sm"],
@@ -2395,21 +2406,23 @@ def _get_inv_freq(theta: float, device: torch.device) -> torch.Tensor:
     return _inv_freq_cache[key]
 
 
-def _plan_splits(data: dict) -> tuple[int, int, bool]:
+def _plan_splits(data: dict) -> tuple[int, int, int, bool]:
     """`_plan_splits` picks how many blocks share each request's keys, from shapes only.
 
     Args:
         data: The inputs; only `config` and the page table's shape are read.
 
     Returns:
-        The split count and the cached keys per split (a multiple of 64), so that every key a
-        request can hold falls in a split and the grid fits in one wave of resident blocks, and
-        whether the kernel instead splits the batch's keys evenly over those blocks (verify on
-        full layers, 2 to 32 requests). In decode, short spans (at most 32 steps, such as the
-        2,048-token window) use at most 16 splits, so the merge tree needs one level.
+        The split count, the cached keys per split and of split 0 (multiples of 64), so that
+        every key a request can hold falls in a split and the grid fits in one wave of resident
+        blocks, and whether the kernel instead splits the batch's keys evenly over those blocks
+        (verify on full layers, 2 to 32 requests). Split 0 also attends the new tokens, so it
+        gets one step fewer of cached keys when the grid still fits. In decode, short spans (at
+        most 32 steps, such as the 2,048-token window) use at most 16 splits, so the merge tree
+        needs one level.
 
     Example:
-        >>> split_count, keys_per_split, is_balanced = _plan_splits(data)
+        >>> split_count, keys_per_split, first_split_keys, is_balanced = _plan_splits(data)
     """
     config: dict = data["config"]
     span_keys: int = config["window"] or data["page_table"].shape[1] * config["page_size"]
@@ -2433,7 +2446,16 @@ def _plan_splits(data: dict) -> tuple[int, int, bool]:
         and 1 < config["batch"] <= _WARP_SIZE
         and split_count > 1
     )
-    return split_count, keys_per_split, is_balanced
+    first_split_keys: int = keys_per_split - _TILE_KEYS
+    shifted_split_count: int = 1 + max(0, -(-(span_keys - first_split_keys) // keys_per_split))
+    is_tree_limited: bool = tile_count <= 2 * _MERGE_FAN_IN and config["q_len"] == 1
+    if (
+        is_balanced
+        or shifted_split_count * group_count > slot_count
+        or shifted_split_count > (_MERGE_FAN_IN if is_tree_limited else _MAX_SPLITS)
+    ):
+        return split_count, keys_per_split, keys_per_split, is_balanced
+    return shifted_split_count, keys_per_split, first_split_keys, is_balanced
 
 
 def _get_workspace(data: dict, split_count: int) -> tuple[torch.Tensor, ...]:
@@ -2477,7 +2499,7 @@ def kernel_fn(data: dict) -> torch.Tensor:
         >>> out = kernel_fn(data)
     """
     config: dict = data["config"]
-    split_count, keys_per_split, is_balanced = _plan_splits(data)
+    split_count, keys_per_split, first_split_keys, is_balanced = _plan_splits(data)
     max_split_count: int = min(2 * split_count, _MAX_SPLITS) if is_balanced else split_count
     out: torch.Tensor = torch.empty(
         (config["batch"], config["q_len"], config["num_q_heads"] * _HEAD_DIM),
@@ -2501,6 +2523,7 @@ def kernel_fn(data: dict) -> torch.Tensor:
         *_get_workspace(data, max_split_count),
         split_count,
         keys_per_split,
+        first_split_keys,
         is_balanced,
     )
     return out
