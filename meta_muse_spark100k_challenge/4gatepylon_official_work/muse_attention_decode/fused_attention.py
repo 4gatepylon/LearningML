@@ -1,9 +1,9 @@
 # okc: problem=muse_attention_decode
 """`fused_attention.py` computes muse_attention_decode in one readable CUDA kernel.
 
-Each request's keys are split into chunks, and one thread block of 4 warps (8 for sliding-window
-verify) handles one chunk of one request and one key/value head, for every query head of that
-group and every token of the block. It:
+Each request's keys are split into chunks, and one thread block handles one chunk of one request
+and one key/value head, for every query head of that group and every token of the block. A block
+has 4 warps, or 8 for verify on sliding layers or with few requests. It:
 
 1. Copies its query and gate rows to shared memory in one `cp.async` batch, RMS-normalizes the
    queries, applies RoPE from a per-token cos/sin table and rounds them to FP8 E4M3, as FA3 does
@@ -34,8 +34,8 @@ Must know:
         - The page-table reads for a step are issued one step before its keys and values.
         - The split count fills exactly one wave of resident blocks, from the occupancy calculator.
         - Each build compiles one path: decode (4 warps, 1 chunk per warp per step, 3 blocks per
-          SM), full verify (4 warps, 4 chunks, 4 blocks per SM) or sliding verify (8 warps,
-          2 chunks, 2 blocks per SM).
+          SM), full verify (4 warps, 4 chunks, 4 blocks per SM) or verify on sliding layers or
+          with at most 8 request x KV-head groups (8 warps, 2 chunks, 2 blocks per SM).
 """
 
 import torch
@@ -73,6 +73,7 @@ constexpr int kStages = 3;
 constexpr int kDecodeBlocksPerSm = 3;
 constexpr int kVerifyBlocksPerSm = 4;
 constexpr int kWideVerifyBlocksPerSm = 2;
+constexpr int kMaxWideFullGroups = 8;
 constexpr int kMaxTokens = 8;
 constexpr int kMergeFanIn = 16;
 constexpr int kMaxMergeGroups = kMaxSplits / kMergeFanIn;
@@ -1110,14 +1111,15 @@ struct KernelBuild {
  *
  * @param[in] row_count Query rows per block (L x query heads per KV head).
  * @param[in] window Sliding window in tokens, or 0 for full attention.
+ * @param[in] group_count Requests x KV heads: full verify with few groups also gets 8 warps.
  * @return The kernel to launch and its threads per block.
  *
  * @par Example
  * @code
- * const KernelBuild build = select_kernel(64, 2048);
+ * const KernelBuild build = select_kernel(64, 2048, 32);
  * @endcode
  */
-KernelBuild select_kernel(int64_t row_count, int64_t window) {
+KernelBuild select_kernel(int64_t row_count, int64_t window, int64_t group_count) {
   const int64_t m_tile_count = (row_count + kMmaRows - 1) / kMmaRows;
   if (m_tile_count == 1) {
     return {attention_kernel<4, 1, kDecodeBlocksPerSm>, kMinThreads};
@@ -1125,7 +1127,7 @@ KernelBuild select_kernel(int64_t row_count, int64_t window) {
   if (m_tile_count == 2) {
     return {attention_kernel<4, 2, kVerifyBlocksPerSm>, kMinThreads};
   }
-  if (window != 0) {
+  if (window != 0 || group_count <= kMaxWideFullGroups) {
     return {attention_kernel<8, 2, kWideVerifyBlocksPerSm>, 2 * kMinThreads};
   }
   return {attention_kernel<4, 4, kVerifyBlocksPerSm>, kMinThreads};
@@ -1206,7 +1208,8 @@ void run(torch::Tensor qkv, torch::Tensor k_cache, torch::Tensor v_cache, torch:
   p.arrival_count_device = arrival_count.data_ptr<int>();
   p.split_count = static_cast<int>(partial_max.size(2));
   p.keys_per_split = static_cast<int>(keys_per_split);
-  const KernelBuild build = select_kernel(p.L * (p.q_head_count / p.kv_head_count), window);
+  const KernelBuild build = select_kernel(p.L * (p.q_head_count / p.kv_head_count), window,
+                                          qkv.size(0) * p.kv_head_count);
   C10_CUDA_CHECK(cudaFuncSetAttribute(build.kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
                                       sizeof(SharedTile)));
   build.kernel<<<dim3(p.split_count, k_cache.size(2), qkv.size(0)), build.thread_count,
@@ -1218,15 +1221,16 @@ void run(torch::Tensor qkv, torch::Tensor k_cache, torch::Tensor v_cache, torch:
  *
  * @param[in] row_count Query rows per block (L x query heads per KV head), which picks the build.
  * @param[in] window Sliding window in tokens, or 0 for full attention, which also picks it.
+ * @param[in] group_count Requests x KV heads, which also picks it.
  * @return The occupancy calculator's count, for the kernel's threads and shared memory.
  *
  * @par Example
  * @code
- * int64_t slots = resident_blocks_per_sm(8, 0) * sm_count;
+ * int64_t slots = resident_blocks_per_sm(8, 0, 64) * sm_count;
  * @endcode
  */
-int64_t resident_blocks_per_sm(int64_t row_count, int64_t window) {
-  const KernelBuild build = select_kernel(row_count, window);
+int64_t resident_blocks_per_sm(int64_t row_count, int64_t window, int64_t group_count) {
+  const KernelBuild build = select_kernel(row_count, window, group_count);
   C10_CUDA_CHECK(cudaFuncSetAttribute(build.kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
                                       sizeof(SharedTile)));
   int block_count = 0;
@@ -1241,7 +1245,8 @@ CPP_SOURCE: str = (
     "torch::Tensor k_scale, torch::Tensor v_scale, torch::Tensor inv_freq, torch::Tensor out, "
     "int64_t window, double qk_scale_factor, double sm_scale, torch::Tensor partial_out, "
     "torch::Tensor partial_max, torch::Tensor partial_sum, torch::Tensor arrival_count, "
-    "int64_t keys_per_split); int64_t resident_blocks_per_sm(int64_t row_count, int64_t window);"
+    "int64_t keys_per_split); "
+    "int64_t resident_blocks_per_sm(int64_t row_count, int64_t window, int64_t group_count);"
 )
 HEAD_DIM: int = 64
 ROPE_PAIR_STRIDE: int = 2
@@ -1266,7 +1271,7 @@ def _get_extension() -> object:
     """
     if "module" not in _extension_cache:
         _extension_cache["module"] = load_inline(
-            name="muse_fused_attention_wide_verify",
+            name="muse_fused_attention_wide_small_verify",
             cpp_sources=CPP_SOURCE,
             cuda_sources=CUDA_SOURCE,
             functions=["run", "resident_blocks_per_sm"],
@@ -1317,10 +1322,11 @@ def _plan_splits(data: dict) -> tuple[int, int]:
     tile_count: int = -(-span_keys // TILE_KEYS)
     sm_count: int = torch.cuda.get_device_properties(data["qkv"].device).multi_processor_count
     row_count: int = config["q_len"] * config["num_q_heads"] // config["num_kv_heads"]
-    slot_count: int = sm_count * _get_extension().resident_blocks_per_sm(
-        row_count, config["window"]
-    )
     group_count: int = config["batch"] * config["num_kv_heads"]
+    resident_count: int = _get_extension().resident_blocks_per_sm(
+        row_count, config["window"], group_count
+    )
+    slot_count: int = sm_count * resident_count
     wanted_split_count: int = max(1, slot_count // group_count)
     wanted_split_count = min(wanted_split_count, MAX_SPLITS)
     if tile_count <= 2 * MERGE_FAN_IN:
