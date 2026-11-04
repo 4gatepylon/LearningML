@@ -32,6 +32,14 @@ namespace {
 constexpr int kHeadDim = 64;
 constexpr int kWarpSize = 32;
 constexpr int kPrologueWarps = 8;
+constexpr int kMaxRows = 64;
+constexpr int kTileKeys = 32;
+constexpr int kThreads = 128;
+constexpr int kWarps = kThreads / kWarpSize;
+constexpr int kRowsPerPass = kThreads / kHeadDim;
+constexpr int kAccumulatorCount = kMaxRows / kRowsPerPass;
+constexpr int kBytesPerLoad = 16;
+constexpr int kLoadsPerRow = kHeadDim / kBytesPerLoad;
 constexpr float kRmsEps = 1e-5f;
 
 struct Params {
@@ -46,6 +54,21 @@ struct Params {
   __nv_bfloat16* q_device;
   int L, q_head_count, kv_head_count;
   float qk_scale_factor;
+  const int* page_table_device;
+  __nv_bfloat16* out_device;
+  int page_size, page_table_stride, window;
+  float sm_scale;
+};
+
+struct SharedTile {
+  float q[kMaxRows][kHeadDim];
+  float k[kTileKeys][kHeadDim + 1];
+  float v[kTileKeys][kHeadDim];
+  float p[kMaxRows][kTileKeys];
+  int key_position[kTileKeys];
+  float row_max[kMaxRows];
+  float row_sum[kMaxRows];
+  float row_rescale[kMaxRows];
 };
 
 /**
@@ -62,6 +85,24 @@ struct Params {
 __device__ float warp_sum(float x) {
   for (int offset = kWarpSize / 2; offset > 0; offset /= 2) {
     x += __shfl_xor_sync(0xffffffffu, x, offset);
+  }
+  return x;
+}
+
+/**
+ * @brief `warp_max` returns the maximum of `x` over the 32 lanes of a warp, in every lane.
+ *
+ * @param[in] x This lane's value.
+ * @return The warp-wide maximum.
+ *
+ * @par Example
+ * @code
+ * float tile_max = warp_max(score);
+ * @endcode
+ */
+__device__ float warp_max(float x) {
+  for (int offset = kWarpSize / 2; offset > 0; offset /= 2) {
+    x = fmaxf(x, __shfl_xor_sync(0xffffffffu, x, offset));
   }
   return x;
 }
@@ -131,6 +172,162 @@ __global__ void prologue_kernel(const Params p) {
     p.k_cache_device[offset + 1] = __nv_fp8_e4m3(k.y / *p.k_scale_device);
     p.v_cache_device[offset] = __nv_fp8_e4m3(v.x / *p.v_scale_device);
     p.v_cache_device[offset + 1] = __nv_fp8_e4m3(v.y / *p.v_scale_device);
+  }
+}
+
+/**
+ * @brief `load_cached_tile` copies up to 32 keys and values of one request and KV head from the
+ * paged FP8 cache into shared memory, and marks missing keys with position -1.
+ *
+ * @param[in] p Kernel parameters.
+ * @param[out] tile Shared memory tile.
+ * @param[in] b Request index.
+ * @param[in] kv_head Key/value head index.
+ * @param[in] first_position_incl First key position of the tile.
+ * @param[in] end_position_excl Keys at or after this position are missing.
+ *
+ * @par Example
+ * @code
+ * load_cached_tile(p, tile, b, kv_head, start, seq_len + p.L);
+ * @endcode
+ */
+__device__ void load_cached_tile(const Params& p, SharedTile& tile, int b, int kv_head,
+                                 int first_position_incl, int end_position_excl) {
+  const int key = threadIdx.x / kLoadsPerRow;
+  const int chunk = threadIdx.x % kLoadsPerRow;
+  const int position = first_position_incl + key;
+  const bool is_present = position < end_position_excl;
+  uint4 k_bytes = make_uint4(0, 0, 0, 0);
+  uint4 v_bytes = make_uint4(0, 0, 0, 0);
+  if (is_present) {
+    const int page = p.page_table_device[b * p.page_table_stride + position / p.page_size];
+    const int64_t row = static_cast<int64_t>(page) * p.page_size + position % p.page_size;
+    const int64_t offset = (row * p.kv_head_count + kv_head) * kHeadDim + chunk * kBytesPerLoad;
+    k_bytes = *reinterpret_cast<const uint4*>(p.k_cache_device + offset);
+    v_bytes = *reinterpret_cast<const uint4*>(p.v_cache_device + offset);
+  }
+  const __nv_fp8_e4m3* k_values = reinterpret_cast<const __nv_fp8_e4m3*>(&k_bytes);
+  const __nv_fp8_e4m3* v_values = reinterpret_cast<const __nv_fp8_e4m3*>(&v_bytes);
+  for (int i = 0; i < kBytesPerLoad; ++i) {
+    tile.k[key][chunk * kBytesPerLoad + i] = static_cast<float>(k_values[i]);
+    tile.v[key][chunk * kBytesPerLoad + i] = static_cast<float>(v_values[i]);
+  }
+  if (chunk == 0) {
+    tile.key_position[key] = is_present ? position : -1;
+  }
+}
+
+/**
+ * @brief `attend_tile` folds the keys in shared memory into every query row's online softmax and
+ * output accumulator.
+ *
+ * @param[in] p Kernel parameters.
+ * @param[in,out] tile Shared memory tile; its scores and per-row softmax state are updated.
+ * @param[in,out] accumulators This thread's unnormalized outputs, for rows
+ * `threadIdx.x / 64 + 2 i` and dimension `threadIdx.x % 64`.
+ * @param[in] row_count Query rows (L x query heads per KV head).
+ * @param[in] seq_len Cached tokens of this request: the first new token's position.
+ *
+ * @par Example
+ * @code
+ * attend_tile(p, tile, accumulators, row_count, seq_len);
+ * @endcode
+ */
+__device__ void attend_tile(const Params& p, SharedTile& tile, float* accumulators, int row_count,
+                            int seq_len) {
+  const int group_size = p.q_head_count / p.kv_head_count;
+  const float logit_scale = p.sm_scale * *p.k_scale_device;
+  for (int index = threadIdx.x; index < row_count * kTileKeys; index += kThreads) {
+    const int row = index / kTileKeys;
+    const int key = index % kTileKeys;
+    float dot = 0.0f;
+    for (int d = 0; d < kHeadDim; ++d) {
+      dot += tile.q[row][d] * tile.k[key][d];
+    }
+    const int key_position = tile.key_position[key];
+    const int query_position = seq_len + row / group_size;
+    const bool is_visible = key_position >= 0 && key_position <= query_position &&
+                            (p.window == 0 || key_position > query_position - p.window);
+    tile.p[row][key] = is_visible ? dot * logit_scale : -INFINITY;
+  }
+  __syncthreads();
+  const int warp = threadIdx.x / kWarpSize;
+  const int lane = threadIdx.x % kWarpSize;
+  for (int row = warp; row < row_count; row += kWarps) {
+    const float score = tile.p[row][lane];
+    const float old_max = tile.row_max[row];
+    const float new_max = fmaxf(old_max, warp_max(score));
+    const float safe_max = new_max == -INFINITY ? 0.0f : new_max;
+    const float probability = expf(score - safe_max);
+    const float tile_sum = warp_sum(probability);
+    tile.p[row][lane] = probability;
+    if (lane == 0) {
+      tile.row_rescale[row] = expf(old_max - safe_max);
+      tile.row_sum[row] = tile.row_sum[row] * tile.row_rescale[row] + tile_sum;
+      tile.row_max[row] = new_max;
+    }
+  }
+  __syncthreads();
+  const int d = threadIdx.x % kHeadDim;
+#pragma unroll
+  for (int i = 0; i < kAccumulatorCount; ++i) {
+    const int row = threadIdx.x / kHeadDim + kRowsPerPass * i;
+    if (row < row_count) {
+      float pv = 0.0f;
+      for (int key = 0; key < kTileKeys; ++key) {
+        pv += tile.p[row][key] * tile.v[key][d];
+      }
+      accumulators[i] = accumulators[i] * tile.row_rescale[row] + pv;
+    }
+  }
+  __syncthreads();
+}
+
+/**
+ * @brief `write_gated_output` divides each query row's accumulated output by its softmax sum,
+ * applies the per-head RMSNorm and the sigmoid gate, and writes the result as bf16.
+ *
+ * @param[in] p Kernel parameters.
+ * @param[in,out] tile Shared memory tile; its query rows are reused for the outputs.
+ * @param[in] accumulators This thread's unnormalized outputs (see `attend_tile`).
+ * @param[in] b Request index.
+ * @param[in] kv_head Key/value head index.
+ * @param[in] row_count Query rows (L x query heads per KV head).
+ *
+ * @par Example
+ * @code
+ * write_gated_output(p, tile, accumulators, b, kv_head, row_count);
+ * @endcode
+ */
+__device__ void write_gated_output(const Params& p, SharedTile& tile, const float* accumulators,
+                                   int b, int kv_head, int row_count) {
+  const int warp = threadIdx.x / kWarpSize;
+  const int lane = threadIdx.x % kWarpSize;
+  const int group_size = p.q_head_count / p.kv_head_count;
+  const int qkv_row_size = (2 * p.q_head_count + 2 * p.kv_head_count) * kHeadDim;
+  const float v_scale = *p.v_scale_device;
+#pragma unroll
+  for (int i = 0; i < kAccumulatorCount; ++i) {
+    const int row = threadIdx.x / kHeadDim + kRowsPerPass * i;
+    if (row < row_count) {
+      tile.q[row][threadIdx.x % kHeadDim] = accumulators[i] / tile.row_sum[row] * v_scale;
+    }
+  }
+  __syncthreads();
+  for (int row = warp; row < row_count; row += kWarps) {
+    const int token = b * p.L + row / group_size;
+    const int head = kv_head * group_size + row % group_size;
+    const float2 o = make_float2(tile.q[row][2 * lane], tile.q[row][2 * lane + 1]);
+    const float inv_rms = rsqrtf(warp_sum(o.x * o.x + o.y * o.y) / kHeadDim + kRmsEps);
+    const __nv_bfloat162* gate = reinterpret_cast<const __nv_bfloat162*>(
+        p.qkv_device + token * qkv_row_size +
+        (p.q_head_count + 2 * p.kv_head_count + head) * kHeadDim);
+    const float2 g = __bfloat1622float2(gate[lane]);
+    const float2 out =
+        make_float2(o.x * inv_rms / (1.0f + expf(-g.x)), o.y * inv_rms / (1.0f + expf(-g.y)));
+    __nv_bfloat162* out_row = reinterpret_cast<__nv_bfloat162*>(
+        p.out_device + (token * p.q_head_count + head) * kHeadDim);
+    out_row[lane] = __float22bfloat162_rn(out);
   }
 }
 
@@ -209,7 +406,7 @@ def _get_extension() -> object:
     """
     if "module" not in _extension_cache:
         _extension_cache["module"] = load_inline(
-            name="muse_fused_attention_prologue",
+            name="muse_fused_attention_prologue_helpers",
             cpp_sources=CPP_SOURCE,
             cuda_sources=CUDA_SOURCE,
             functions=["prologue"],
