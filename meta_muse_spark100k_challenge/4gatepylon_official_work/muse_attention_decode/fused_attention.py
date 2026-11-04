@@ -139,7 +139,8 @@ struct Params {
   float* partial_max_device;
   float* partial_sum_device;
   int* arrival_count_device;
-  int split_count, keys_per_split;
+  int split_count, max_split_count, keys_per_split;
+  bool is_balanced;
 };
 
 /**
@@ -1463,17 +1464,17 @@ __device__ void merge_slots(const Params& p, SharedTile& tile, int64_t first_slo
  * @brief `merger_count` returns how many blocks merge each request and KV head's splits: one
  * per slice of rows, at most `kMaxMergers`.
  *
- * @param[in] p Kernel parameters.
+ * @param[in] split_count The group's splits.
  * @param[in] row_count Query rows (L x query heads per KV head).
  * @return The merger count.
  *
  * @par Example
  * @code
- * const int mergers = merger_count(p, row_count);
+ * const int mergers = merger_count(work.split_count, row_count);
  * @endcode
  */
-__device__ int merger_count(const Params& p, int row_count) {
-  return min(kMaxMergers, min(p.split_count, row_count));
+__device__ int merger_count(int split_count, int row_count) {
+  return min(kMaxMergers, min(split_count, row_count));
 }
 
 /**
@@ -1483,20 +1484,22 @@ __device__ int merger_count(const Params& p, int row_count) {
  * @param[in] p Kernel parameters.
  * @param[in,out] tile Shared memory tile: its `merge_rank`.
  * @param[in] group Request x KV-head group.
+ * @param[in] split_count The group's splits.
  * @param[in] mergers `merger_count`.
  * @return The merge rank, or a negative number.
  *
  * @par Example
  * @code
- * const int rank = take_merge_rank(p, tile, group, mergers);
+ * const int rank = take_merge_rank(p, tile, group, work.split_count, mergers);
  * @endcode
  */
-__device__ int take_merge_rank(const Params& p, SharedTile& tile, int group, int mergers) {
+__device__ int take_merge_rank(const Params& p, SharedTile& tile, int group, int split_count,
+                               int mergers) {
   __threadfence();
   __syncthreads();
   if (threadIdx.x == 0) {
-    tile.merge_rank = atomicAdd(&p.arrival_count_device[kCountersPerGroup * group], 1) -
-                      (p.split_count - mergers);
+    tile.merge_rank =
+        atomicAdd(&p.arrival_count_device[kCountersPerGroup * group], 1) - (split_count - mergers);
   }
   __syncthreads();
   return tile.merge_rank;
@@ -1507,23 +1510,24 @@ __device__ int take_merge_rank(const Params& p, SharedTile& tile, int group, int
  *
  * @param[in] p Kernel parameters.
  * @param[in] group Request x KV-head group.
+ * @param[in] split_count The group's splits.
  *
  * @par Example
  * @code
- * wait_for_all_splits(p, group);
+ * wait_for_all_splits(p, group, work.split_count);
  * @endcode
  *
  * @par Must know
  * - Gotchas:
  *   - The kernel launches cooperatively, so every split is resident and the wait ends.
  */
-__device__ void wait_for_all_splits(const Params& p, int group) {
+__device__ void wait_for_all_splits(const Params& p, int group, int split_count) {
   if (threadIdx.x == 0) {
     const int* counter = &p.arrival_count_device[kCountersPerGroup * group];
     int arrived = 0;
     do {
       asm volatile("ld.acquire.gpu.global.b32 %0, [%1];\n" : "=r"(arrived) : "l"(counter));
-    } while (arrived < p.split_count);
+    } while (arrived < split_count);
   }
   __syncthreads();
   __threadfence();
@@ -1542,19 +1546,20 @@ __device__ void wait_for_all_splits(const Params& p, int group) {
  * @param[in] rank This block's merge rank.
  * @param[in] mergers `merger_count`.
  * @param[in] row_count Query rows (L x query heads per KV head).
+ * @param[in] split_count The group's splits.
  *
  * @par Example
  * @code
- * merge_rows<4>(p, tile, first_slot, rank, mergers, row_count);
+ * merge_rows<4>(p, tile, first_slot, rank, mergers, row_count, work.split_count);
  * @endcode
  */
 template <int kSplitUnroll>
 __device__ void merge_rows(const Params& p, SharedTile& tile, int64_t first_slot, int rank,
-                           int mergers, int row_count) {
+                           int mergers, int row_count, int split_count) {
   const int my_row_count = (row_count - rank + mergers - 1) / mergers;
   const int warp = threadIdx.x / kWarpSize;
   const int lane = threadIdx.x % kWarpSize;
-  for (int index = threadIdx.x; index < p.split_count * my_row_count; index += thread_count()) {
+  for (int index = threadIdx.x; index < split_count * my_row_count; index += thread_count()) {
     const int row = rank + index % my_row_count * mergers;
     const int64_t slot = first_slot + index / my_row_count;
     tile.merge.row_weight[index] = __ldcg(&p.partial_max_device[slot * kMaxRows + row]);
@@ -1563,7 +1568,7 @@ __device__ void merge_rows(const Params& p, SharedTile& tile, int64_t first_slot
   __syncthreads();
   for (int local_row = warp; local_row < my_row_count; local_row += warp_count()) {
     float merged_max = -INFINITY;
-    for (int s = lane; s < p.split_count; s += kWarpSize) {
+    for (int s = lane; s < split_count; s += kWarpSize) {
       merged_max = fmaxf(merged_max, tile.merge.row_weight[s * my_row_count + local_row]);
     }
     for (int offset = kWarpSize / 2; offset > 0; offset /= 2) {
@@ -1571,7 +1576,7 @@ __device__ void merge_rows(const Params& p, SharedTile& tile, int64_t first_slot
     }
     const float safe_max = merged_max == -INFINITY ? 0.0f : merged_max;
     float merged_sum = 0.0f;
-    for (int s = lane; s < p.split_count; s += kWarpSize) {
+    for (int s = lane; s < split_count; s += kWarpSize) {
       const int index = s * my_row_count + local_row;
       const float weight = fast_exp2(tile.merge.row_weight[index] - safe_max);
       tile.merge.row_weight[index] = weight;
@@ -1591,7 +1596,7 @@ __device__ void merge_rows(const Params& p, SharedTile& tile, int64_t first_slot
     const int row = rank + local_row * mergers;
     float4 merged = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
 #pragma unroll kSplitUnroll
-    for (int s = task / vector_count; s < p.split_count; s += part_count) {
+    for (int s = task / vector_count; s < split_count; s += part_count) {
       const float4 x = __ldcg(&reinterpret_cast<const float4*>(
           p.partial_out_device +
           (first_slot + s) * kMaxRows * kHeadDim)[row * kVectorsPerRow + vector % kVectorsPerRow]);
@@ -1690,8 +1695,9 @@ __device__ bool merge_splits(const Params& p, SharedTile& tile, int b, int kv_he
 }
 
 /**
- * @brief `BlockWork` describes what one block of `attention_kernel` works on: its split, KV head
- * and request, its warp's place among the query rows and keys, and its split's key positions.
+ * @brief `BlockWork` describes what one block of `attention_kernel` works on: its split, its
+ * group's split count, KV head and request (or that it has none), its warp's place among the query
+ * rows and keys, and its split's key positions.
  *
  * @par Example
  * @code
@@ -1699,11 +1705,83 @@ __device__ bool merge_splits(const Params& p, SharedTile& tile, int b, int kv_he
  * @endcode
  */
 struct BlockWork {
-  int split, kv_head, b, warp, lane;
+  int split, split_count, kv_head, b, warp, lane;
+  bool is_idle;
   int row_count, m_tile_count, key_group_count, m_tile, key_group;
   bool is_active;
   int seq_len, window_start_incl, first_position_incl, end_position_excl;
 };
+
+/**
+ * @brief `BalancedSplit` is one block's share of a batch whose cached keys are split evenly over
+ * all of its blocks: the request, the split, the request's split count and the keys per split.
+ *
+ * @par Example
+ * @code
+ * const BalancedSplit share = balance_splits(p, B, slot);
+ * @endcode
+ */
+struct BalancedSplit {
+  int b, split, split_count, keys_per_split;
+};
+
+/**
+ * @brief `balance_splits` picks the fewest keys per split (a multiple of 64) at which the batch's
+ * requests need at most `split_count x B` splits in all, so that longer requests get more
+ * blocks, and returns the share of block `slot`.
+ *
+ * @param[in] p Kernel parameters.
+ * @param[in] B Requests.
+ * @param[in] slot The block's index among the KV head's `split_count x B` blocks.
+ * @return The block's share; `b` is `B` or more when the slot has no keys.
+ *
+ * @par Example
+ * @code
+ * const BalancedSplit share = balance_splits(p, gridDim.z, blockIdx.z * gridDim.x + blockIdx.x);
+ * @endcode
+ *
+ * @par Must know
+ * - Limitations:
+ *   - A batch has at most 32 requests, one per lane; every warp computes the same plan.
+ */
+__device__ BalancedSplit balance_splits(const Params& p, int B, int slot) {
+  const int lane = threadIdx.x % kWarpSize;
+  const int seq_len = lane < B ? p.seq_lens_device[lane] : 0;
+  const int slot_count = p.split_count * B;
+  const int total_keys = __reduce_add_sync(kFullWarpMask, seq_len);
+  const int longest_keys = __reduce_max_sync(kFullWarpMask, seq_len);
+  int low_steps =
+      max((total_keys + slot_count * kStepKeys - 1) / (slot_count * kStepKeys),
+          (longest_keys + p.max_split_count * kStepKeys - 1) / (p.max_split_count * kStepKeys));
+  low_steps = max(low_steps, 1);
+  int high_steps = max(
+      low_steps, (total_keys + (slot_count - B) * kStepKeys - 1) / ((slot_count - B) * kStepKeys));
+  while (low_steps < high_steps) {
+    const int steps = (low_steps + high_steps) / 2;
+    const int keys = steps * kStepKeys;
+    const int splits =
+        __reduce_add_sync(kFullWarpMask, lane < B ? max(1, (seq_len + keys - 1) / keys) : 0);
+    if (splits <= slot_count) {
+      high_steps = steps;
+    } else {
+      low_steps = steps + 1;
+    }
+  }
+  BalancedSplit share;
+  share.keys_per_split = high_steps * kStepKeys;
+  const int split_count =
+      lane < B ? max(1, (seq_len + share.keys_per_split - 1) / share.keys_per_split) : 0;
+  int end_slot_excl = split_count;
+  for (int offset = 1; offset < kWarpSize; offset *= 2) {
+    const int temp_end = __shfl_up_sync(kFullWarpMask, end_slot_excl, offset);
+    end_slot_excl += lane >= offset ? temp_end : 0;
+  }
+  share.b = __popc(__ballot_sync(kFullWarpMask, end_slot_excl <= slot));
+  const int owner = min(share.b, kWarpSize - 1);
+  share.split = slot - __shfl_sync(kFullWarpMask, end_slot_excl - split_count, owner);
+  share.split_count = __shfl_sync(kFullWarpMask, split_count, owner);
+  return share;
+}
 
 /**
  * @brief `describe_block` returns this block's and this warp's `BlockWork`; it starts the read of
@@ -1711,7 +1789,8 @@ struct BlockWork {
  *
  * @tparam kWarpCount Warps per block.
  * @tparam kIsVerify Whether the block serves 8 tokens (64 query rows) rather than 1 (8 rows).
- * @param[in] p Kernel parameters; the grid is (splits, KV heads, requests).
+ * @param[in] p Kernel parameters; the grid is (splits, KV heads, requests), or, when the split
+ * plan is balanced, `split_count x B` slots per KV head that `balance_splits` assigns.
  * @return The block's work.
  *
  * @par Example
@@ -1722,9 +1801,19 @@ struct BlockWork {
 template <int kWarpCount, bool kIsVerify>
 __device__ BlockWork describe_block(const Params& p) {
   BlockWork work;
+  int keys_per_split = p.keys_per_split;
   work.split = blockIdx.x;
+  work.split_count = p.split_count;
   work.kv_head = blockIdx.y;
   work.b = blockIdx.z;
+  if (kIsVerify && p.is_balanced) {
+    const BalancedSplit share = balance_splits(p, gridDim.z, blockIdx.z * gridDim.x + blockIdx.x);
+    work.b = min(share.b, static_cast<int>(gridDim.z) - 1);
+    work.split = share.split;
+    work.split_count = share.split_count;
+    keys_per_split = share.keys_per_split;
+  }
+  work.is_idle = work.split >= work.split_count;
   work.warp = threadIdx.x / kWarpSize;
   work.lane = threadIdx.x % kWarpSize;
   work.row_count = kIsVerify ? kMaxTokens * kGroupSize : kGroupSize;
@@ -1735,8 +1824,8 @@ __device__ BlockWork describe_block(const Params& p) {
   work.is_active = work.key_group < work.key_group_count;
   work.seq_len = p.seq_lens_device[work.b];
   work.window_start_incl = p.window == 0 ? 0 : max(0, work.seq_len - p.window + 1);
-  work.first_position_incl = work.window_start_incl + work.split * p.keys_per_split;
-  work.end_position_excl = min(work.first_position_incl + p.keys_per_split, work.seq_len);
+  work.first_position_incl = work.window_start_incl + work.split * keys_per_split;
+  work.end_position_excl = min(work.first_position_incl + keys_per_split, work.seq_len);
   return work;
 }
 
@@ -1958,17 +2047,17 @@ __device__ void combine_block_state(SharedTile& tile, const BlockWork& work, War
 template <int kWarpCount>
 __device__ void merge_in_parallel(const Params& p, SharedTile& tile, const BlockWork& work) {
   const int group = work.b * p.kv_head_count + work.kv_head;
-  const int64_t first_slot = static_cast<int64_t>(group) * p.split_count;
-  const int mergers = merger_count(p, work.row_count);
+  const int64_t first_slot = static_cast<int64_t>(group) * p.max_split_count;
+  const int mergers = merger_count(work.split_count, work.row_count);
   publish_state(p, tile, first_slot + work.split, work.row_count);
-  const int merge_rank = take_merge_rank(p, tile, group, mergers);
+  const int merge_rank = take_merge_rank(p, tile, group, work.split_count, mergers);
   if (merge_rank < 0) {
     wait_for_copies<0>();
     return;
   }
-  wait_for_all_splits(p, group);
+  wait_for_all_splits(p, group, work.split_count);
   merge_rows<kWarpCount == kMaxWarps ? 4 : 1>(p, tile, first_slot, merge_rank, mergers,
-                                              work.row_count);
+                                              work.row_count, work.split_count);
   wait_for_copies<0>();
   __syncthreads();
   write_gated_output(p, tile, work.b, work.kv_head, work.row_count, merge_rank, mergers);
@@ -2025,6 +2114,9 @@ __global__ void __launch_bounds__(kWarpCount* kWarpSize, kMinBlocksPerSm)
   extern __shared__ __align__(16) unsigned char shared_bytes[];
   SharedTile& tile = *reinterpret_cast<SharedTile*>(shared_bytes);
   const BlockWork work = describe_block<kWarpCount, kIsVerify>(p);
+  if (work.is_idle) {
+    return;
+  }
   KeyAddresses addresses = start_block<kWarpCount * kWarpSize>(p, tile, work);
   uint32_t q_fragments[kQkSteps][4];
   load_query_fragments(tile, work, q_fragments);
@@ -2122,14 +2214,17 @@ KernelBuild select_kernel(int64_t row_count, int64_t window, int64_t group_count
  * @param[in,out] arrival_count int32 [B, Hkv, 17], zero before and after each call. Decode's
  * merge tree counts arrivals per group of 16 splits in counters 0 to 15 and group mergers in 16;
  * verify's parallel merge counts arrivals in counter 0 and finished mergers in 1.
- * @param[in] keys_per_split Cached keys per split, a multiple of 64.
+ * @param[in] split_count Blocks per request and KV head.
+ * @param[in] keys_per_split Cached keys per split, a multiple of 64, unless balanced.
+ * @param[in] is_balanced Whether verify splits the batch's keys evenly over its `split_count x B`
+ * blocks per KV head (at most 32 requests); the workspace then holds each request's most splits.
  * @throws c10::Error A tensor has the wrong dtype, shape or layout, or the page size is not a power
  * of 2.
  *
  * @par Example
  * @code
  * run(qkv, k_cache, v_cache, page_table, seq_lens, cache_loc, k_scale, v_scale, inv_freq, out,
- *     2048, 5.473, 0.125, partial_out, partial_max, partial_sum, arrival_count, 64);
+ *     2048, 5.473, 0.125, partial_out, partial_max, partial_sum, arrival_count, 8, 64, false);
  * @endcode
  */
 void run(torch::Tensor qkv, torch::Tensor k_cache, torch::Tensor v_cache, torch::Tensor page_table,
@@ -2137,7 +2232,7 @@ void run(torch::Tensor qkv, torch::Tensor k_cache, torch::Tensor v_cache, torch:
          torch::Tensor v_scale, torch::Tensor inv_freq, torch::Tensor out, int64_t window,
          double qk_scale_factor, double sm_scale, torch::Tensor partial_out,
          torch::Tensor partial_max, torch::Tensor partial_sum, torch::Tensor arrival_count,
-         int64_t keys_per_split) {
+         int64_t split_count, int64_t keys_per_split, bool is_balanced) {
   const int64_t q_head_count = out.size(2) / kHeadDim;
   TORCH_CHECK(qkv.is_contiguous() && k_cache.is_contiguous() && v_cache.is_contiguous() &&
                   page_table.is_contiguous() && out.is_contiguous(),
@@ -2152,6 +2247,11 @@ void run(torch::Tensor qkv, torch::Tensor k_cache, torch::Tensor v_cache, torch:
   TORCH_CHECK(qkv.size(1) == 1 || qkv.size(1) == kMaxTokens, "L must be 1 (decode) or ", kMaxTokens,
               " (verify), got ", qkv.size(1));
   TORCH_CHECK(partial_max.size(2) <= kMaxSplits, "at most ", kMaxSplits, " splits");
+  TORCH_CHECK(split_count > 0 && split_count <= partial_max.size(2),
+              "split_count must be in [1, workspace splits], got ", split_count);
+  TORCH_CHECK(
+      !is_balanced || (qkv.size(1) == kMaxTokens && split_count > 1 && qkv.size(0) <= kWarpSize),
+      "balanced splits need verify, 2 or more splits and at most ", kWarpSize, " requests");
   TORCH_CHECK(q_head_count == kGroupSize * k_cache.size(2), "query heads per KV head must be ",
               kGroupSize, ", got ", q_head_count, " / ", k_cache.size(2));
   TORCH_CHECK(qkv.scalar_type() == at::kBFloat16 && k_cache.scalar_type() == at::kFloat8_e4m3fn &&
@@ -2184,8 +2284,10 @@ void run(torch::Tensor qkv, torch::Tensor k_cache, torch::Tensor v_cache, torch:
   p.partial_max_device = partial_max.data_ptr<float>();
   p.partial_sum_device = partial_sum.data_ptr<float>();
   p.arrival_count_device = arrival_count.data_ptr<int>();
-  p.split_count = static_cast<int>(partial_max.size(2));
+  p.split_count = static_cast<int>(split_count);
+  p.max_split_count = static_cast<int>(partial_max.size(2));
   p.keys_per_split = static_cast<int>(keys_per_split);
+  p.is_balanced = is_balanced;
   const KernelBuild build = select_kernel(p.L * (p.q_head_count / p.kv_head_count), window,
                                           qkv.size(0) * p.kv_head_count);
   C10_CUDA_CHECK(cudaFuncSetAttribute(build.kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
@@ -2234,7 +2336,7 @@ CPP_SOURCE: str = (
     "torch::Tensor k_scale, torch::Tensor v_scale, torch::Tensor inv_freq, torch::Tensor out, "
     "int64_t window, double qk_scale_factor, double sm_scale, torch::Tensor partial_out, "
     "torch::Tensor partial_max, torch::Tensor partial_sum, torch::Tensor arrival_count, "
-    "int64_t keys_per_split); "
+    "int64_t split_count, int64_t keys_per_split, bool is_balanced); "
     "int64_t resident_blocks_per_sm(int64_t row_count, int64_t window, int64_t group_count);"
 )
 _HEAD_DIM: int = 64
@@ -2242,6 +2344,7 @@ _ROPE_PAIR_STRIDE: int = 2
 _MAX_ROWS: int = 64
 _TILE_KEYS: int = 64
 _MAX_SPLITS: int = 256
+_WARP_SIZE: int = 32
 _MERGE_FAN_IN: int = 16
 _COUNTERS_PER_GROUP: int = 17
 _extension_cache: dict[str, object] = {}
@@ -2260,7 +2363,7 @@ def _get_extension() -> object:
     """
     if "module" not in _extension_cache:
         _extension_cache["module"] = load_inline(
-            name="muse_fused_attention_64_mergers",
+            name="muse_fused_attention_balanced_splits",
             cpp_sources=CPP_SOURCE,
             cuda_sources=CUDA_SOURCE,
             functions=["run", "resident_blocks_per_sm"],
@@ -2293,7 +2396,7 @@ def _get_inv_freq(theta: float, device: torch.device) -> torch.Tensor:
     return _inv_freq_cache[key]
 
 
-def _plan_splits(data: dict) -> tuple[int, int]:
+def _plan_splits(data: dict) -> tuple[int, int, bool]:
     """`_plan_splits` picks how many blocks share each request's keys, from shapes only.
 
     Args:
@@ -2301,12 +2404,13 @@ def _plan_splits(data: dict) -> tuple[int, int]:
 
     Returns:
         The split count and the cached keys per split (a multiple of 64), so that every key a
-        request can hold falls in a split and the grid fits in one wave of resident blocks. In
-        decode, short spans (at most 32 steps, such as the 2,048-token window) use at most 16
-        splits, so the merge tree needs one level.
+        request can hold falls in a split and the grid fits in one wave of resident blocks, and
+        whether the kernel instead splits the batch's keys evenly over those blocks (verify on
+        full layers, 2 to 32 requests). In decode, short spans (at most 32 steps, such as the
+        2,048-token window) use at most 16 splits, so the merge tree needs one level.
 
     Example:
-        >>> split_count, keys_per_split = _plan_splits(data)
+        >>> split_count, keys_per_split, is_balanced = _plan_splits(data)
     """
     config: dict = data["config"]
     span_keys: int = config["window"] or data["page_table"].shape[1] * config["page_size"]
@@ -2323,7 +2427,14 @@ def _plan_splits(data: dict) -> tuple[int, int]:
     if tile_count <= 2 * _MERGE_FAN_IN and config["q_len"] == 1:
         wanted_split_count = min(wanted_split_count, _MERGE_FAN_IN)
     keys_per_split: int = -(-tile_count // min(tile_count, wanted_split_count)) * _TILE_KEYS
-    return -(-span_keys // keys_per_split), keys_per_split
+    split_count: int = -(-span_keys // keys_per_split)
+    is_balanced: bool = (
+        config["q_len"] > 1
+        and config["window"] == 0
+        and 1 < config["batch"] <= _WARP_SIZE
+        and split_count > 1
+    )
+    return split_count, keys_per_split, is_balanced
 
 
 def _get_workspace(data: dict, split_count: int) -> tuple[torch.Tensor, ...]:
@@ -2367,7 +2478,8 @@ def kernel_fn(data: dict) -> torch.Tensor:
         >>> out = kernel_fn(data)
     """
     config: dict = data["config"]
-    split_count, keys_per_split = _plan_splits(data)
+    split_count, keys_per_split, is_balanced = _plan_splits(data)
+    max_split_count: int = min(2 * split_count, _MAX_SPLITS) if is_balanced else split_count
     out: torch.Tensor = torch.empty(
         (config["batch"], config["q_len"], config["num_q_heads"] * _HEAD_DIM),
         dtype=torch.bfloat16,
@@ -2387,7 +2499,9 @@ def kernel_fn(data: dict) -> torch.Tensor:
         config["window"],
         config["qk_scale_factor"],
         config["sm_scale"],
-        *_get_workspace(data, split_count),
+        *_get_workspace(data, max_split_count),
+        split_count,
         keys_per_split,
+        is_balanced,
     )
     return out
