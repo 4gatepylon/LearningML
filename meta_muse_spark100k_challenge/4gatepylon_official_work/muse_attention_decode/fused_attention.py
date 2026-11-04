@@ -1,12 +1,16 @@
 # okc: problem=muse_attention_decode
-"""`fused_attention.py` computes muse_attention_decode, moving its steps into CUDA one at a time.
+"""`fused_attention.py` computes muse_attention_decode in one readable CUDA kernel.
 
-The step runs as two CUDA kernels. The prologue kernel RMS-normalizes the queries and the
-block's new keys, scales the queries by `qk_scale_factor`, applies RoPE on sliding layers, rounds
-the queries to bf16 as `reference.py` does, and writes the new keys and values to the FP8 cache.
-The attention kernel runs one thread block per request and key/value head. It streams the
-request's keys and values (the new ones included) through shared memory, 32 at a time, folds each
-tile into an online softmax on CUDA cores, then applies the per-head RMSNorm and the sigmoid gate.
+One thread block handles one request and one key/value head, for every query head of that group
+and every token of the block. In order, it:
+
+1. RMS-normalizes the queries, scales them by `qk_scale_factor`, applies RoPE on sliding layers and
+   rounds them to bf16, as `reference.py` does.
+2. Streams the request's cached keys and values through shared memory, 32 keys at a time, and folds
+   each tile into an online softmax on CUDA cores.
+3. Normalizes the block's new keys, applies RoPE, writes the new keys and values to the FP8 cache,
+   and attends to them as one last, causal tile.
+4. Divides by the softmax sum and applies the per-head RMSNorm and the sigmoid gate.
 
 Interface:
     kernel_fn(data): `TASK.md`'s timed call; returns bfloat16 [B, L, Hq * 64].
@@ -32,7 +36,6 @@ namespace {
 
 constexpr int kHeadDim = 64;
 constexpr int kWarpSize = 32;
-constexpr int kPrologueWarps = 8;
 constexpr int kMaxRows = 64;
 constexpr int kTileKeys = 32;
 constexpr int kThreads = 128;
@@ -52,7 +55,6 @@ struct Params {
   const float* k_scale_device;
   const float* v_scale_device;
   const float* inv_freq_device;
-  __nv_bfloat16* q_device;
   int L, q_head_count, kv_head_count;
   float qk_scale_factor;
   const int* page_table_device;
@@ -135,45 +137,6 @@ __device__ float2 normalize_and_rotate(float2 x, float gain, int position,
   const float cos_angle = cosf(angle);
   const float sin_angle = sinf(angle);
   return make_float2(x.x * cos_angle - x.y * sin_angle, x.x * sin_angle + x.y * cos_angle);
-}
-
-/**
- * @brief `prologue_kernel` prepares one new token: its normalized, rotated, bf16-rounded queries,
- * and its keys and values written to the FP8 cache.
- *
- * @param[in] p Kernel parameters; the grid has one block per token (B x L).
- *
- * @par Example
- * @code
- * prologue_kernel<<<B * L, kPrologueWarps * kWarpSize, 0, stream>>>(p);
- * @endcode
- */
-__global__ void prologue_kernel(const Params p) {
-  const int token = blockIdx.x;
-  const int warp = threadIdx.x / kWarpSize;
-  const int lane = threadIdx.x % kWarpSize;
-  const int position = p.seq_lens_device[token / p.L] + token % p.L;
-  const __nv_bfloat162* token_in = reinterpret_cast<const __nv_bfloat162*>(
-      p.qkv_device + token * (2 * p.q_head_count + 2 * p.kv_head_count) * kHeadDim);
-  for (int head = warp; head < p.q_head_count + p.kv_head_count; head += kPrologueWarps) {
-    const float2 x = __bfloat1622float2(token_in[head * kHeadDim / 2 + lane]);
-    if (head < p.q_head_count) {
-      const float2 q =
-          normalize_and_rotate(x, p.qk_scale_factor, position, p.inv_freq_device, lane);
-      __nv_bfloat162* q_out = reinterpret_cast<__nv_bfloat162*>(p.q_device);
-      q_out[(token * p.q_head_count + head) * kHeadDim / 2 + lane] = __float22bfloat162_rn(q);
-      continue;
-    }
-    const int kv_head = head - p.q_head_count;
-    const float2 k = normalize_and_rotate(x, 1.0f, position, p.inv_freq_device, lane);
-    const float2 v = __bfloat1622float2(token_in[(head + p.kv_head_count) * kHeadDim / 2 + lane]);
-    const int64_t offset =
-        (p.cache_loc_device[token] * p.kv_head_count + kv_head) * kHeadDim + 2 * lane;
-    p.k_cache_device[offset] = __nv_fp8_e4m3(k.x / *p.k_scale_device);
-    p.k_cache_device[offset + 1] = __nv_fp8_e4m3(k.y / *p.k_scale_device);
-    p.v_cache_device[offset] = __nv_fp8_e4m3(v.x / *p.v_scale_device);
-    p.v_cache_device[offset + 1] = __nv_fp8_e4m3(v.y / *p.v_scale_device);
-  }
 }
 
 /**
@@ -333,8 +296,61 @@ __device__ void write_gated_output(const Params& p, SharedTile& tile, const floa
 }
 
 /**
- * @brief `attention_kernel` attends one request's prepared queries of one KV head group over its
- * cache, including the block's new keys, and writes the gated output.
+ * @brief `load_new_tile` normalizes and rotates the block's L new keys, writes them and their
+ * values to the FP8 cache, and puts the stored (FP8-rounded) values in shared memory.
+ *
+ * @param[in] p Kernel parameters.
+ * @param[out] tile Shared memory tile.
+ * @param[in] b Request index.
+ * @param[in] kv_head Key/value head index.
+ * @param[in] seq_len Cached tokens of this request: the first new token's position.
+ *
+ * @par Example
+ * @code
+ * load_new_tile(p, tile, b, kv_head, seq_len);
+ * @endcode
+ */
+__device__ void load_new_tile(const Params& p, SharedTile& tile, int b, int kv_head, int seq_len) {
+  const int warp = threadIdx.x / kWarpSize;
+  const int lane = threadIdx.x % kWarpSize;
+  const int qkv_row_size = (2 * p.q_head_count + 2 * p.kv_head_count) * kHeadDim;
+  for (int key = warp; key < kTileKeys; key += kWarps) {
+    float2 k_stored = make_float2(0.0f, 0.0f);
+    float2 v_stored = make_float2(0.0f, 0.0f);
+    if (key < p.L) {
+      const __nv_bfloat162* token =
+          reinterpret_cast<const __nv_bfloat162*>(p.qkv_device + (b * p.L + key) * qkv_row_size);
+      const float2 k_in =
+          __bfloat1622float2(token[(p.q_head_count + kv_head) * kHeadDim / 2 + lane]);
+      const float2 v_in = __bfloat1622float2(
+          token[(p.q_head_count + p.kv_head_count + kv_head) * kHeadDim / 2 + lane]);
+      const float2 k = normalize_and_rotate(k_in, 1.0f, seq_len + key, p.inv_freq_device, lane);
+      const __nv_fp8_e4m3 k_fp8[2] = {__nv_fp8_e4m3(k.x / *p.k_scale_device),
+                                      __nv_fp8_e4m3(k.y / *p.k_scale_device)};
+      const __nv_fp8_e4m3 v_fp8[2] = {__nv_fp8_e4m3(v_in.x / *p.v_scale_device),
+                                      __nv_fp8_e4m3(v_in.y / *p.v_scale_device)};
+      const int64_t offset =
+          (p.cache_loc_device[b * p.L + key] * p.kv_head_count + kv_head) * kHeadDim + 2 * lane;
+      p.k_cache_device[offset] = k_fp8[0];
+      p.k_cache_device[offset + 1] = k_fp8[1];
+      p.v_cache_device[offset] = v_fp8[0];
+      p.v_cache_device[offset + 1] = v_fp8[1];
+      k_stored = make_float2(static_cast<float>(k_fp8[0]), static_cast<float>(k_fp8[1]));
+      v_stored = make_float2(static_cast<float>(v_fp8[0]), static_cast<float>(v_fp8[1]));
+    }
+    tile.k[key][2 * lane] = k_stored.x;
+    tile.k[key][2 * lane + 1] = k_stored.y;
+    tile.v[key][2 * lane] = v_stored.x;
+    tile.v[key][2 * lane + 1] = v_stored.y;
+    if (lane == 0) {
+      tile.key_position[key] = key < p.L ? seq_len + key : -1;
+    }
+  }
+}
+
+/**
+ * @brief `attention_kernel` computes the gated attention output of one request and one KV head
+ * group, and writes the block's new keys and values to the cache.
  *
  * @param[in] p Kernel parameters; the grid is (KV heads, requests).
  *
@@ -350,58 +366,75 @@ __global__ void __launch_bounds__(kThreads) attention_kernel(const Params p) {
   const int group_size = p.q_head_count / p.kv_head_count;
   const int row_count = p.L * group_size;
   const int seq_len = p.seq_lens_device[b];
-  for (int index = threadIdx.x; index < row_count * kHeadDim; index += kThreads) {
-    const int row = index / kHeadDim;
+  const int warp = threadIdx.x / kWarpSize;
+  const int lane = threadIdx.x % kWarpSize;
+  const int qkv_row_size = (2 * p.q_head_count + 2 * p.kv_head_count) * kHeadDim;
+  for (int row = warp; row < row_count; row += kWarps) {
     const int head = kv_head * group_size + row % group_size;
-    const int64_t q_offset = ((b * p.L + row / group_size) * p.q_head_count + head) * kHeadDim;
-    tile.q[row][index % kHeadDim] = __bfloat162float(p.q_device[q_offset + index % kHeadDim]);
-  }
-  for (int row = threadIdx.x; row < row_count; row += kThreads) {
-    tile.row_max[row] = -INFINITY;
-    tile.row_sum[row] = 0.0f;
+    const __nv_bfloat162* q_in = reinterpret_cast<const __nv_bfloat162*>(
+        p.qkv_device + (b * p.L + row / group_size) * qkv_row_size + head * kHeadDim);
+    const float2 q = normalize_and_rotate(__bfloat1622float2(q_in[lane]), p.qk_scale_factor,
+                                          seq_len + row / group_size, p.inv_freq_device, lane);
+    tile.q[row][2 * lane] = __bfloat162float(__float2bfloat16(q.x));
+    tile.q[row][2 * lane + 1] = __bfloat162float(__float2bfloat16(q.y));
+    if (lane == 0) {
+      tile.row_max[row] = -INFINITY;
+      tile.row_sum[row] = 0.0f;
+    }
   }
   float accumulators[kAccumulatorCount] = {};
   const int first_position_incl = p.window == 0 ? 0 : max(0, seq_len - p.window + 1);
-  for (int start = first_position_incl; start < seq_len + p.L; start += kTileKeys) {
-    load_cached_tile(p, tile, b, kv_head, start, seq_len + p.L);
+  for (int start = first_position_incl; start < seq_len; start += kTileKeys) {
+    load_cached_tile(p, tile, b, kv_head, start, seq_len);
     __syncthreads();
     attend_tile(p, tile, accumulators, row_count, seq_len);
   }
+  load_new_tile(p, tile, b, kv_head, seq_len);
+  __syncthreads();
+  attend_tile(p, tile, accumulators, row_count, seq_len);
   write_gated_output(p, tile, accumulators, b, kv_head, row_count);
 }
 
 }  // namespace
 
 /**
- * @brief `prologue` checks the tensors and launches `prologue_kernel` on the current stream.
+ * @brief `run` checks the tensors and launches `attention_kernel` on the current stream.
  *
  * @param[in] qkv Fused projection output, bf16 [B, L, (2 Hq + 2 Hkv) * 64].
  * @param[in,out] k_cache FP8 key cache [pages, page_size, Hkv, 64]; the new keys are written.
  * @param[in,out] v_cache FP8 value cache, same shape; the new values are written.
+ * @param[in] page_table int32 [B, max_pages].
  * @param[in] seq_lens int32 [B].
  * @param[in] cache_loc int64 [B * L], the new tokens' flat cache rows.
  * @param[in] k_scale float32 [], key = e4m3 * k_scale.
  * @param[in] v_scale float32 [], value = e4m3 * v_scale.
  * @param[in] inv_freq float32 [32] RoPE inverse frequencies, or empty for no RoPE.
- * @param[out] q bf16 [B, L, Hq, 64], the prepared queries.
+ * @param[out] out bf16 [B, L, Hq * 64].
+ * @param[in] window Sliding window in tokens, or 0 for full attention.
  * @param[in] qk_scale_factor Query gain after the RMSNorm.
+ * @param[in] sm_scale Softmax scale.
  * @throws c10::Error A tensor has the wrong dtype, shape or layout.
  *
  * @par Example
  * @code
- * prologue(qkv, k_cache, v_cache, seq_lens, cache_loc, k_scale, v_scale, inv_freq, q, 5.473);
+ * run(qkv, k_cache, v_cache, page_table, seq_lens, cache_loc, k_scale, v_scale, inv_freq, out,
+ *     2048, 5.473, 0.125);
  * @endcode
  */
-void prologue(torch::Tensor qkv, torch::Tensor k_cache, torch::Tensor v_cache,
-              torch::Tensor seq_lens, torch::Tensor cache_loc, torch::Tensor k_scale,
-              torch::Tensor v_scale, torch::Tensor inv_freq, torch::Tensor q,
-              double qk_scale_factor) {
+void run(torch::Tensor qkv, torch::Tensor k_cache, torch::Tensor v_cache, torch::Tensor page_table,
+         torch::Tensor seq_lens, torch::Tensor cache_loc, torch::Tensor k_scale,
+         torch::Tensor v_scale, torch::Tensor inv_freq, torch::Tensor out, int64_t window,
+         double qk_scale_factor, double sm_scale) {
+  const int64_t q_head_count = out.size(2) / kHeadDim;
   TORCH_CHECK(qkv.is_contiguous() && k_cache.is_contiguous() && v_cache.is_contiguous() &&
-                  q.is_contiguous(),
+                  page_table.is_contiguous() && out.is_contiguous(),
               "tensors must be contiguous");
-  TORCH_CHECK(k_cache.size(3) == kHeadDim && q.size(3) == kHeadDim, "head_dim must be ", kHeadDim);
+  TORCH_CHECK(k_cache.size(3) == kHeadDim, "head_dim must be ", kHeadDim);
+  TORCH_CHECK(qkv.size(1) * q_head_count / k_cache.size(2) <= kMaxRows,
+              "L * Hq / Hkv must be <= ", kMaxRows);
   TORCH_CHECK(qkv.scalar_type() == at::kBFloat16 && k_cache.scalar_type() == at::kFloat8_e4m3fn &&
-                  seq_lens.scalar_type() == at::kInt && cache_loc.scalar_type() == at::kLong,
+                  page_table.scalar_type() == at::kInt && seq_lens.scalar_type() == at::kInt &&
+                  cache_loc.scalar_type() == at::kLong && out.scalar_type() == at::kBFloat16,
               "unexpected dtype");
   Params p{};
   p.qkv_device = reinterpret_cast<const __nv_bfloat16*>(qkv.data_ptr());
@@ -412,76 +445,26 @@ void prologue(torch::Tensor qkv, torch::Tensor k_cache, torch::Tensor v_cache,
   p.k_scale_device = k_scale.data_ptr<float>();
   p.v_scale_device = v_scale.data_ptr<float>();
   p.inv_freq_device = inv_freq.numel() == 0 ? nullptr : inv_freq.data_ptr<float>();
-  p.q_device = reinterpret_cast<__nv_bfloat16*>(q.data_ptr());
-  p.L = static_cast<int>(qkv.size(1));
-  p.q_head_count = static_cast<int>(q.size(2));
-  p.kv_head_count = static_cast<int>(k_cache.size(2));
-  p.qk_scale_factor = static_cast<float>(qk_scale_factor);
-  prologue_kernel<<<qkv.size(0) * qkv.size(1), kPrologueWarps * kWarpSize, 0,
-                    at::cuda::getCurrentCUDAStream()>>>(p);
-  C10_CUDA_KERNEL_LAUNCH_CHECK();
-}
-
-/**
- * @brief `attend` checks the tensors and launches `attention_kernel` on the current stream.
- *
- * @param[in] qkv Fused projection output, bf16 [B, L, (2 Hq + 2 Hkv) * 64], for the gate.
- * @param[in] q bf16 [B, L, Hq, 64], the queries `prologue` prepared.
- * @param[in] k_cache FP8 key cache [pages, page_size, Hkv, 64], with the block's new keys.
- * @param[in] v_cache FP8 value cache, same shape, with the block's new values.
- * @param[in] page_table int32 [B, max_pages].
- * @param[in] seq_lens int32 [B].
- * @param[in] k_scale float32 [], key = e4m3 * k_scale.
- * @param[in] v_scale float32 [], value = e4m3 * v_scale.
- * @param[out] out bf16 [B, L, Hq * 64].
- * @param[in] window Sliding window in tokens, or 0 for full attention.
- * @param[in] sm_scale Softmax scale.
- * @throws c10::Error A tensor has the wrong dtype, shape or layout.
- *
- * @par Example
- * @code
- * attend(qkv, q, k_cache, v_cache, page_table, seq_lens, k_scale, v_scale, out, 2048, 0.125);
- * @endcode
- */
-void attend(torch::Tensor qkv, torch::Tensor q, torch::Tensor k_cache, torch::Tensor v_cache,
-            torch::Tensor page_table, torch::Tensor seq_lens, torch::Tensor k_scale,
-            torch::Tensor v_scale, torch::Tensor out, int64_t window, double sm_scale) {
-  TORCH_CHECK(page_table.is_contiguous() && out.is_contiguous() && q.is_contiguous(),
-              "tensors must be contiguous");
-  TORCH_CHECK(q.size(1) * q.size(2) / k_cache.size(2) <= kMaxRows,
-              "L * Hq / Hkv must be <= ", kMaxRows);
-  TORCH_CHECK(page_table.scalar_type() == at::kInt && out.scalar_type() == at::kBFloat16,
-              "unexpected dtype");
-  Params p{};
-  p.qkv_device = reinterpret_cast<const __nv_bfloat16*>(qkv.data_ptr());
-  p.k_cache_device = reinterpret_cast<__nv_fp8_e4m3*>(k_cache.data_ptr());
-  p.v_cache_device = reinterpret_cast<__nv_fp8_e4m3*>(v_cache.data_ptr());
-  p.seq_lens_device = seq_lens.data_ptr<int>();
-  p.k_scale_device = k_scale.data_ptr<float>();
-  p.v_scale_device = v_scale.data_ptr<float>();
-  p.q_device = reinterpret_cast<__nv_bfloat16*>(q.data_ptr());
   p.page_table_device = page_table.data_ptr<int>();
   p.out_device = reinterpret_cast<__nv_bfloat16*>(out.data_ptr());
-  p.L = static_cast<int>(q.size(1));
-  p.q_head_count = static_cast<int>(q.size(2));
+  p.L = static_cast<int>(qkv.size(1));
+  p.q_head_count = static_cast<int>(q_head_count);
   p.kv_head_count = static_cast<int>(k_cache.size(2));
   p.page_size = static_cast<int>(k_cache.size(1));
   p.page_table_stride = static_cast<int>(page_table.size(1));
   p.window = static_cast<int>(window);
+  p.qk_scale_factor = static_cast<float>(qk_scale_factor);
   p.sm_scale = static_cast<float>(sm_scale);
-  attention_kernel<<<dim3(k_cache.size(2), q.size(0)), kThreads, 0,
+  attention_kernel<<<dim3(k_cache.size(2), qkv.size(0)), kThreads, 0,
                      at::cuda::getCurrentCUDAStream()>>>(p);
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 """
 CPP_SOURCE: str = (
-    "void prologue(torch::Tensor qkv, torch::Tensor k_cache, torch::Tensor v_cache, "
-    "torch::Tensor seq_lens, torch::Tensor cache_loc, torch::Tensor k_scale, "
-    "torch::Tensor v_scale, torch::Tensor inv_freq, torch::Tensor q, double qk_scale_factor);"
-    "void attend(torch::Tensor qkv, torch::Tensor q, torch::Tensor k_cache, "
-    "torch::Tensor v_cache, torch::Tensor page_table, torch::Tensor seq_lens, "
-    "torch::Tensor k_scale, torch::Tensor v_scale, torch::Tensor out, int64_t window, "
-    "double sm_scale);"
+    "void run(torch::Tensor qkv, torch::Tensor k_cache, torch::Tensor v_cache, "
+    "torch::Tensor page_table, torch::Tensor seq_lens, torch::Tensor cache_loc, "
+    "torch::Tensor k_scale, torch::Tensor v_scale, torch::Tensor inv_freq, torch::Tensor out, "
+    "int64_t window, double qk_scale_factor, double sm_scale);"
 )
 HEAD_DIM: int = 64
 ROPE_PAIR_STRIDE: int = 2
@@ -496,14 +479,14 @@ def _get_extension() -> object:
         The compiled extension.
 
     Example:
-        >>> _get_extension().prologue(...)
+        >>> _get_extension().run(...)
     """
     if "module" not in _extension_cache:
         _extension_cache["module"] = load_inline(
-            name="muse_fused_attention_two_kernels",
+            name="muse_fused_attention_one_kernel",
             cpp_sources=CPP_SOURCE,
             cuda_sources=CUDA_SOURCE,
-            functions=["prologue", "attend"],
+            functions=["run"],
             extra_cuda_cflags=["-O3"],
         )
     return _extension_cache["module"]
@@ -544,35 +527,24 @@ def kernel_fn(data: dict) -> torch.Tensor:
         >>> out = kernel_fn(data)
     """
     config: dict = data["config"]
-    q: torch.Tensor = torch.empty(
-        (config["batch"], config["q_len"], config["num_q_heads"], HEAD_DIM),
+    out: torch.Tensor = torch.empty(
+        (config["batch"], config["q_len"], config["num_q_heads"] * HEAD_DIM),
         dtype=torch.bfloat16,
         device=data["qkv"].device,
     )
-    _get_extension().prologue(
+    _get_extension().run(
         data["qkv"],
         data["k_cache"],
         data["v_cache"],
+        data["page_table"],
         data["seq_lens"],
         data["cache_loc"],
         data["k_scale"],
         data["v_scale"],
         _get_inv_freq(config["rope_theta"], data["qkv"].device),
-        q,
-        config["qk_scale_factor"],
-    )
-    out: torch.Tensor = torch.empty_like(q).view(q.shape[0], q.shape[1], -1)
-    _get_extension().attend(
-        data["qkv"],
-        q,
-        data["k_cache"],
-        data["v_cache"],
-        data["page_table"],
-        data["seq_lens"],
-        data["k_scale"],
-        data["v_scale"],
         out,
         config["window"],
+        config["qk_scale_factor"],
         config["sm_scale"],
     )
     return out
