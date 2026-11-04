@@ -1,17 +1,21 @@
 # okc: problem=muse_attention_decode
 """`fused_attention.py` computes muse_attention_decode in one readable CUDA kernel.
 
-Each request's keys are split into chunks, and one thread block handles one chunk of one request
-and one key/value head, for every query head of that group and every token of the block. It:
+Each request's keys are split into chunks, and one thread block of 4 warps handles one chunk of
+one request and one key/value head, for every query head of that group and every token of the
+block. It:
 
 1. RMS-normalizes the queries, scales them by `qk_scale_factor`, applies RoPE on sliding layers and
    rounds them to bf16, as `reference.py` does.
-2. Streams its chunk of cached keys and values through shared memory, 32 keys at a time, and folds
-   each tile into an online softmax on CUDA cores.
+2. Streams its chunk of cached FP8 keys and values 64 at a time: registers hold the next step's
+   bytes while the current step is converted to fp16 in shared memory. Each warp attends its 16
+   query rows over its share of the step's keys: S = Q K^T and O += P V run on tensor cores
+   (`mma.sync`), with an online softmax in between.
 3. In the first chunk's block only: normalizes the block's new keys, applies RoPE, writes the new
-   keys and values to the FP8 cache, and attends to them as one last, causal tile.
-4. Publishes its softmax state. The last block of the request and KV head to finish merges every
-   chunk's state, divides by the softmax sum, and applies the per-head RMSNorm and sigmoid gate.
+   keys and values to the FP8 cache, and attends to them as one last, causal step.
+4. Combines its warps' softmax states and publishes the block's state. The last block of the
+   request and KV head to finish merges every chunk's state, divides by the softmax sum, and
+   applies the per-head RMSNorm and the sigmoid gate.
 
 Interface:
     kernel_fn(data): `TASK.md`'s timed call; returns bfloat16 [B, L, Hq * 64].
@@ -21,7 +25,9 @@ Example:
 
 Must know:
     Gotchas:
-        - The arrival counters live across calls; the merging block resets its counter to 0.
+        - The arrival counters live across calls; each merging block resets its counter to 0.
+    Performance:
+        - The page-table reads for a step are issued one step before its keys and values.
 """
 
 import torch
@@ -39,24 +45,21 @@ namespace {
 constexpr int kHeadDim = 64;
 constexpr int kWarpSize = 32;
 constexpr int kMaxRows = 64;
-constexpr int kTileKeys = 32;
 constexpr int kThreads = 128;
 constexpr int kWarps = kThreads / kWarpSize;
-constexpr int kRowsPerPass = kThreads / kHeadDim;
-constexpr int kAccumulatorCount = kMaxRows / kRowsPerPass;
-constexpr int kBytesPerLoad = 16;
-constexpr int kLoadsPerRow = kHeadDim / kBytesPerLoad;
 constexpr int kStepKeys = 64;
 constexpr int kMmaRows = 16;
 constexpr int kMmaCols = 8;
-constexpr int kDimTiles = kHeadDim / kMmaCols;
-constexpr int kRowStride = kHeadDim + 8;
-constexpr int kLoadsPerThread = kStepKeys * kLoadsPerRow / kThreads;
-constexpr int kMaxSplits = 64;
 constexpr int kMmaDepth = 16;
 constexpr int kChunkKeys = 16;
 constexpr int kChunksPerStep = kStepKeys / kChunkKeys;
+constexpr int kDimTiles = kHeadDim / kMmaCols;
 constexpr int kDepthSteps = kHeadDim / kMmaDepth;
+constexpr int kRowStride = kHeadDim + 8;
+constexpr int kBytesPerLoad = 16;
+constexpr int kLoadsPerRow = kHeadDim / kBytesPerLoad;
+constexpr int kLoadsPerThread = kStepKeys * kLoadsPerRow / kThreads;
+constexpr int kMaxSplits = 64;
 constexpr float kRmsEps = 1e-5f;
 constexpr float kLog2e = 1.4426950408889634f;
 
@@ -80,18 +83,6 @@ struct Params {
   float* partial_sum_device;
   int* arrival_count_device;
   int split_count, keys_per_split;
-};
-
-struct ScalarTile {
-  float q[kMaxRows][kHeadDim];
-  float k[kTileKeys][kHeadDim + 1];
-  float v[kTileKeys][kHeadDim];
-  float p[kMaxRows][kTileKeys];
-  int key_position[kTileKeys];
-  float row_max[kMaxRows];
-  float row_sum[kMaxRows];
-  float row_rescale[kMaxRows];
-  bool is_last_split;
 };
 
 struct SharedTile {
@@ -149,24 +140,6 @@ __device__ float warp_sum(float x) {
 }
 
 /**
- * @brief `warp_max` returns the maximum of `x` over the 32 lanes of a warp, in every lane.
- *
- * @param[in] x This lane's value.
- * @return The warp-wide maximum.
- *
- * @par Example
- * @code
- * float tile_max = warp_max(score);
- * @endcode
- */
-__device__ float warp_max(float x) {
-  for (int offset = kWarpSize / 2; offset > 0; offset /= 2) {
-    x = fmaxf(x, __shfl_xor_sync(0xffffffffu, x, offset));
-  }
-  return x;
-}
-
-/**
  * @brief `normalize_and_rotate` RMS-normalizes one 64-wide head vector held by a warp, scales it,
  * and applies interleaved RoPE.
  *
@@ -196,211 +169,42 @@ __device__ float2 normalize_and_rotate(float2 x, float gain, int position,
 }
 
 /**
- * @brief `load_cached_tile` copies up to 32 keys and values of one request and KV head from the
- * paged FP8 cache into shared memory, and marks missing keys with position -1.
+ * @brief `write_gated_output` divides each query row's merged output by its softmax sum, applies
+ * the per-head RMSNorm and the sigmoid gate, and writes the result as bf16.
  *
  * @param[in] p Kernel parameters.
- * @param[out] tile Shared memory tile.
- * @param[in] b Request index.
- * @param[in] kv_head Key/value head index.
- * @param[in] first_position_incl First key position of the tile.
- * @param[in] end_position_excl Keys at or after this position are missing.
- *
- * @par Example
- * @code
- * load_cached_tile(p, tile, b, kv_head, start, seq_len + p.L);
- * @endcode
- */
-__device__ void load_cached_tile(const Params& p, ScalarTile& tile, int b, int kv_head,
-                                 int first_position_incl, int end_position_excl) {
-  const int key = threadIdx.x / kLoadsPerRow;
-  const int chunk = threadIdx.x % kLoadsPerRow;
-  const int position = first_position_incl + key;
-  const bool is_present = position < end_position_excl;
-  uint4 k_bytes = make_uint4(0, 0, 0, 0);
-  uint4 v_bytes = make_uint4(0, 0, 0, 0);
-  if (is_present) {
-    const int page = p.page_table_device[b * p.page_table_stride + position / p.page_size];
-    const int64_t row = static_cast<int64_t>(page) * p.page_size + position % p.page_size;
-    const int64_t offset = (row * p.kv_head_count + kv_head) * kHeadDim + chunk * kBytesPerLoad;
-    k_bytes = *reinterpret_cast<const uint4*>(p.k_cache_device + offset);
-    v_bytes = *reinterpret_cast<const uint4*>(p.v_cache_device + offset);
-  }
-  const __nv_fp8_e4m3* k_values = reinterpret_cast<const __nv_fp8_e4m3*>(&k_bytes);
-  const __nv_fp8_e4m3* v_values = reinterpret_cast<const __nv_fp8_e4m3*>(&v_bytes);
-  for (int i = 0; i < kBytesPerLoad; ++i) {
-    tile.k[key][chunk * kBytesPerLoad + i] = static_cast<float>(k_values[i]);
-    tile.v[key][chunk * kBytesPerLoad + i] = static_cast<float>(v_values[i]);
-  }
-  if (chunk == 0) {
-    tile.key_position[key] = is_present ? position : -1;
-  }
-}
-
-/**
- * @brief `attend_tile` folds the keys in shared memory into every query row's online softmax and
- * output accumulator.
- *
- * @param[in] p Kernel parameters.
- * @param[in,out] tile Shared memory tile; its scores and per-row softmax state are updated.
- * @param[in,out] accumulators This thread's unnormalized outputs, for rows
- * `threadIdx.x / 64 + 2 i` and dimension `threadIdx.x % 64`.
- * @param[in] row_count Query rows (L x query heads per KV head).
- * @param[in] seq_len Cached tokens of this request: the first new token's position.
- *
- * @par Example
- * @code
- * attend_tile(p, tile, accumulators, row_count, seq_len);
- * @endcode
- */
-__device__ void attend_tile(const Params& p, ScalarTile& tile, float* accumulators, int row_count,
-                            int seq_len) {
-  const int group_size = p.q_head_count / p.kv_head_count;
-  const float logit_scale = p.sm_scale * *p.k_scale_device;
-  for (int index = threadIdx.x; index < row_count * kTileKeys; index += kThreads) {
-    const int row = index / kTileKeys;
-    const int key = index % kTileKeys;
-    float dot = 0.0f;
-    for (int d = 0; d < kHeadDim; ++d) {
-      dot += tile.q[row][d] * tile.k[key][d];
-    }
-    const int key_position = tile.key_position[key];
-    const int query_position = seq_len + row / group_size;
-    const bool is_visible = key_position >= 0 && key_position <= query_position &&
-                            (p.window == 0 || key_position > query_position - p.window);
-    tile.p[row][key] = is_visible ? dot * logit_scale : -INFINITY;
-  }
-  __syncthreads();
-  const int warp = threadIdx.x / kWarpSize;
-  const int lane = threadIdx.x % kWarpSize;
-  for (int row = warp; row < row_count; row += kWarps) {
-    const float score = tile.p[row][lane];
-    const float old_max = tile.row_max[row];
-    const float new_max = fmaxf(old_max, warp_max(score));
-    const float safe_max = new_max == -INFINITY ? 0.0f : new_max;
-    const float probability = expf(score - safe_max);
-    const float tile_sum = warp_sum(probability);
-    tile.p[row][lane] = probability;
-    if (lane == 0) {
-      tile.row_rescale[row] = expf(old_max - safe_max);
-      tile.row_sum[row] = tile.row_sum[row] * tile.row_rescale[row] + tile_sum;
-      tile.row_max[row] = new_max;
-    }
-  }
-  __syncthreads();
-  const int d = threadIdx.x % kHeadDim;
-#pragma unroll
-  for (int i = 0; i < kAccumulatorCount; ++i) {
-    const int row = threadIdx.x / kHeadDim + kRowsPerPass * i;
-    if (row < row_count) {
-      float pv = 0.0f;
-      for (int key = 0; key < kTileKeys; ++key) {
-        pv += tile.p[row][key] * tile.v[key][d];
-      }
-      accumulators[i] = accumulators[i] * tile.row_rescale[row] + pv;
-    }
-  }
-  __syncthreads();
-}
-
-/**
- * @brief `write_gated_output` divides each query row's accumulated output by its softmax sum,
- * applies the per-head RMSNorm and the sigmoid gate, and writes the result as bf16.
- *
- * @param[in] p Kernel parameters.
- * @param[in,out] tile Shared memory tile; its query rows are reused for the outputs.
- * @param[in] accumulators This thread's unnormalized outputs (see `attend_tile`).
+ * @param[in] tile Shared memory tile with the merged, unnormalized outputs and row sums.
  * @param[in] b Request index.
  * @param[in] kv_head Key/value head index.
  * @param[in] row_count Query rows (L x query heads per KV head).
  *
  * @par Example
  * @code
- * write_gated_output(p, tile, accumulators, b, kv_head, row_count);
+ * write_gated_output(p, tile, b, kv_head, row_count);
  * @endcode
  */
-__device__ void write_gated_output(const Params& p, ScalarTile& tile, const float* accumulators,
-                                   int b, int kv_head, int row_count) {
+__device__ void write_gated_output(const Params& p, const SharedTile& tile, int b, int kv_head,
+                                   int row_count) {
   const int warp = threadIdx.x / kWarpSize;
   const int lane = threadIdx.x % kWarpSize;
   const int group_size = p.q_head_count / p.kv_head_count;
   const int qkv_row_size = (2 * p.q_head_count + 2 * p.kv_head_count) * kHeadDim;
-  const float v_scale = *p.v_scale_device;
-#pragma unroll
-  for (int i = 0; i < kAccumulatorCount; ++i) {
-    const int row = threadIdx.x / kHeadDim + kRowsPerPass * i;
-    if (row < row_count) {
-      tile.q[row][threadIdx.x % kHeadDim] = accumulators[i] / tile.row_sum[row] * v_scale;
-    }
-  }
-  __syncthreads();
   for (int row = warp; row < row_count; row += kWarps) {
     const int token = b * p.L + row / group_size;
     const int head = kv_head * group_size + row % group_size;
-    const float2 o = make_float2(tile.q[row][2 * lane], tile.q[row][2 * lane + 1]);
+    const float scale = *p.v_scale_device / tile.row_sum[row];
+    const float2 o =
+        make_float2(tile.out[row][2 * lane] * scale, tile.out[row][2 * lane + 1] * scale);
     const float inv_rms = rsqrtf(warp_sum(o.x * o.x + o.y * o.y) / kHeadDim + kRmsEps);
     const __nv_bfloat162* gate = reinterpret_cast<const __nv_bfloat162*>(
         p.qkv_device + token * qkv_row_size +
         (p.q_head_count + 2 * p.kv_head_count + head) * kHeadDim);
     const float2 g = __bfloat1622float2(gate[lane]);
-    const float2 out =
+    const float2 gated =
         make_float2(o.x * inv_rms / (1.0f + expf(-g.x)), o.y * inv_rms / (1.0f + expf(-g.y)));
     __nv_bfloat162* out_row = reinterpret_cast<__nv_bfloat162*>(
         p.out_device + (token * p.q_head_count + head) * kHeadDim);
-    out_row[lane] = __float22bfloat162_rn(out);
-  }
-}
-
-/**
- * @brief `load_new_tile` normalizes and rotates the block's L new keys, writes them and their
- * values to the FP8 cache, and puts the stored (FP8-rounded) values in shared memory.
- *
- * @param[in] p Kernel parameters.
- * @param[out] tile Shared memory tile.
- * @param[in] b Request index.
- * @param[in] kv_head Key/value head index.
- * @param[in] seq_len Cached tokens of this request: the first new token's position.
- *
- * @par Example
- * @code
- * load_new_tile(p, tile, b, kv_head, seq_len);
- * @endcode
- */
-__device__ void load_new_tile(const Params& p, ScalarTile& tile, int b, int kv_head, int seq_len) {
-  const int warp = threadIdx.x / kWarpSize;
-  const int lane = threadIdx.x % kWarpSize;
-  const int qkv_row_size = (2 * p.q_head_count + 2 * p.kv_head_count) * kHeadDim;
-  for (int key = warp; key < kTileKeys; key += kWarps) {
-    float2 k_stored = make_float2(0.0f, 0.0f);
-    float2 v_stored = make_float2(0.0f, 0.0f);
-    if (key < p.L) {
-      const __nv_bfloat162* token =
-          reinterpret_cast<const __nv_bfloat162*>(p.qkv_device + (b * p.L + key) * qkv_row_size);
-      const float2 k_in =
-          __bfloat1622float2(token[(p.q_head_count + kv_head) * kHeadDim / 2 + lane]);
-      const float2 v_in = __bfloat1622float2(
-          token[(p.q_head_count + p.kv_head_count + kv_head) * kHeadDim / 2 + lane]);
-      const float2 k = normalize_and_rotate(k_in, 1.0f, seq_len + key, p.inv_freq_device, lane);
-      const __nv_fp8_e4m3 k_fp8[2] = {__nv_fp8_e4m3(k.x / *p.k_scale_device),
-                                      __nv_fp8_e4m3(k.y / *p.k_scale_device)};
-      const __nv_fp8_e4m3 v_fp8[2] = {__nv_fp8_e4m3(v_in.x / *p.v_scale_device),
-                                      __nv_fp8_e4m3(v_in.y / *p.v_scale_device)};
-      const int64_t offset =
-          (p.cache_loc_device[b * p.L + key] * p.kv_head_count + kv_head) * kHeadDim + 2 * lane;
-      p.k_cache_device[offset] = k_fp8[0];
-      p.k_cache_device[offset + 1] = k_fp8[1];
-      p.v_cache_device[offset] = v_fp8[0];
-      p.v_cache_device[offset + 1] = v_fp8[1];
-      k_stored = make_float2(static_cast<float>(k_fp8[0]), static_cast<float>(k_fp8[1]));
-      v_stored = make_float2(static_cast<float>(v_fp8[0]), static_cast<float>(v_fp8[1]));
-    }
-    tile.k[key][2 * lane] = k_stored.x;
-    tile.k[key][2 * lane + 1] = k_stored.y;
-    tile.v[key][2 * lane] = v_stored.x;
-    tile.v[key][2 * lane + 1] = v_stored.y;
-    if (lane == 0) {
-      tile.key_position[key] = key < p.L ? seq_len + key : -1;
-    }
+    out_row[lane] = __float22bfloat162_rn(gated);
   }
 }
 
@@ -634,142 +438,6 @@ __device__ void store_new_keys(const Params& p, SharedTile& tile, int b, int kv_
 }
 
 /**
- * @brief `merge_splits` publishes this block's softmax state and, in the last block of its
- * request and KV head to arrive, merges every split's state.
- *
- * @param[in] p Kernel parameters.
- * @param[in,out] tile Shared memory tile; the merging block gets the merged row sums.
- * @param[in,out] accumulators This thread's unnormalized outputs (see `attend_tile`); the merging
- * block gets the merged outputs.
- * @param[in] b Request index.
- * @param[in] kv_head Key/value head index.
- * @param[in] split This block's split.
- * @param[in] row_count Query rows (L x query heads per KV head).
- * @return Whether this block merged and must write the output.
- *
- * @par Example
- * @code
- * if (merge_splits(p, tile, accumulators, b, kv_head, split, row_count)) { ... }
- * @endcode
- */
-__device__ bool merge_splits(const Params& p, ScalarTile& tile, float* accumulators, int b,
-                             int kv_head, int split, int row_count) {
-  const int group = b * p.kv_head_count + kv_head;
-  const int64_t first_slot = static_cast<int64_t>(group) * p.split_count * kMaxRows;
-  const int64_t own_slot = first_slot + static_cast<int64_t>(split) * kMaxRows;
-  const int d = threadIdx.x % kHeadDim;
-#pragma unroll
-  for (int i = 0; i < kAccumulatorCount; ++i) {
-    const int row = threadIdx.x / kHeadDim + kRowsPerPass * i;
-    if (row < row_count) {
-      p.partial_out_device[(own_slot + row) * kHeadDim + d] = accumulators[i];
-    }
-  }
-  for (int row = threadIdx.x; row < row_count; row += kThreads) {
-    p.partial_max_device[own_slot + row] = tile.row_max[row];
-    p.partial_sum_device[own_slot + row] = tile.row_sum[row];
-  }
-  __threadfence();
-  __syncthreads();
-  if (threadIdx.x == 0) {
-    tile.is_last_split = atomicAdd(&p.arrival_count_device[group], 1) == p.split_count - 1;
-  }
-  __syncthreads();
-  if (!tile.is_last_split) {
-    return false;
-  }
-  __threadfence();
-  for (int row = threadIdx.x; row < row_count; row += kThreads) {
-    float merged_max = -INFINITY;
-    for (int s = 0; s < p.split_count; ++s) {
-      merged_max =
-          fmaxf(merged_max, __ldcg(&p.partial_max_device[first_slot + s * kMaxRows + row]));
-    }
-    float merged_sum = 0.0f;
-    for (int s = 0; s < p.split_count; ++s) {
-      const int64_t slot = first_slot + s * kMaxRows + row;
-      merged_sum += __ldcg(&p.partial_sum_device[slot]) *
-                    expf(__ldcg(&p.partial_max_device[slot]) - merged_max);
-    }
-    tile.row_max[row] = merged_max;
-    tile.row_sum[row] = merged_sum;
-  }
-  __syncthreads();
-#pragma unroll
-  for (int i = 0; i < kAccumulatorCount; ++i) {
-    const int row = threadIdx.x / kHeadDim + kRowsPerPass * i;
-    if (row < row_count) {
-      float merged_out = 0.0f;
-      for (int s = 0; s < p.split_count; ++s) {
-        const int64_t slot = first_slot + s * kMaxRows + row;
-        merged_out += __ldcg(&p.partial_out_device[slot * kHeadDim + d]) *
-                      expf(__ldcg(&p.partial_max_device[slot]) - tile.row_max[row]);
-      }
-      accumulators[i] = merged_out;
-    }
-  }
-  if (threadIdx.x == 0) {
-    p.arrival_count_device[group] = 0;
-  }
-  return true;
-}
-
-/**
- * @brief `attention_kernel` attends one split of one request's keys for one KV head group; the
- * first split also writes the block's new keys and values, and the last to finish writes the
- * output.
- *
- * @param[in] p Kernel parameters; the grid is (splits, KV heads, requests).
- *
- * @par Example
- * @code
- * attention_kernel<<<dim3(split_count, kv_head_count, B), kThreads, 0, stream>>>(p);
- * @endcode
- */
-__global__ void __launch_bounds__(kThreads) attention_kernel(const Params p) {
-  __shared__ ScalarTile tile;
-  const int split = blockIdx.x;
-  const int kv_head = blockIdx.y;
-  const int b = blockIdx.z;
-  const int group_size = p.q_head_count / p.kv_head_count;
-  const int row_count = p.L * group_size;
-  const int seq_len = p.seq_lens_device[b];
-  const int warp = threadIdx.x / kWarpSize;
-  const int lane = threadIdx.x % kWarpSize;
-  const int qkv_row_size = (2 * p.q_head_count + 2 * p.kv_head_count) * kHeadDim;
-  for (int row = warp; row < row_count; row += kWarps) {
-    const int head = kv_head * group_size + row % group_size;
-    const __nv_bfloat162* q_in = reinterpret_cast<const __nv_bfloat162*>(
-        p.qkv_device + (b * p.L + row / group_size) * qkv_row_size + head * kHeadDim);
-    const float2 q = normalize_and_rotate(__bfloat1622float2(q_in[lane]), p.qk_scale_factor,
-                                          seq_len + row / group_size, p.inv_freq_device, lane);
-    tile.q[row][2 * lane] = __bfloat162float(__float2bfloat16(q.x));
-    tile.q[row][2 * lane + 1] = __bfloat162float(__float2bfloat16(q.y));
-    if (lane == 0) {
-      tile.row_max[row] = -INFINITY;
-      tile.row_sum[row] = 0.0f;
-    }
-  }
-  float accumulators[kAccumulatorCount] = {};
-  const int window_start_incl = p.window == 0 ? 0 : max(0, seq_len - p.window + 1);
-  const int first_position_incl = window_start_incl + split * p.keys_per_split;
-  const int end_position_excl = min(first_position_incl + p.keys_per_split, seq_len);
-  for (int start = first_position_incl; start < end_position_excl; start += kTileKeys) {
-    load_cached_tile(p, tile, b, kv_head, start, end_position_excl);
-    __syncthreads();
-    attend_tile(p, tile, accumulators, row_count, seq_len);
-  }
-  if (split == 0) {
-    load_new_tile(p, tile, b, kv_head, seq_len);
-    __syncthreads();
-    attend_tile(p, tile, accumulators, row_count, seq_len);
-  }
-  if (merge_splits(p, tile, accumulators, b, kv_head, split, row_count)) {
-    write_gated_output(p, tile, accumulators, b, kv_head, row_count);
-  }
-}
-
-/**
  * @brief `attend_chunk` folds 16 keys from shared memory into one warp's online softmax over its
  * 16 query rows: S = Q K^T and O += P V on tensor cores, the masks and the rescaling in between.
  *
@@ -959,6 +627,108 @@ __device__ bool merge_splits(const Params& p, SharedTile& tile, int b, int kv_he
   return true;
 }
 
+/**
+ * @brief `attention_kernel` attends one split of one request's keys for one KV head group; the
+ * first split also writes the block's new keys and values, and the last to finish writes the
+ * output.
+ *
+ * @param[in] p Kernel parameters; the grid is (splits, KV heads, requests).
+ *
+ * @par Example
+ * @code
+ * attention_kernel<<<dim3(split_count, kv_head_count, B), kThreads, sizeof(SharedTile),
+ * stream>>>(p);
+ * @endcode
+ */
+__global__ void __launch_bounds__(kThreads) attention_kernel(const Params p) {
+  extern __shared__ __align__(16) unsigned char shared_bytes[];
+  SharedTile& tile = *reinterpret_cast<SharedTile*>(shared_bytes);
+  const int split = blockIdx.x;
+  const int kv_head = blockIdx.y;
+  const int b = blockIdx.z;
+  const int warp = threadIdx.x / kWarpSize;
+  const int lane = threadIdx.x % kWarpSize;
+  const int group_size = p.q_head_count / p.kv_head_count;
+  const int row_count = p.L * group_size;
+  const int m_tile_count = (row_count + kMmaRows - 1) / kMmaRows;
+  const int key_group_count = kWarps / m_tile_count;
+  const int m_tile = warp % m_tile_count;
+  const int key_group = warp / m_tile_count;
+  const bool is_active = key_group < key_group_count;
+  const int chunks_per_warp = kChunksPerStep / key_group_count;
+  const int seq_len = p.seq_lens_device[b];
+  const int window_start_incl = p.window == 0 ? 0 : max(0, seq_len - p.window + 1);
+  const int first_position_incl = window_start_incl + split * p.keys_per_split;
+  const int end_position_excl = min(first_position_incl + p.keys_per_split, seq_len);
+  KeyAddresses next_addresses = locate_keys(p, b, kv_head, first_position_incl, end_position_excl);
+  RawKeys next = load_raw_keys(p, kv_head, next_addresses);
+  next_addresses = locate_keys(p, b, kv_head, first_position_incl + kStepKeys, end_position_excl);
+  const int qkv_row_size = (2 * p.q_head_count + 2 * p.kv_head_count) * kHeadDim;
+  for (int row = warp; row < m_tile_count * kMmaRows; row += kWarps) {
+    float2 q = make_float2(0.0f, 0.0f);
+    if (row < row_count) {
+      const int head = kv_head * group_size + row % group_size;
+      const __nv_bfloat162* q_in = reinterpret_cast<const __nv_bfloat162*>(
+          p.qkv_device + (b * p.L + row / group_size) * qkv_row_size + head * kHeadDim);
+      q = normalize_and_rotate(__bfloat1622float2(q_in[lane]), p.qk_scale_factor,
+                               seq_len + row / group_size, p.inv_freq_device, lane);
+    }
+    const __nv_bfloat162 q_bf16 = __float22bfloat162_rn(q);
+    reinterpret_cast<__half2*>(&tile.q[row][0])[lane] =
+        __float22half2_rn(__bfloat1622float2(q_bf16));
+  }
+  __syncthreads();
+  uint32_t q_fragments[kDepthSteps][4];
+  for (int depth = 0; depth < kDepthSteps; ++depth) {
+    load_matrices<false>(q_fragments[depth],
+                         &tile.q[m_tile * kMmaRows + 8 * ((lane / 8) % 2) + lane % 8]
+                                [kMmaDepth * depth + 8 * (lane / 16)]);
+  }
+  WarpState state = {};
+  state.max_log2[0] = state.max_log2[1] = -INFINITY;
+  const float logit_scale_log2 = p.sm_scale * *p.k_scale_device * kLog2e;
+  const int first_row = m_tile * kMmaRows;
+  for (int start = first_position_incl; start < end_position_excl; start += kStepKeys) {
+    const RawKeys current = next;
+    next = load_raw_keys(p, kv_head, next_addresses);
+    next_addresses = locate_keys(p, b, kv_head, start + 2 * kStepKeys, end_position_excl);
+    store_raw_keys(current, tile);
+    __syncthreads();
+    for (int chunk = 0; is_active && chunk < chunks_per_warp; ++chunk) {
+      attend_chunk(p, tile, q_fragments, (key_group * chunks_per_warp + chunk) * kChunkKeys,
+                   first_row, seq_len, logit_scale_log2, state);
+    }
+    __syncthreads();
+  }
+  if (split == 0) {
+    store_new_keys(p, tile, b, kv_head, seq_len);
+    __syncthreads();
+    for (int chunk = 0; is_active && chunk < chunks_per_warp; ++chunk) {
+      attend_chunk(p, tile, q_fragments, (key_group * chunks_per_warp + chunk) * kChunkKeys,
+                   first_row, seq_len, logit_scale_log2, state);
+    }
+  }
+  for (int half = 0; half < 2 && is_active; ++half) {
+    state.sum[half] += __shfl_xor_sync(0xffffffffu, state.sum[half], 1);
+    state.sum[half] += __shfl_xor_sync(0xffffffffu, state.sum[half], 2);
+    const int row = lane / 4 + 8 * half;
+    if (lane % 4 == 0) {
+      tile.warp_max[warp][row] = state.max_log2[half];
+      tile.warp_sum[warp][row] = state.sum[half];
+    }
+    for (int d = 0; d < kDimTiles; ++d) {
+      tile.warp_out[warp][row][d * kMmaCols + 2 * (lane % 4)] = state.out[d][2 * half];
+      tile.warp_out[warp][row][d * kMmaCols + 2 * (lane % 4) + 1] = state.out[d][2 * half + 1];
+    }
+  }
+  __syncthreads();
+  combine_warps(tile, row_count, m_tile_count, key_group_count);
+  __syncthreads();
+  if (merge_splits(p, tile, b, kv_head, split, row_count)) {
+    write_gated_output(p, tile, b, kv_head, row_count);
+  }
+}
+
 }  // namespace
 
 /**
@@ -981,7 +751,7 @@ __device__ bool merge_splits(const Params& p, SharedTile& tile, int b, int kv_he
  * @param[out] partial_max float32 [B, Hkv, splits, 64] workspace: each split's row maxima.
  * @param[out] partial_sum float32 [B, Hkv, splits, 64] workspace: each split's row sums.
  * @param[in,out] arrival_count int32 [B, Hkv], zero before and after each call.
- * @param[in] keys_per_split Cached keys per split, a multiple of 32.
+ * @param[in] keys_per_split Cached keys per split, a multiple of 64.
  * @throws c10::Error A tensor has the wrong dtype, shape or layout.
  *
  * @par Example
@@ -1001,6 +771,7 @@ void run(torch::Tensor qkv, torch::Tensor k_cache, torch::Tensor v_cache, torch:
                   page_table.is_contiguous() && out.is_contiguous(),
               "tensors must be contiguous");
   TORCH_CHECK(k_cache.size(3) == kHeadDim, "head_dim must be ", kHeadDim);
+  TORCH_CHECK(partial_max.size(2) <= kMaxSplits, "at most ", kMaxSplits, " splits");
   TORCH_CHECK(qkv.size(1) * q_head_count / k_cache.size(2) <= kMaxRows,
               "L * Hq / Hkv must be <= ", kMaxRows);
   TORCH_CHECK(qkv.scalar_type() == at::kBFloat16 && k_cache.scalar_type() == at::kFloat8_e4m3fn &&
@@ -1032,8 +803,10 @@ void run(torch::Tensor qkv, torch::Tensor k_cache, torch::Tensor v_cache, torch:
   p.arrival_count_device = arrival_count.data_ptr<int>();
   p.split_count = static_cast<int>(partial_max.size(2));
   p.keys_per_split = static_cast<int>(keys_per_split);
-  attention_kernel<<<dim3(p.split_count, k_cache.size(2), qkv.size(0)), kThreads, 0,
-                     at::cuda::getCurrentCUDAStream()>>>(p);
+  C10_CUDA_CHECK(cudaFuncSetAttribute(attention_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                      sizeof(SharedTile)));
+  attention_kernel<<<dim3(p.split_count, k_cache.size(2), qkv.size(0)), kThreads,
+                     sizeof(SharedTile), at::cuda::getCurrentCUDAStream()>>>(p);
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 """
@@ -1048,8 +821,9 @@ CPP_SOURCE: str = (
 HEAD_DIM: int = 64
 ROPE_PAIR_STRIDE: int = 2
 MAX_ROWS: int = 64
-TILE_KEYS: int = 32
+TILE_KEYS: int = 64
 TARGET_BLOCKS_PER_SM: int = 4
+MAX_SPLITS: int = 64
 _extension_cache: dict[str, object] = {}
 _inv_freq_cache: dict[tuple[float, torch.device], torch.Tensor] = {}
 _workspace_cache: dict[tuple[int, int, int, torch.device], tuple[torch.Tensor, ...]] = {}
@@ -1066,7 +840,7 @@ def _get_extension() -> object:
     """
     if "module" not in _extension_cache:
         _extension_cache["module"] = load_inline(
-            name="muse_fused_attention_mma_pieces",
+            name="muse_fused_attention_tensor_cores",
             cpp_sources=CPP_SOURCE,
             cuda_sources=CUDA_SOURCE,
             functions=["run"],
@@ -1104,7 +878,7 @@ def _plan_splits(data: dict) -> tuple[int, int]:
         data: The inputs; only `config` and the page table's shape are read.
 
     Returns:
-        The split count and the cached keys per split (a multiple of 32), so that every key a
+        The split count and the cached keys per split (a multiple of 64), so that every key a
         request can hold falls in a split and the grid has about `TARGET_BLOCKS_PER_SM` per SM.
 
     Example:
@@ -1116,6 +890,7 @@ def _plan_splits(data: dict) -> tuple[int, int]:
     sm_count: int = torch.cuda.get_device_properties(data["qkv"].device).multi_processor_count
     group_count: int = config["batch"] * config["num_kv_heads"]
     wanted_split_count: int = max(1, -(-TARGET_BLOCKS_PER_SM * sm_count // group_count))
+    wanted_split_count = min(wanted_split_count, MAX_SPLITS)
     keys_per_split: int = -(-tile_count // min(tile_count, wanted_split_count)) * TILE_KEYS
     return -(-span_keys // keys_per_split), keys_per_split
 
