@@ -12,9 +12,9 @@ has 4 warps, or 8 for verify on sliding layers or with few requests. It:
    ring in shared memory, whose space the merge reuses afterwards. Each warp attends its 16
    query rows over its share of the step's keys: S = Q K^T runs on FP8 tensor cores straight
    from the ring, the values are converted to fp16 for O += P V, and the online softmax updates
-   once per step. Only steps at the edge of the window or chunk apply the mask. In full verify,
-   the 4 warps run both products together as one warpgroup `wgmma`, so the keys and the fp16
-   values sit in `wgmma`'s 64- and 128-byte swizzles.
+   once per step. Only steps at the edge of the window or chunk apply the mask. In verify, each
+   warpgroup of 4 warps runs both products on `wgmma` over its keys (all 64, or 32 of them with
+   8 warps), so the keys and the fp16 values sit in `wgmma`'s 64- and 128-byte swizzles.
 3. In the first chunk's block only: normalizes the block's new keys (staged in shared memory at
    the start), applies RoPE, writes the new keys and values to the FP8 cache, and attends to them
    as one last, causal step.
@@ -31,15 +31,17 @@ Example:
 
 Must know:
     Limitations:
-        - The full-verify build uses `wgmma`, so the kernel builds for and runs on Hopper (sm_90a).
+        - The verify builds use `wgmma`, so the kernel builds for and runs on Hopper (sm_90a).
+        - Verify needs 64 query rows per KV head (8 tokens x 8 query heads), as both head layouts
+          in `TASK.md` give.
     Gotchas:
         - The arrival counters live across calls; each merging block resets its counter to 0.
     Performance:
         - The page-table reads for a step are issued one step before its keys and values.
         - The split count fills exactly one wave of resident blocks, from the occupancy calculator.
         - Each build compiles one path: decode (4 warps, 1 chunk per warp per step, 3 blocks per
-          SM), full verify (4 warps, 4 chunks, 4 blocks per SM) or verify on sliding layers, with 3
-          row tiles or with at most 8 request x KV-head groups (8 warps, 2 chunks, 2 blocks per SM).
+          SM), full verify (4 warps, 4 chunks, 4 blocks per SM) or verify on sliding layers or with
+          at most 8 request x KV-head groups (8 warps, 2 chunks, 2 blocks per SM).
 """
 
 import torch
@@ -450,29 +452,69 @@ __device__ void wgmma_64x64x32_fp8(float (&d)[32], const uint32_t (&a)[4], uint6
 }
 
 /**
- * @brief `score_keys_wgmma` computes S = Q K^T for the warpgroup's 64 query rows and the step's 64
- * keys on `wgmma`, and waits for the result.
+ * @brief `wgmma_64x32x32_fp8` is `wgmma_64x64x32_fp8` for 32 keys: D is 64 x 32 fp32, 16 values
+ * per thread in the `mma.sync` C layout of 4 n-tiles.
  *
- * @param[out] scores This thread's 32 scores, in the `mma.sync` C layout of 8 n-tiles of 8 keys.
- * @param[in] q_fragments This thread's FP8 query fragments, one per 32 head dimensions.
- * @param[in] keys The step's FP8 keys, one 64-byte row per key, swizzled by `swizzled_dim`.
+ * @param[in,out] d This thread's 16 accumulators.
+ * @param[in] a This thread's A fragment.
+ * @param[in] key_descriptor `make_key_descriptor` of the 32 keys' 32 dimensions.
+ * @param[in] should_accumulate Whether to add to D (otherwise D = A B).
  *
  * @par Example
  * @code
- * score_keys_wgmma(accumulators, q_fragments, keys);
+ * wgmma_64x32x32_fp8(scores, q_fragments[0], descriptor, false);
+ * @endcode
+ */
+__device__ void wgmma_64x32x32_fp8(float (&d)[16], const uint32_t (&a)[4], uint64_t key_descriptor,
+                                   bool should_accumulate) {
+#if defined(__CUDA_ARCH_FEAT_SM90_ALL)
+  asm volatile(
+      "{\n.reg .pred accumulate;\nsetp.ne.b32 accumulate, %21, 0;\n"
+      "wgmma.mma_async.sync.aligned.m64n32k32.f32.e4m3.e4m3 {%0, %1, %2, %3, %4, %5, %6, %7, %8, "
+      "%9, %10, %11, %12, %13, %14, %15}, {%16, %17, %18, %19}, %20, "
+      "accumulate, 1, 1;\n}\n"
+      : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3]), "+f"(d[4]), "+f"(d[5]), "+f"(d[6]),
+        "+f"(d[7]), "+f"(d[8]), "+f"(d[9]), "+f"(d[10]), "+f"(d[11]), "+f"(d[12]), "+f"(d[13]),
+        "+f"(d[14]), "+f"(d[15])
+      : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "l"(key_descriptor),
+        "r"(static_cast<int>(should_accumulate)));
+#else
+  __trap();
+#endif
+}
+
+/**
+ * @brief `score_keys_wgmma` computes S = Q K^T for the warpgroup's 64 query rows and `kKeyCount`
+ * keys on `wgmma`, and waits for the result.
+ *
+ * @tparam kKeyCount Keys: 64 (the whole step) or 32.
+ * @param[out] scores This thread's scores, in the `mma.sync` C layout of n-tiles of 8 keys.
+ * @param[in] q_fragments This thread's FP8 query fragments, one per 32 head dimensions.
+ * @param[in] keys The first key's row of the step's FP8 keys, swizzled by `swizzled_dim`.
+ *
+ * @par Example
+ * @code
+ * score_keys_wgmma<64>(accumulators, q_fragments, keys);
  * @endcode
  *
  * @par Must know
  * - Gotchas:
  *   - All 128 threads of the warpgroup must call `score_keys_wgmma` together.
  */
-__device__ void score_keys_wgmma(float (&scores)[32], const uint32_t (&q_fragments)[kQkSteps][4],
+template <int kKeyCount>
+__device__ void score_keys_wgmma(float (&scores)[kKeyCount / 2],
+                                 const uint32_t (&q_fragments)[kQkSteps][4],
                                  const uint8_t (*keys)[kHeadDim]) {
 #if defined(__CUDA_ARCH_FEAT_SM90_ALL)
   asm volatile("wgmma.fence.sync.aligned;\n" ::: "memory");
   for (int depth = 0; depth < kQkSteps; ++depth) {
-    wgmma_64x64x32_fp8(scores, q_fragments[depth],
-                       make_key_descriptor(&keys[0][kFp8MmaDepth * depth]), depth > 0);
+    const uint64_t descriptor = make_key_descriptor(&keys[0][kFp8MmaDepth * depth]);
+    if constexpr (kKeyCount == kStepKeys) {
+      wgmma_64x64x32_fp8(scores, q_fragments[depth], descriptor, depth > 0);
+    } else {
+      static_assert(kKeyCount == kStepKeys / 2, "wgmma scores 64 or 32 keys");
+      wgmma_64x32x32_fp8(scores, q_fragments[depth], descriptor, depth > 0);
+    }
   }
   asm volatile("wgmma.commit_group.sync.aligned;\n" ::: "memory");
   asm volatile("wgmma.wait_group.sync.aligned 0;\n" ::: "memory");
@@ -915,28 +957,33 @@ __device__ void store_new_keys(const Params& p, SharedTile& tile, int b, int kv_
 }
 
 /**
- * @brief `accumulate_values_wgmma` computes O += P V for the warpgroup's 64 query rows and the
- * step's 64 keys on `wgmma`, and waits for the result.
+ * @brief `accumulate_values_wgmma` computes O += P V for the warpgroup's 64 query rows and
+ * `kChunkCount` chunks of 16 keys on `wgmma`, and waits for the result.
+ *
+ * @tparam kChunkCount Chunks of 16 keys: 4 (the whole step) or 2.
  *
  * @param[in,out] out This thread's 32 output accumulators, in the `mma.sync` C layout.
  * @param[in] probabilities This thread's 32 probabilities, in the `mma.sync` C layout of 4 chunks
  * of 16 keys.
- * @param[in] values The step's fp16 values, in the 128-byte swizzle of `swizzled_value_dim`.
+ * @param[in] values The first key's row of the step's fp16 values, in the 128-byte swizzle of
+ * `swizzled_value_dim`.
  *
  * @par Example
  * @code
- * accumulate_values_wgmma(out, scores, tile.v);
+ * accumulate_values_wgmma<4>(out, scores, tile.v);
  * @endcode
  *
  * @par Must know
  * - Gotchas:
  *   - All 128 threads of the warpgroup must call `accumulate_values_wgmma` together.
  */
-__device__ void accumulate_values_wgmma(float (&out)[32], const float (&probabilities)[4][2][4],
+template <int kChunkCount>
+__device__ void accumulate_values_wgmma(float (&out)[32],
+                                        const float (&probabilities)[kChunkCount][2][4],
                                         const __half (*values)[kHeadDim]) {
 #if defined(__CUDA_ARCH_FEAT_SM90_ALL)
   asm volatile("wgmma.fence.sync.aligned;\n" ::: "memory");
-  for (int chunk = 0; chunk < kStepKeys / kHalfMmaDepth; ++chunk) {
+  for (int chunk = 0; chunk < kChunkCount; ++chunk) {
     const float (&p)[2][4] = probabilities[chunk];
     const uint32_t p_fragment[4] = {pack_halves(p[0][0], p[0][1]), pack_halves(p[0][2], p[0][3]),
                                     pack_halves(p[1][0], p[1][1]), pack_halves(p[1][2], p[1][3])};
@@ -957,7 +1004,7 @@ __device__ void accumulate_values_wgmma(float (&out)[32], const float (&probabil
  * @tparam kChunkCount Chunks of 16 keys this warp attends in the step.
  * @param[in] p Kernel parameters.
  * @param[in] tile Shared memory tile with the step's fp16 values and key positions.
- * @tparam kUseWgmma Whether the 4 warps run S and P V together on `wgmma` (full verify).
+ * @tparam kUseWgmma Whether each warpgroup runs S and P V on `wgmma` over its keys (verify).
  * @param[in] keys The step's FP8 keys, one 64-byte row per key, swizzled by `swizzled_dim`.
  * @param[in] q_fragments This warp's FP8 query rows as A fragments, one per 32 head dimensions.
  * @param[in] first_key First of the warp's keys, within the step.
@@ -986,11 +1033,13 @@ __device__ void attend_keys(const Params& p, const SharedTile& tile,
                             WarpState& state) {
   const int lane = threadIdx.x % kWarpSize;
   const int group_size = p.q_head_count / p.kv_head_count;
+  const int warpgroup_first_key = kChunkCount * kChunkKeys == kStepKeys ? 0 : first_key;
   float scores[kChunkCount][2][4] = {};
   if constexpr (kUseWgmma) {
-    static_assert(kChunkCount * kChunkKeys == kStepKeys, "wgmma covers all 64 keys of the step");
-    float (&accumulators)[32] = *reinterpret_cast<float (*)[32]>(&scores[0][0][0]);
-    score_keys_wgmma(accumulators, q_fragments, keys);
+    constexpr int kKeyCount = kChunkCount * kChunkKeys;
+    float (&accumulators)[kKeyCount / 2] =
+        *reinterpret_cast<float (*)[kKeyCount / 2]>(&scores[0][0][0]);
+    score_keys_wgmma<kKeyCount>(accumulators, q_fragments, &keys[warpgroup_first_key]);
   } else {
     for (int chunk = 0; chunk < kChunkCount; ++chunk) {
       for (int n = 0; n < 2; ++n) {
@@ -1042,7 +1091,8 @@ __device__ void attend_keys(const Params& p, const SharedTile& tile,
     }
   }
   if constexpr (kUseWgmma) {
-    accumulate_values_wgmma(*reinterpret_cast<float (*)[32]>(&state.out[0][0]), scores, tile.v);
+    accumulate_values_wgmma<kChunkCount>(*reinterpret_cast<float (*)[32]>(&state.out[0][0]), scores,
+                                         &tile.v[warpgroup_first_key]);
     return;
   }
   for (int chunk = 0; chunk < kChunkCount; ++chunk) {
@@ -1356,7 +1406,7 @@ __global__ void __launch_bounds__(kWarpCount* kWarpSize, kMinBlocksPerSm)
   state.max_log2[0] = state.max_log2[1] = -INFINITY;
   const float logit_scale_log2 = p.sm_scale * p.qk_scale_factor * *p.k_scale_device * kLog2e;
   const int first_row = m_tile * kMmaRows;
-  constexpr bool kUseWgmma = kWarpCount == 4 && kChunksPerWarp == 4;
+  constexpr bool kUseWgmma = kWarpCount * kChunksPerWarp * kChunkKeys == 4 * kStepKeys;
   for (int step = 0; first_position_incl + step * kStepKeys < end_position_excl; ++step) {
     wait_for_copies<kStages - 2>();
     if constexpr (kUseWgmma) asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
@@ -1439,6 +1489,7 @@ struct KernelBuild {
  * @param[in] window Sliding window in tokens, or 0 for full attention.
  * @param[in] group_count Requests x KV heads: full verify with few groups also gets 8 warps.
  * @return The kernel to launch and its threads per block.
+ * @throws c10::Error When a verify block has other than 64 query rows (33 to 48 rows).
  *
  * @par Example
  * @code
@@ -1453,7 +1504,9 @@ KernelBuild select_kernel(int64_t row_count, int64_t window, int64_t group_count
   if (m_tile_count == 2) {
     return {attention_kernel<4, 2, kVerifyBlocksPerSm>, kMinThreads};
   }
-  if (m_tile_count == 3 || window != 0 || group_count <= kMaxWideFullGroups) {
+  TORCH_CHECK(m_tile_count == 4, "verify needs 64 query rows per KV head (4 row tiles), got ",
+              row_count, " rows");
+  if (window != 0 || group_count <= kMaxWideFullGroups) {
     return {attention_kernel<8, 2, kWideVerifyBlocksPerSm>, 2 * kMinThreads};
   }
   return {attention_kernel<4, 4, kVerifyBlocksPerSm>, kMinThreads};
@@ -1597,7 +1650,7 @@ def _get_extension() -> object:
     """
     if "module" not in _extension_cache:
         _extension_cache["module"] = load_inline(
-            name="muse_fused_attention_one_trip_merge",
+            name="muse_fused_attention_wide_wgmma",
             cpp_sources=CPP_SOURCE,
             cuda_sources=CUDA_SOURCE,
             functions=["run", "resident_blocks_per_sm"],
