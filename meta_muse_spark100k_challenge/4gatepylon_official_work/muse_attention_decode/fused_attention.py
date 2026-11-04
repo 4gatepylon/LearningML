@@ -14,9 +14,10 @@ block. It:
    online softmax in between.
 3. In the first chunk's block only: normalizes the block's new keys, applies RoPE, writes the new
    keys and values to the FP8 cache, and attends to them as one last, causal step.
-4. Combines its warps' softmax states and publishes the block's state. The last block of the
-   request and KV head to finish merges every chunk's state, divides by the softmax sum, and
-   applies the per-head RMSNorm and the sigmoid gate.
+4. Combines its warps' softmax states and publishes the block's state. A two-level tree merges
+   the chunks: the last block of each group of up to 8 chunks merges that group, then the last
+   group merger merges the groups, divides by the softmax sum, and applies the per-head RMSNorm
+   and the sigmoid gate.
 
 Interface:
     kernel_fn(data): `TASK.md`'s timed call; returns bfloat16 [B, L, Hq * 64].
@@ -64,7 +65,11 @@ constexpr int kLoadsPerThread = kStepKeys * kLoadsPerRow / kThreads;
 constexpr int kMaxSplits = 64;
 constexpr int kStages = 4;
 constexpr int kMaxTokens = 8;
-constexpr int kMergeElementsPerThread = kMaxRows * kHeadDim / kThreads;
+constexpr int kMergeFanIn = 8;
+constexpr int kMaxMergeGroups = kMaxSplits / kMergeFanIn;
+constexpr int kCountersPerGroup = kMaxMergeGroups + 1;
+constexpr int kFloatsPerVector = 4;
+constexpr int kVectorsPerRow = kHeadDim / kFloatsPerVector;
 constexpr int kPiecesPerRow = kHeadDim * 2 / kBytesPerLoad;
 constexpr float kRmsEps = 1e-5f;
 constexpr float kLog2e = 1.4426950408889634f;
@@ -101,8 +106,8 @@ struct StartTile {
   __half q[kMaxRows][kRowStride];
 };
 
-struct EndTile {
-  float out[kMaxRows][kHeadDim];
+struct MergeTile {
+  float split_weight[kMergeFanIn][kMaxRows];
   __nv_bfloat16 gate[kMaxRows][kHeadDim];
 };
 
@@ -110,11 +115,11 @@ struct SharedTile {
   union {
     StepTile step;
     float warp_out[kWarps][kMmaRows][kHeadDim];
-    float split_weight[kMaxSplits][kMaxRows];
+    MergeTile merge;
   };
   union {
     StartTile start;
-    EndTile end;
+    float out[kMaxRows][kHeadDim];
   };
   float2 rotation[kMaxTokens][kHeadDim / 2];
   uint8_t raw_k[kStages][kStepKeys][kHeadDim];
@@ -202,10 +207,10 @@ __device__ void write_gated_output(const Params& p, const SharedTile& tile, int 
     const int head = kv_head * group_size + row % group_size;
     const float scale = *p.v_scale_device / tile.row_sum[row];
     const float2 o =
-        make_float2(tile.end.out[row][2 * lane] * scale, tile.end.out[row][2 * lane + 1] * scale);
+        make_float2(tile.out[row][2 * lane] * scale, tile.out[row][2 * lane + 1] * scale);
     const float inv_rms = rsqrtf(warp_sum(o.x * o.x + o.y * o.y) / kHeadDim + kRmsEps);
     const float2 g =
-        __bfloat1622float2(reinterpret_cast<const __nv_bfloat162*>(&tile.end.gate[row][0])[lane]);
+        __bfloat1622float2(reinterpret_cast<const __nv_bfloat162*>(&tile.merge.gate[row][0])[lane]);
     const float2 gated =
         make_float2(o.x * inv_rms / (1.0f + expf(-g.x)), o.y * inv_rms / (1.0f + expf(-g.y)));
     __nv_bfloat162* out_row = reinterpret_cast<__nv_bfloat162*>(
@@ -651,7 +656,7 @@ __device__ void combine_warps(SharedTile& tile, int row_count, int m_tile_count,
       merged_sum += weight * tile.warp_sum[warp][row_in_tile];
       merged_out += weight * tile.warp_out[warp][row_in_tile][d];
     }
-    tile.end.out[row][d] = merged_out;
+    tile.out[row][d] = merged_out;
     if (d == 0) {
       tile.row_max[row] = merged_max / kLog2e;
       tile.row_sum[row] = merged_sum;
@@ -660,90 +665,166 @@ __device__ void combine_warps(SharedTile& tile, int row_count, int m_tile_count,
 }
 
 /**
- * @brief `merge_splits` publishes this block's softmax state and, in the last block of its
- * request and KV head to arrive, merges every split's state into `out` and `row_sum`.
+ * @brief `publish_state` writes the block's softmax state (unnormalized outputs, row maxima in
+ * natural-log units, row sums) to one workspace slot.
  *
  * @param[in] p Kernel parameters.
- * @param[in,out] tile Shared memory tile with this block's state; the merging block gets the
- * merged state and uses `split_weight` for each split's weight per row.
+ * @param[in] tile Shared memory tile with the state.
+ * @param[in] slot Workspace slot: every slot holds 64 rows.
+ * @param[in] row_count Query rows (L x query heads per KV head).
+ *
+ * @par Example
+ * @code
+ * publish_state(p, tile, first_slot + split, row_count);
+ * @endcode
+ */
+__device__ void publish_state(const Params& p, const SharedTile& tile, int64_t slot,
+                              int row_count) {
+  float4* slot_out = reinterpret_cast<float4*>(p.partial_out_device + slot * kMaxRows * kHeadDim);
+  for (int vector = threadIdx.x; vector < row_count * kVectorsPerRow; vector += kThreads) {
+    slot_out[vector] = reinterpret_cast<const float4*>(&tile.out[0][0])[vector];
+  }
+  for (int row = threadIdx.x; row < row_count; row += kThreads) {
+    p.partial_max_device[slot * kMaxRows + row] = tile.row_max[row];
+    p.partial_sum_device[slot * kMaxRows + row] = tile.row_sum[row];
+  }
+}
+
+/**
+ * @brief `arrive` counts this block in at a workspace counter and tells whether it was the last
+ * of `expected_count` blocks; the last block may then read what the others published.
+ *
+ * @param[in] p Kernel parameters.
+ * @param[in,out] tile Shared memory tile: its `is_last_split` flag.
+ * @param[in] counter Index into the arrival counters.
+ * @param[in] expected_count Blocks that arrive at this counter.
+ * @return Whether this block arrived last.
+ *
+ * @par Example
+ * @code
+ * if (!arrive(p, tile, counter, 8)) { return false; }
+ * @endcode
+ */
+__device__ bool arrive(const Params& p, SharedTile& tile, int counter, int expected_count) {
+  __threadfence();
+  __syncthreads();
+  if (threadIdx.x == 0) {
+    tile.is_last_split = atomicAdd(&p.arrival_count_device[counter], 1) == expected_count - 1;
+  }
+  __syncthreads();
+  if (tile.is_last_split) {
+    __threadfence();
+  }
+  return tile.is_last_split;
+}
+
+/**
+ * @brief `merge_slots` merges up to 8 published softmax states into the block's state in `tile`.
+ *
+ * @param[in] p Kernel parameters.
+ * @param[in,out] tile Shared memory tile: gets the merged outputs, row maxima and row sums; uses
+ * `split_weight` for each slot's weight per row.
+ * @param[in] first_slot First workspace slot to merge.
+ * @param[in] slot_stride Distance between merged slots.
+ * @param[in] slot_count Slots to merge, at most `kMergeFanIn`.
+ * @param[in] row_count Query rows (L x query heads per KV head).
+ *
+ * @par Example
+ * @code
+ * merge_slots(p, tile, first_slot, 1, 8, row_count);
+ * @endcode
+ */
+__device__ void merge_slots(const Params& p, SharedTile& tile, int64_t first_slot, int slot_stride,
+                            int slot_count, int row_count) {
+  for (int index = threadIdx.x; index < slot_count * row_count; index += kThreads) {
+    const int64_t slot = first_slot + (index / row_count) * slot_stride;
+    tile.merge.split_weight[index / row_count][index % row_count] =
+        __ldcg(&p.partial_max_device[slot * kMaxRows + index % row_count]);
+  }
+  __syncthreads();
+  for (int row = threadIdx.x; row < row_count; row += kThreads) {
+    float merged_max = -INFINITY;
+    for (int s = 0; s < slot_count; ++s) {
+      merged_max = fmaxf(merged_max, tile.merge.split_weight[s][row]);
+    }
+    const float safe_max = merged_max == -INFINITY ? 0.0f : merged_max;
+    float merged_sum = 0.0f;
+#pragma unroll
+    for (int s = 0; s < kMergeFanIn; ++s) {
+      if (s < slot_count) {
+        tile.merge.split_weight[s][row] = expf(tile.merge.split_weight[s][row] - safe_max);
+        merged_sum +=
+            tile.merge.split_weight[s][row] *
+            __ldcg(&p.partial_sum_device[(first_slot + s * slot_stride) * kMaxRows + row]);
+      }
+    }
+    tile.row_max[row] = merged_max;
+    tile.row_sum[row] = merged_sum;
+  }
+  __syncthreads();
+  for (int vector = threadIdx.x; vector < row_count * kVectorsPerRow; vector += kThreads) {
+    const int row = vector / kVectorsPerRow;
+    float4 merged = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+#pragma unroll
+    for (int s = 0; s < kMergeFanIn; ++s) {
+      if (s < slot_count) {
+        const float4* slot_out = reinterpret_cast<const float4*>(
+            p.partial_out_device + (first_slot + s * slot_stride) * kMaxRows * kHeadDim);
+        const float4 x = __ldcg(&slot_out[vector]);
+        const float weight = tile.merge.split_weight[s][row];
+        merged = make_float4(merged.x + weight * x.x, merged.y + weight * x.y,
+                             merged.z + weight * x.z, merged.w + weight * x.w);
+      }
+    }
+    reinterpret_cast<float4*>(&tile.out[0][0])[vector] = merged;
+  }
+  __syncthreads();
+}
+
+/**
+ * @brief `merge_splits` merges every split's softmax state with a two-level tree: the last block
+ * of each group of 8 splits merges its group, and the last group merger merges the groups.
+ *
+ * @param[in] p Kernel parameters.
+ * @param[in,out] tile Shared memory tile with this block's state; the block that finishes the
+ * tree gets the merged state.
  * @param[in] b Request index.
  * @param[in] kv_head Key/value head index.
  * @param[in] split This block's split.
  * @param[in] row_count Query rows (L x query heads per KV head).
- * @return Whether this block merged and must write the output.
+ * @return Whether this block finished the tree and must write the output.
  *
  * @par Example
  * @code
- * if (merge_splits(p, tile, b, kv_head, split, row_count)) { ... }
+ * const bool is_merging_block = merge_splits(p, tile, b, kv_head, split, row_count);
  * @endcode
  */
 __device__ bool merge_splits(const Params& p, SharedTile& tile, int b, int kv_head, int split,
                              int row_count) {
   const int group = b * p.kv_head_count + kv_head;
-  const int64_t first_slot = static_cast<int64_t>(group) * p.split_count * kMaxRows;
-  const int64_t own_slot = first_slot + static_cast<int64_t>(split) * kMaxRows;
-  for (int element = threadIdx.x; element < row_count * kHeadDim; element += kThreads) {
-    p.partial_out_device[own_slot * kHeadDim + element] =
-        tile.end.out[element / kHeadDim][element % kHeadDim];
-  }
-  for (int row = threadIdx.x; row < row_count; row += kThreads) {
-    p.partial_max_device[own_slot + row] = tile.row_max[row];
-    p.partial_sum_device[own_slot + row] = tile.row_sum[row];
-  }
-  __threadfence();
-  __syncthreads();
-  if (threadIdx.x == 0) {
-    tile.is_last_split = atomicAdd(&p.arrival_count_device[group], 1) == p.split_count - 1;
-  }
-  __syncthreads();
-  if (!tile.is_last_split) {
+  const int64_t first_slot = static_cast<int64_t>(group) * p.split_count;
+  const int merge_group = split / kMergeFanIn;
+  const int merge_group_count = (p.split_count + kMergeFanIn - 1) / kMergeFanIn;
+  const int group_slot_count = min(kMergeFanIn, p.split_count - merge_group * kMergeFanIn);
+  publish_state(p, tile, first_slot + split, row_count);
+  if (!arrive(p, tile, group * kCountersPerGroup + merge_group, group_slot_count)) {
     return false;
   }
-  __threadfence();
-  for (int index = threadIdx.x; index < p.split_count * row_count; index += kThreads) {
-    const int64_t slot = first_slot + (index / row_count) * kMaxRows + index % row_count;
-    tile.split_weight[index / row_count][index % row_count] = __ldcg(&p.partial_max_device[slot]);
-  }
-  __syncthreads();
-  for (int row = threadIdx.x; row < row_count; row += kThreads) {
-    float merged_max = -INFINITY;
-    for (int s = 0; s < p.split_count; ++s) {
-      merged_max = fmaxf(merged_max, tile.split_weight[s][row]);
-    }
-    for (int s = 0; s < p.split_count; ++s) {
-      tile.split_weight[s][row] = expf(tile.split_weight[s][row] - merged_max);
-    }
-    tile.row_sum[row] = 0.0f;
-  }
-  __syncthreads();
-  for (int index = threadIdx.x; index < p.split_count * row_count; index += kThreads) {
-    const int64_t slot = first_slot + (index / row_count) * kMaxRows + index % row_count;
-    atomicAdd(&tile.row_sum[index % row_count],
-              tile.split_weight[index / row_count][index % row_count] *
-                  __ldcg(&p.partial_sum_device[slot]));
-  }
-  float merged_out[kMergeElementsPerThread] = {};
-  for (int s = 0; s < p.split_count; ++s) {
-    const float* split_out = p.partial_out_device + (first_slot + s * kMaxRows) * kHeadDim;
-#pragma unroll
-    for (int i = 0; i < kMergeElementsPerThread; ++i) {
-      const int element = threadIdx.x + i * kThreads;
-      if (element < row_count * kHeadDim) {
-        merged_out[i] += tile.split_weight[s][element / kHeadDim] * __ldcg(&split_out[element]);
-      }
-    }
-  }
-#pragma unroll
-  for (int i = 0; i < kMergeElementsPerThread; ++i) {
-    const int element = threadIdx.x + i * kThreads;
-    if (element < row_count * kHeadDim) {
-      tile.end.out[element / kHeadDim][element % kHeadDim] = merged_out[i];
-    }
-  }
+  merge_slots(p, tile, first_slot + merge_group * kMergeFanIn, 1, group_slot_count, row_count);
   if (threadIdx.x == 0) {
-    p.arrival_count_device[group] = 0;
+    p.arrival_count_device[group * kCountersPerGroup + merge_group] = 0;
   }
-  __syncthreads();
+  if (merge_group_count == 1) {
+    return true;
+  }
+  publish_state(p, tile, first_slot + merge_group * kMergeFanIn, row_count);
+  if (!arrive(p, tile, group * kCountersPerGroup + kMaxMergeGroups, merge_group_count)) {
+    return false;
+  }
+  merge_slots(p, tile, first_slot, kMergeFanIn, merge_group_count, row_count);
+  if (threadIdx.x == 0) {
+    p.arrival_count_device[group * kCountersPerGroup + kMaxMergeGroups] = 0;
+  }
   return true;
 }
 
@@ -852,10 +933,10 @@ __global__ void __launch_bounds__(kThreads) attention_kernel(const Params p) {
     }
   }
   __syncthreads();
-  start_rows_copy(p, tile.end.gate, b, kv_head, row_count,
-                  (p.q_head_count + 2 * p.kv_head_count) * kHeadDim);
   combine_warps(tile, row_count, m_tile_count, key_group_count);
   __syncthreads();
+  start_rows_copy(p, tile.merge.gate, b, kv_head, row_count,
+                  (p.q_head_count + 2 * p.kv_head_count) * kHeadDim);
   const bool is_merging_block = merge_splits(p, tile, b, kv_head, split, row_count);
   wait_for_copies<0>();
   __syncthreads();
@@ -885,7 +966,7 @@ __global__ void __launch_bounds__(kThreads) attention_kernel(const Params p) {
  * @param[out] partial_out float32 [B, Hkv, splits, 64, 64] workspace: each split's outputs.
  * @param[out] partial_max float32 [B, Hkv, splits, 64] workspace: each split's row maxima.
  * @param[out] partial_sum float32 [B, Hkv, splits, 64] workspace: each split's row sums.
- * @param[in,out] arrival_count int32 [B, Hkv], zero before and after each call.
+ * @param[in,out] arrival_count int32 [B, Hkv, 9], zero before and after each call.
  * @param[in] keys_per_split Cached keys per split, a multiple of 64.
  * @throws c10::Error A tensor has the wrong dtype, shape or layout.
  *
@@ -977,6 +1058,7 @@ ROPE_PAIR_STRIDE: int = 2
 MAX_ROWS: int = 64
 TILE_KEYS: int = 64
 MAX_SPLITS: int = 64
+COUNTERS_PER_GROUP: int = 9
 _extension_cache: dict[str, object] = {}
 _inv_freq_cache: dict[tuple[float, torch.device], torch.Tensor] = {}
 _workspace_cache: dict[tuple[int, int, int, torch.device], tuple[torch.Tensor, ...]] = {}
@@ -993,7 +1075,7 @@ def _get_extension() -> object:
     """
     if "module" not in _extension_cache:
         _extension_cache["module"] = load_inline(
-            name="muse_fused_attention_batched_rows",
+            name="muse_fused_attention_merge_tree",
             cpp_sources=CPP_SOURCE,
             cuda_sources=CUDA_SOURCE,
             functions=["run", "resident_blocks_per_sm"],
@@ -1058,7 +1140,7 @@ def _get_workspace(data: dict, split_count: int) -> tuple[torch.Tensor, ...]:
 
     Returns:
         partial_out [B, Hkv, splits, 64, 64], partial_max and partial_sum [B, Hkv, splits, 64]
-        (float32), and arrival_count [B, Hkv] (int32, zero), allocated once per shape.
+        (float32), and arrival_count [B, Hkv, 9] (int32, zero), allocated once per shape.
 
     Example:
         >>> partial_out, partial_max, partial_sum, arrival_count = _get_workspace(data, 8)
@@ -1072,7 +1154,7 @@ def _get_workspace(data: dict, split_count: int) -> tuple[torch.Tensor, ...]:
             torch.empty((*shape, MAX_ROWS, HEAD_DIM), device=device),
             torch.empty((*shape, MAX_ROWS), device=device),
             torch.empty((*shape, MAX_ROWS), device=device),
-            torch.zeros(shape[:2], dtype=torch.int32, device=device),
+            torch.zeros((*shape[:2], COUNTERS_PER_GROUP), dtype=torch.int32, device=device),
         )
     return _workspace_cache[key]
 
