@@ -1,11 +1,12 @@
 # okc: problem=muse_attention_decode
 """`fused_attention.py` computes muse_attention_decode, moving its steps into CUDA one at a time.
 
-The step runs in two stages. A CUDA prologue kernel RMS-normalizes the queries and the block's new
-keys, scales the queries by `qk_scale_factor`, applies RoPE on sliding layers, rounds the queries to
-bf16 as `reference.py` does, and writes the new keys and values to the FP8 cache. The attention
-stage, still PyTorch, then attends over each request's cache and applies the per-head RMSNorm and
-the sigmoid gate. Later versions move it into the same CUDA kernel.
+The step runs as two CUDA kernels. The prologue kernel RMS-normalizes the queries and the
+block's new keys, scales the queries by `qk_scale_factor`, applies RoPE on sliding layers, rounds
+the queries to bf16 as `reference.py` does, and writes the new keys and values to the FP8 cache.
+The attention kernel runs one thread block per request and key/value head. It streams the
+request's keys and values (the new ones included) through shared memory, 32 at a time, folds each
+tile into an online softmax on CUDA cores, then applies the per-head RMSNorm and the sigmoid gate.
 
 Interface:
     kernel_fn(data): `TASK.md`'s timed call; returns bfloat16 [B, L, Hq * 64].
@@ -15,7 +16,7 @@ Example:
 
 Must know:
     Performance:
-        - The PyTorch attention gathers every position a request's page table can hold.
+        - With one block per request and KV head, small batches use only a few of the GPU's SMs.
 """
 
 import torch
@@ -331,6 +332,44 @@ __device__ void write_gated_output(const Params& p, SharedTile& tile, const floa
   }
 }
 
+/**
+ * @brief `attention_kernel` attends one request's prepared queries of one KV head group over its
+ * cache, including the block's new keys, and writes the gated output.
+ *
+ * @param[in] p Kernel parameters; the grid is (KV heads, requests).
+ *
+ * @par Example
+ * @code
+ * attention_kernel<<<dim3(kv_head_count, B), kThreads, 0, stream>>>(p);
+ * @endcode
+ */
+__global__ void __launch_bounds__(kThreads) attention_kernel(const Params p) {
+  __shared__ SharedTile tile;
+  const int kv_head = blockIdx.x;
+  const int b = blockIdx.y;
+  const int group_size = p.q_head_count / p.kv_head_count;
+  const int row_count = p.L * group_size;
+  const int seq_len = p.seq_lens_device[b];
+  for (int index = threadIdx.x; index < row_count * kHeadDim; index += kThreads) {
+    const int row = index / kHeadDim;
+    const int head = kv_head * group_size + row % group_size;
+    const int64_t q_offset = ((b * p.L + row / group_size) * p.q_head_count + head) * kHeadDim;
+    tile.q[row][index % kHeadDim] = __bfloat162float(p.q_device[q_offset + index % kHeadDim]);
+  }
+  for (int row = threadIdx.x; row < row_count; row += kThreads) {
+    tile.row_max[row] = -INFINITY;
+    tile.row_sum[row] = 0.0f;
+  }
+  float accumulators[kAccumulatorCount] = {};
+  const int first_position_incl = p.window == 0 ? 0 : max(0, seq_len - p.window + 1);
+  for (int start = first_position_incl; start < seq_len + p.L; start += kTileKeys) {
+    load_cached_tile(p, tile, b, kv_head, start, seq_len + p.L);
+    __syncthreads();
+    attend_tile(p, tile, accumulators, row_count, seq_len);
+  }
+  write_gated_output(p, tile, accumulators, b, kv_head, row_count);
+}
+
 }  // namespace
 
 /**
@@ -382,15 +421,70 @@ void prologue(torch::Tensor qkv, torch::Tensor k_cache, torch::Tensor v_cache,
                     at::cuda::getCurrentCUDAStream()>>>(p);
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
+
+/**
+ * @brief `attend` checks the tensors and launches `attention_kernel` on the current stream.
+ *
+ * @param[in] qkv Fused projection output, bf16 [B, L, (2 Hq + 2 Hkv) * 64], for the gate.
+ * @param[in] q bf16 [B, L, Hq, 64], the queries `prologue` prepared.
+ * @param[in] k_cache FP8 key cache [pages, page_size, Hkv, 64], with the block's new keys.
+ * @param[in] v_cache FP8 value cache, same shape, with the block's new values.
+ * @param[in] page_table int32 [B, max_pages].
+ * @param[in] seq_lens int32 [B].
+ * @param[in] k_scale float32 [], key = e4m3 * k_scale.
+ * @param[in] v_scale float32 [], value = e4m3 * v_scale.
+ * @param[out] out bf16 [B, L, Hq * 64].
+ * @param[in] window Sliding window in tokens, or 0 for full attention.
+ * @param[in] sm_scale Softmax scale.
+ * @throws c10::Error A tensor has the wrong dtype, shape or layout.
+ *
+ * @par Example
+ * @code
+ * attend(qkv, q, k_cache, v_cache, page_table, seq_lens, k_scale, v_scale, out, 2048, 0.125);
+ * @endcode
+ */
+void attend(torch::Tensor qkv, torch::Tensor q, torch::Tensor k_cache, torch::Tensor v_cache,
+            torch::Tensor page_table, torch::Tensor seq_lens, torch::Tensor k_scale,
+            torch::Tensor v_scale, torch::Tensor out, int64_t window, double sm_scale) {
+  TORCH_CHECK(page_table.is_contiguous() && out.is_contiguous() && q.is_contiguous(),
+              "tensors must be contiguous");
+  TORCH_CHECK(q.size(1) * q.size(2) / k_cache.size(2) <= kMaxRows,
+              "L * Hq / Hkv must be <= ", kMaxRows);
+  TORCH_CHECK(page_table.scalar_type() == at::kInt && out.scalar_type() == at::kBFloat16,
+              "unexpected dtype");
+  Params p{};
+  p.qkv_device = reinterpret_cast<const __nv_bfloat16*>(qkv.data_ptr());
+  p.k_cache_device = reinterpret_cast<__nv_fp8_e4m3*>(k_cache.data_ptr());
+  p.v_cache_device = reinterpret_cast<__nv_fp8_e4m3*>(v_cache.data_ptr());
+  p.seq_lens_device = seq_lens.data_ptr<int>();
+  p.k_scale_device = k_scale.data_ptr<float>();
+  p.v_scale_device = v_scale.data_ptr<float>();
+  p.q_device = reinterpret_cast<__nv_bfloat16*>(q.data_ptr());
+  p.page_table_device = page_table.data_ptr<int>();
+  p.out_device = reinterpret_cast<__nv_bfloat16*>(out.data_ptr());
+  p.L = static_cast<int>(q.size(1));
+  p.q_head_count = static_cast<int>(q.size(2));
+  p.kv_head_count = static_cast<int>(k_cache.size(2));
+  p.page_size = static_cast<int>(k_cache.size(1));
+  p.page_table_stride = static_cast<int>(page_table.size(1));
+  p.window = static_cast<int>(window);
+  p.sm_scale = static_cast<float>(sm_scale);
+  attention_kernel<<<dim3(k_cache.size(2), q.size(0)), kThreads, 0,
+                     at::cuda::getCurrentCUDAStream()>>>(p);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
 """
 CPP_SOURCE: str = (
     "void prologue(torch::Tensor qkv, torch::Tensor k_cache, torch::Tensor v_cache, "
     "torch::Tensor seq_lens, torch::Tensor cache_loc, torch::Tensor k_scale, "
     "torch::Tensor v_scale, torch::Tensor inv_freq, torch::Tensor q, double qk_scale_factor);"
+    "void attend(torch::Tensor qkv, torch::Tensor q, torch::Tensor k_cache, "
+    "torch::Tensor v_cache, torch::Tensor page_table, torch::Tensor seq_lens, "
+    "torch::Tensor k_scale, torch::Tensor v_scale, torch::Tensor out, int64_t window, "
+    "double sm_scale);"
 )
 HEAD_DIM: int = 64
 ROPE_PAIR_STRIDE: int = 2
-RMS_EPS: float = 1e-5
 _extension_cache: dict[str, object] = {}
 _inv_freq_cache: dict[tuple[float, torch.device], torch.Tensor] = {}
 
@@ -406,10 +500,10 @@ def _get_extension() -> object:
     """
     if "module" not in _extension_cache:
         _extension_cache["module"] = load_inline(
-            name="muse_fused_attention_prologue_helpers",
+            name="muse_fused_attention_two_kernels",
             cpp_sources=CPP_SOURCE,
             cuda_sources=CUDA_SOURCE,
-            functions=["prologue"],
+            functions=["prologue", "attend"],
             extra_cuda_cflags=["-O3"],
         )
     return _extension_cache["module"]
@@ -435,43 +529,6 @@ def _get_inv_freq(theta: float, device: torch.device) -> torch.Tensor:
             1.0 / (theta ** (exponents / HEAD_DIM)) if theta else torch.empty(0, device=device)
         )
     return _inv_freq_cache[key]
-
-
-def _attend_and_gate(data: dict, q: torch.Tensor) -> torch.Tensor:
-    """`_attend_and_gate` attends the prepared queries over the cache and gates the result.
-
-    Args:
-        data: The inputs; the caches already hold the block's new keys and values.
-        q: bf16 [B, L, Hq, 64] prepared queries.
-
-    Returns:
-        bfloat16 [B, L, Hq * 64]: rmsnorm(attention) * sigmoid(gate).
-
-    Example:
-        >>> out = _attend_and_gate(data, q)
-    """
-    config: dict = data["config"]
-    B, L, Hq = config["batch"], config["q_len"], config["num_q_heads"]
-    Hkv, page_size, window = config["num_kv_heads"], config["page_size"], config["window"]
-    k_cache: torch.Tensor = data["k_cache"].view(-1, Hkv, HEAD_DIM)
-    v_cache: torch.Tensor = data["v_cache"].view(-1, Hkv, HEAD_DIM)
-    positions: torch.Tensor = data["positions"].view(B, L)
-    t: torch.Tensor = torch.arange(data["page_table"].shape[1] * page_size, device=q.device)
-    out: torch.Tensor = torch.empty((B, L, Hq, HEAD_DIM), device=q.device)
-    for b in range(B):
-        rows: torch.Tensor = data["page_table"][b].long().clamp(min=0)[t // page_size] * page_size
-        rows = rows + t % page_size
-        K: torch.Tensor = k_cache[rows].float() * data["k_scale"]
-        V: torch.Tensor = v_cache[rows].float() * data["v_scale"]
-        is_visible: torch.Tensor = t[None, :] <= positions[b][:, None]
-        if window:
-            is_visible &= t[None, :] > positions[b][:, None] - window
-        S: torch.Tensor = torch.einsum("lkgd,skd->lkgs", q[b].view(L, Hkv, -1, HEAD_DIM).float(), K)
-        S = (S * config["sm_scale"]).masked_fill(~is_visible[:, None, None, :], float("-inf"))
-        out[b] = torch.einsum("lkgs,skd->lkgd", S.softmax(-1), V).reshape(L, Hq, HEAD_DIM)
-    out = out * torch.rsqrt(out.pow(2).mean(-1, keepdim=True) + RMS_EPS)
-    gate: torch.Tensor = data["qkv"][..., (Hq + 2 * Hkv) * HEAD_DIM :].float().view(B, L, Hq, -1)
-    return (out * torch.sigmoid(gate)).reshape(B, L, Hq * HEAD_DIM).to(torch.bfloat16)
 
 
 def kernel_fn(data: dict) -> torch.Tensor:
@@ -504,4 +561,18 @@ def kernel_fn(data: dict) -> torch.Tensor:
         q,
         config["qk_scale_factor"],
     )
-    return _attend_and_gate(data, q)
+    out: torch.Tensor = torch.empty_like(q).view(q.shape[0], q.shape[1], -1)
+    _get_extension().attend(
+        data["qkv"],
+        q,
+        data["k_cache"],
+        data["v_cache"],
+        data["page_table"],
+        data["seq_lens"],
+        data["k_scale"],
+        data["v_scale"],
+        out,
+        config["window"],
+        config["sm_scale"],
+    )
+    return out
