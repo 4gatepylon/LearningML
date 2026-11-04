@@ -1788,6 +1788,85 @@ __device__ void load_query_fragments(SharedTile& tile, const BlockWork& work,
 }
 
 /**
+ * @brief `attend_split` streams the split's keys and values through the ring, 64 per step, and
+ * folds each step into this warp's softmax state.
+ *
+ * @tparam kWarpCount Warps per block.
+ * @tparam kChunksPerWarp Chunks of 16 keys each warp attends per step.
+ * @tparam kIsVerify Whether this is a verify build (`wgmma`).
+ * @param[in] p Kernel parameters.
+ * @param[in,out] tile Shared memory tile.
+ * @param[in] work The block's work.
+ * @param[in,out] addresses The next step's page-table entries, from `start_block`.
+ * @param[in] q_fragments This thread's query fragments.
+ * @param[in] logit_scale_log2 Factor from Q K^T to base-2 logits.
+ * @param[in,out] state This thread's softmax state.
+ *
+ * @par Example
+ * @code
+ * attend_split<4, 4, true>(p, tile, work, addresses, q_fragments, logit_scale_log2, state);
+ * @endcode
+ */
+template <int kWarpCount, int kChunksPerWarp, bool kIsVerify>
+__device__ void attend_split(const Params& p, SharedTile& tile, const BlockWork& work,
+                             KeyAddresses& addresses, const uint32_t (&q_fragments)[kQkSteps][4],
+                             float logit_scale_log2, WarpState& state) {
+  constexpr int kThreadCount = kWarpCount * kWarpSize;
+  for (int step = 0; work.first_position_incl + step * kStepKeys < work.end_position_excl; ++step) {
+    wait_for_copies<kStages - 2>();
+    if constexpr (kIsVerify) asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
+    __syncthreads();
+    convert_step<kThreadCount>(tile, step % kStages);
+    const KeyAddresses next_addresses = locate_keys<kThreadCount>(
+        p, work.b, work.kv_head, work.first_position_incl + (step + kStages) * kStepKeys,
+        work.end_position_excl);
+    start_step_copy<kThreadCount>(p, tile, work.kv_head, addresses, (step + kStages - 1) % kStages);
+    addresses = next_addresses;
+    if constexpr (kIsVerify) asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
+    __syncthreads();
+    const int start_incl = work.first_position_incl + step * kStepKeys;
+    const bool is_masked = start_incl + kStepKeys > work.end_position_excl ||
+                           (p.window != 0 && start_incl < work.window_start_incl + p.L - 1);
+    attend_keys<kChunksPerWarp, kIsVerify>(p, tile, tile.ring.raw_k[step % kStages], q_fragments,
+                                           work.key_group * kChunksPerWarp * kChunkKeys,
+                                           work.m_tile * kMmaRows, work.seq_len, logit_scale_log2,
+                                           is_masked, state);
+  }
+  wait_for_copies<0>();
+  __syncthreads();
+}
+
+/**
+ * @brief `attend_new_tokens` writes the block's new keys and values to the cache and attends to
+ * them as one last, causal step (first split only).
+ *
+ * @tparam kChunksPerWarp Chunks of 16 keys each warp attends per step.
+ * @tparam kIsVerify Whether this is a verify build (`wgmma`).
+ * @param[in] p Kernel parameters.
+ * @param[in,out] tile Shared memory tile.
+ * @param[in] work The block's work.
+ * @param[in] q_fragments This thread's query fragments.
+ * @param[in] logit_scale_log2 Factor from Q K^T to base-2 logits.
+ * @param[in,out] state This thread's softmax state.
+ *
+ * @par Example
+ * @code
+ * attend_new_tokens<4, true>(p, tile, work, q_fragments, logit_scale_log2, state);
+ * @endcode
+ */
+template <int kChunksPerWarp, bool kIsVerify>
+__device__ void attend_new_tokens(const Params& p, SharedTile& tile, const BlockWork& work,
+                                  const uint32_t (&q_fragments)[kQkSteps][4],
+                                  float logit_scale_log2, WarpState& state) {
+  store_new_keys(p, tile, work.b, work.kv_head, work.seq_len);
+  if constexpr (kIsVerify) asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
+  __syncthreads();
+  attend_keys<kChunksPerWarp, kIsVerify>(
+      p, tile, tile.ring.raw_k[0], q_fragments, work.key_group * kChunksPerWarp * kChunkKeys,
+      work.m_tile * kMmaRows, work.seq_len, logit_scale_log2, true, state);
+}
+
+/**
  * @brief `attention_kernel` attends one split of one request's keys for one KV head group; the
  * first split also writes the block's new keys and values, and the merging blocks write the
  * output.
@@ -1820,49 +1899,19 @@ __global__ void __launch_bounds__(kWarpCount* kWarpSize, kMinBlocksPerSm)
   const int row_count = work.row_count;
   const int m_tile_count = work.m_tile_count;
   const int key_group_count = work.key_group_count;
-  const int key_group = work.key_group;
-  const int m_tile = work.m_tile;
   const bool is_active = work.is_active;
-  const int seq_len = work.seq_len;
-  const int window_start_incl = work.window_start_incl;
-  const int first_position_incl = work.first_position_incl;
-  const int end_position_excl = work.end_position_excl;
   KeyAddresses addresses = start_block<kWarpCount * kWarpSize>(p, tile, work);
   uint32_t q_fragments[kQkSteps][4];
   load_query_fragments(tile, work, q_fragments);
   WarpState state = {};
   state.max_log2[0] = state.max_log2[1] = -INFINITY;
   const float logit_scale_log2 = p.sm_scale * p.qk_scale_factor * tile.k_scale * kLog2e;
-  const int first_row = m_tile * kMmaRows;
-  constexpr bool kUseWgmma = kWarpCount * kChunksPerWarp * kChunkKeys == 4 * kStepKeys;
-  for (int step = 0; first_position_incl + step * kStepKeys < end_position_excl; ++step) {
-    wait_for_copies<kStages - 2>();
-    if constexpr (kUseWgmma) asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
-    __syncthreads();
-    convert_step<kWarpCount * kWarpSize>(tile, step % kStages);
-    const KeyAddresses next_addresses = locate_keys<kWarpCount * kWarpSize>(
-        p, b, kv_head, first_position_incl + (step + kStages) * kStepKeys, end_position_excl);
-    start_step_copy<kWarpCount * kWarpSize>(p, tile, kv_head, addresses,
-                                            (step + kStages - 1) % kStages);
-    addresses = next_addresses;
-    if constexpr (kUseWgmma) asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
-    __syncthreads();
-    const int start = first_position_incl + step * kStepKeys;
-    const bool is_masked = start + kStepKeys > end_position_excl ||
-                           (p.window != 0 && start < window_start_incl + p.L - 1);
-    attend_keys<kChunksPerWarp, kUseWgmma>(p, tile, tile.ring.raw_k[step % kStages], q_fragments,
-                                           key_group * kChunksPerWarp * kChunkKeys, first_row,
-                                           seq_len, logit_scale_log2, is_masked, state);
-  }
-  wait_for_copies<0>();
-  __syncthreads();
+  constexpr bool kIsVerify = kChunksPerWarp > 1;
+  attend_split<kWarpCount, kChunksPerWarp, kIsVerify>(p, tile, work, addresses, q_fragments,
+                                                      logit_scale_log2, state);
   if (split == 0) {
-    store_new_keys(p, tile, b, kv_head, seq_len);
-    if constexpr (kUseWgmma) asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
-    __syncthreads();
-    attend_keys<kChunksPerWarp, kUseWgmma>(p, tile, tile.ring.raw_k[0], q_fragments,
-                                           key_group * kChunksPerWarp * kChunkKeys, first_row,
-                                           seq_len, logit_scale_log2, true, state);
+    attend_new_tokens<kChunksPerWarp, kIsVerify>(p, tile, work, q_fragments, logit_scale_log2,
+                                                 state);
   }
   __syncthreads();
   // DANGEROUS DANGEROUS DANGEROUS IF YOU CHANGE THIS THEN THE 4-WARP BUILD WILL LOSE 3% (D52)
@@ -1891,7 +1940,7 @@ __global__ void __launch_bounds__(kWarpCount* kWarpSize, kMinBlocksPerSm)
   __syncthreads();
   start_rows_copy(p, tile.merge.gate, b, kv_head, row_count,
                   (p.q_head_count + 2 * p.kv_head_count) * kHeadDim);
-  if constexpr (kUseWgmma) {
+  if constexpr (kIsVerify) {
     const int group = b * p.kv_head_count + kv_head;
     const int64_t first_slot = static_cast<int64_t>(group) * p.split_count;
     const int mergers = merger_count(p, row_count);
@@ -2128,7 +2177,7 @@ def _get_extension() -> object:
     """
     if "module" not in _extension_cache:
         _extension_cache["module"] = load_inline(
-            name="muse_fused_attention_block_start",
+            name="muse_fused_attention_attend_split",
             cpp_sources=CPP_SOURCE,
             cuda_sources=CUDA_SOURCE,
             functions=["run", "resident_blocks_per_sm"],
