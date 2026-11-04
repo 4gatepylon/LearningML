@@ -7,10 +7,10 @@ block. It:
 
 1. RMS-normalizes the queries, scales them by `qk_scale_factor`, applies RoPE on sliding layers and
    rounds them to bf16, as `reference.py` does.
-2. Streams its chunk of cached FP8 keys and values 64 at a time: registers hold the next step's
-   bytes while the current step is converted to fp16 in shared memory. Each warp attends its 16
-   query rows over its share of the step's keys: S = Q K^T and O += P V run on tensor cores
-   (`mma.sync`), with an online softmax in between.
+2. Streams its chunk of cached FP8 keys and values 64 at a time through a 4-stage `cp.async`
+   ring in shared memory, converting each step to fp16. Each warp attends its 16 query rows over
+   its share of the step's keys: S = Q K^T and O += P V run on tensor cores (`mma.sync`), with an
+   online softmax in between.
 3. In the first chunk's block only: normalizes the block's new keys, applies RoPE, writes the new
    keys and values to the FP8 cache, and attends to them as one last, causal step.
 4. Combines its warps' softmax states and publishes the block's state. The last block of the
@@ -28,6 +28,7 @@ Must know:
         - The arrival counters live across calls; each merging block resets its counter to 0.
     Performance:
         - The page-table reads for a step are issued one step before its keys and values.
+        - The split count fills exactly one wave of resident blocks, from the occupancy calculator.
 """
 
 import torch
@@ -60,6 +61,7 @@ constexpr int kBytesPerLoad = 16;
 constexpr int kLoadsPerRow = kHeadDim / kBytesPerLoad;
 constexpr int kLoadsPerThread = kStepKeys * kLoadsPerRow / kThreads;
 constexpr int kMaxSplits = 64;
+constexpr int kStages = 4;
 constexpr float kRmsEps = 1e-5f;
 constexpr float kLog2e = 1.4426950408889634f;
 
@@ -85,18 +87,25 @@ struct Params {
   int split_count, keys_per_split;
 };
 
-struct SharedTile {
+struct StepTile {
   __half k[kStepKeys][kRowStride];
   __half v[kStepKeys][kRowStride];
+};
+
+struct SharedTile {
+  union {
+    StepTile step;
+    float warp_out[kWarps][kMmaRows][kHeadDim];
+    float split_weight[kMaxSplits][kMaxRows];
+  };
   union {
     __half q[kMaxRows][kRowStride];
     float out[kMaxRows][kHeadDim];
   };
+  uint8_t raw_k[kStages][kStepKeys][kHeadDim];
+  uint8_t raw_v[kStages][kStepKeys][kHeadDim];
+  int raw_position[kStages][kStepKeys];
   int key_position[kStepKeys];
-  union {
-    float warp_out[kWarps][kMmaRows][kHeadDim];
-    float split_weight[kMaxSplits][kMaxRows];
-  };
   float warp_max[kWarps][kMmaRows];
   float warp_sum[kWarps][kMmaRows];
   float row_max[kMaxRows];
@@ -106,12 +115,6 @@ struct SharedTile {
 
 struct KeyAddresses {
   int page[kLoadsPerThread];
-  int position[kLoadsPerThread];
-};
-
-struct RawKeys {
-  uint4 k[kLoadsPerThread];
-  uint4 v[kLoadsPerThread];
   int position[kLoadsPerThread];
 };
 
@@ -282,7 +285,7 @@ __device__ uint32_t pack_halves(float low, float high) {
  *
  * @par Example
  * @code
- * store_fp8_as_halves(raw.k[i], &tile.k[key][chunk * kBytesPerLoad]);
+ * store_fp8_as_halves(raw_bytes, &tile.step.k[key][dim]);
  * @endcode
  */
 __device__ void store_fp8_as_halves(const uint4& bytes, __half* destination) {
@@ -329,59 +332,98 @@ __device__ KeyAddresses locate_keys(const Params& p, int b, int kv_head, int fir
 }
 
 /**
- * @brief `load_raw_keys` starts loading this thread's pieces of a step's FP8 keys and values into
- * registers; missing keys get zero bytes.
+ * @brief `copy_async_16` starts copying 16 bytes from global to shared memory (`cp.async`), or
+ * zero-fills the destination.
  *
- * @param[in] p Kernel parameters.
- * @param[in] kv_head Key/value head index.
- * @param[in] addresses The pieces' pages, from `locate_keys` one step earlier.
- * @return The pieces, not yet converted.
+ * @param[out] destination 16-byte aligned shared memory.
+ * @param[in] source 16-byte aligned global memory, read only if `is_present`.
+ * @param[in] is_present Whether to copy; otherwise the destination becomes zeros.
  *
  * @par Example
  * @code
- * RawKeys next = load_raw_keys(p, kv_head, next_addresses);
+ * copy_async_16(&tile.raw_k[stage][key][dim], p.k_cache_device + offset, is_present);
  * @endcode
  */
-__device__ RawKeys load_raw_keys(const Params& p, int kv_head, const KeyAddresses& addresses) {
-  RawKeys raw;
-  for (int i = 0; i < kLoadsPerThread; ++i) {
-    const int piece = i * kThreads + threadIdx.x;
-    const int position = addresses.position[i];
-    raw.position[i] = position;
-    raw.k[i] = make_uint4(0, 0, 0, 0);
-    raw.v[i] = make_uint4(0, 0, 0, 0);
-    if (position >= 0) {
-      const int64_t row =
-          static_cast<int64_t>(addresses.page[i]) * p.page_size + position % p.page_size;
-      const int64_t offset =
-          (row * p.kv_head_count + kv_head) * kHeadDim + (piece % kLoadsPerRow) * kBytesPerLoad;
-      raw.k[i] = *reinterpret_cast<const uint4*>(p.k_cache_device + offset);
-      raw.v[i] = *reinterpret_cast<const uint4*>(p.v_cache_device + offset);
-    }
-  }
-  return raw;
+__device__ void copy_async_16(void* destination, const void* source, bool is_present) {
+  const uint32_t address = static_cast<uint32_t>(__cvta_generic_to_shared(destination));
+  const int source_bytes = is_present ? kBytesPerLoad : 0;
+  asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n" ::"r"(address), "l"(source),
+               "r"(source_bytes));
 }
 
 /**
- * @brief `store_raw_keys` converts a step's raw keys and values to fp16 in shared memory.
+ * @brief `wait_for_copies` waits until at most `kPendingCount` of this thread's committed
+ * `cp.async` groups are still in flight.
  *
- * @param[in] raw This thread's pieces from `load_raw_keys`.
- * @param[out] tile Shared memory tile: its keys, values and key positions.
+ * @tparam kPendingCount Groups that may stay in flight.
  *
  * @par Example
  * @code
- * store_raw_keys(current, tile);
+ * wait_for_copies<kStages - 1>();
  * @endcode
  */
-__device__ void store_raw_keys(const RawKeys& raw, SharedTile& tile) {
+template <int kPendingCount>
+__device__ void wait_for_copies() {
+  asm volatile("cp.async.wait_group %0;\n" ::"n"(kPendingCount));
+}
+
+/**
+ * @brief `start_step_copy` starts copying this thread's pieces of one step's FP8 keys and values
+ * into a ring stage, as one `cp.async` group; missing keys become zeros.
+ *
+ * @param[in] p Kernel parameters.
+ * @param[out] tile Shared memory tile: its ring stage and the stage's key positions.
+ * @param[in] kv_head Key/value head index.
+ * @param[in] addresses The pieces' pages, from `locate_keys` one step earlier.
+ * @param[in] stage Ring stage to fill.
+ *
+ * @par Example
+ * @code
+ * start_step_copy(p, tile, kv_head, addresses, (step + kStages - 1) % kStages);
+ * @endcode
+ */
+__device__ void start_step_copy(const Params& p, SharedTile& tile, int kv_head,
+                                const KeyAddresses& addresses, int stage) {
   for (int i = 0; i < kLoadsPerThread; ++i) {
     const int piece = i * kThreads + threadIdx.x;
     const int key = piece / kLoadsPerRow;
     const int dim = (piece % kLoadsPerRow) * kBytesPerLoad;
-    store_fp8_as_halves(raw.k[i], &tile.k[key][dim]);
-    store_fp8_as_halves(raw.v[i], &tile.v[key][dim]);
+    const int position = addresses.position[i];
+    const int64_t row = static_cast<int64_t>(addresses.page[i]) * p.page_size +
+                        (position >= 0 ? position % p.page_size : 0);
+    const int64_t offset = (row * p.kv_head_count + kv_head) * kHeadDim + dim;
+    copy_async_16(&tile.raw_k[stage][key][dim], p.k_cache_device + offset, position >= 0);
+    copy_async_16(&tile.raw_v[stage][key][dim], p.v_cache_device + offset, position >= 0);
     if (piece % kLoadsPerRow == 0) {
-      tile.key_position[key] = raw.position[i];
+      tile.raw_position[stage][key] = addresses.position[i];
+    }
+  }
+  asm volatile("cp.async.commit_group;\n" ::);
+}
+
+/**
+ * @brief `convert_step` converts this thread's pieces of a ring stage to the fp16 keys and values
+ * that the tensor cores read.
+ *
+ * @param[in,out] tile Shared memory tile: reads the stage, writes keys, values and key positions.
+ * @param[in] stage Ring stage whose copies this thread has waited for.
+ *
+ * @par Example
+ * @code
+ * convert_step(tile, step % kStages);
+ * @endcode
+ */
+__device__ void convert_step(SharedTile& tile, int stage) {
+  for (int i = 0; i < kLoadsPerThread; ++i) {
+    const int piece = i * kThreads + threadIdx.x;
+    const int key = piece / kLoadsPerRow;
+    const int dim = (piece % kLoadsPerRow) * kBytesPerLoad;
+    store_fp8_as_halves(*reinterpret_cast<const uint4*>(&tile.raw_k[stage][key][dim]),
+                        &tile.step.k[key][dim]);
+    store_fp8_as_halves(*reinterpret_cast<const uint4*>(&tile.raw_v[stage][key][dim]),
+                        &tile.step.v[key][dim]);
+    if (piece % kLoadsPerRow == 0) {
+      tile.key_position[key] = tile.raw_position[stage][key];
     }
   }
 }
@@ -429,8 +471,8 @@ __device__ void store_new_keys(const Params& p, SharedTile& tile, int b, int kv_
       k_stored = __floats2half2_rn(static_cast<float>(k_fp8[0]), static_cast<float>(k_fp8[1]));
       v_stored = __floats2half2_rn(static_cast<float>(v_fp8[0]), static_cast<float>(v_fp8[1]));
     }
-    reinterpret_cast<__half2*>(&tile.k[key][0])[lane] = k_stored;
-    reinterpret_cast<__half2*>(&tile.v[key][0])[lane] = v_stored;
+    reinterpret_cast<__half2*>(&tile.step.k[key][0])[lane] = k_stored;
+    reinterpret_cast<__half2*>(&tile.step.v[key][0])[lane] = v_stored;
     if (lane == 0) {
       tile.key_position[key] = key < p.L ? seq_len + key : -1;
     }
@@ -465,7 +507,7 @@ __device__ void attend_chunk(const Params& p, const SharedTile& tile,
     for (int pair = 0; pair < kDepthSteps / 2; ++pair) {
       uint32_t b[4];
       load_matrices<false>(
-          b, &tile.k[first_key + n * kMmaCols + lane % 8][32 * pair + 8 * (lane / 8)]);
+          b, &tile.step.k[first_key + n * kMmaCols + lane % 8][32 * pair + 8 * (lane / 8)]);
       mma_16x8x16(scores[n], q_fragments[2 * pair], b[0], b[1]);
       mma_16x8x16(scores[n], q_fragments[2 * pair + 1], b[2], b[3]);
     }
@@ -507,7 +549,7 @@ __device__ void attend_chunk(const Params& p, const SharedTile& tile,
   for (int pair = 0; pair < kDimTiles / 2; ++pair) {
     uint32_t b[4];
     load_matrices<true>(
-        b, &tile.v[first_key + 8 * ((lane / 8) % 2) + lane % 8][16 * pair + 8 * (lane / 16)]);
+        b, &tile.step.v[first_key + 8 * ((lane / 8) % 2) + lane % 8][16 * pair + 8 * (lane / 16)]);
     mma_16x8x16(state.out[2 * pair], p_fragment, b[0], b[1]);
     mma_16x8x16(state.out[2 * pair + 1], p_fragment, b[2], b[3]);
   }
@@ -660,9 +702,13 @@ __global__ void __launch_bounds__(kThreads) attention_kernel(const Params p) {
   const int window_start_incl = p.window == 0 ? 0 : max(0, seq_len - p.window + 1);
   const int first_position_incl = window_start_incl + split * p.keys_per_split;
   const int end_position_excl = min(first_position_incl + p.keys_per_split, seq_len);
-  KeyAddresses next_addresses = locate_keys(p, b, kv_head, first_position_incl, end_position_excl);
-  RawKeys next = load_raw_keys(p, kv_head, next_addresses);
-  next_addresses = locate_keys(p, b, kv_head, first_position_incl + kStepKeys, end_position_excl);
+  KeyAddresses addresses = locate_keys(p, b, kv_head, first_position_incl, end_position_excl);
+  for (int stage = 0; stage < kStages - 1; ++stage) {
+    const KeyAddresses next_addresses = locate_keys(
+        p, b, kv_head, first_position_incl + (stage + 1) * kStepKeys, end_position_excl);
+    start_step_copy(p, tile, kv_head, addresses, stage);
+    addresses = next_addresses;
+  }
   const int qkv_row_size = (2 * p.q_head_count + 2 * p.kv_head_count) * kHeadDim;
   for (int row = warp; row < m_tile_count * kMmaRows; row += kWarps) {
     float2 q = make_float2(0.0f, 0.0f);
@@ -688,18 +734,22 @@ __global__ void __launch_bounds__(kThreads) attention_kernel(const Params p) {
   state.max_log2[0] = state.max_log2[1] = -INFINITY;
   const float logit_scale_log2 = p.sm_scale * *p.k_scale_device * kLog2e;
   const int first_row = m_tile * kMmaRows;
-  for (int start = first_position_incl; start < end_position_excl; start += kStepKeys) {
-    const RawKeys current = next;
-    next = load_raw_keys(p, kv_head, next_addresses);
-    next_addresses = locate_keys(p, b, kv_head, start + 2 * kStepKeys, end_position_excl);
-    store_raw_keys(current, tile);
+  for (int step = 0; first_position_incl + step * kStepKeys < end_position_excl; ++step) {
+    const KeyAddresses next_addresses = locate_keys(
+        p, b, kv_head, first_position_incl + (step + kStages) * kStepKeys, end_position_excl);
+    start_step_copy(p, tile, kv_head, addresses, (step + kStages - 1) % kStages);
+    addresses = next_addresses;
+    wait_for_copies<kStages - 1>();
+    __syncthreads();
+    convert_step(tile, step % kStages);
     __syncthreads();
     for (int chunk = 0; is_active && chunk < chunks_per_warp; ++chunk) {
       attend_chunk(p, tile, q_fragments, (key_group * chunks_per_warp + chunk) * kChunkKeys,
                    first_row, seq_len, logit_scale_log2, state);
     }
-    __syncthreads();
   }
+  wait_for_copies<0>();
+  __syncthreads();
   if (split == 0) {
     store_new_keys(p, tile, b, kv_head, seq_len);
     __syncthreads();
@@ -708,6 +758,7 @@ __global__ void __launch_bounds__(kThreads) attention_kernel(const Params p) {
                    first_row, seq_len, logit_scale_log2, state);
     }
   }
+  __syncthreads();
   for (int half = 0; half < 2 && is_active; ++half) {
     state.sum[half] += __shfl_xor_sync(0xffffffffu, state.sum[half], 1);
     state.sum[half] += __shfl_xor_sync(0xffffffffu, state.sum[half], 2);
@@ -809,6 +860,24 @@ void run(torch::Tensor qkv, torch::Tensor k_cache, torch::Tensor v_cache, torch:
                      sizeof(SharedTile), at::cuda::getCurrentCUDAStream()>>>(p);
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
+/**
+ * @brief `resident_blocks_per_sm` returns how many blocks of `attention_kernel` fit on one SM.
+ *
+ * @return The occupancy calculator's count, for the kernel's threads and shared memory.
+ *
+ * @par Example
+ * @code
+ * int64_t slots = resident_blocks_per_sm() * sm_count;
+ * @endcode
+ */
+int64_t resident_blocks_per_sm() {
+  C10_CUDA_CHECK(cudaFuncSetAttribute(attention_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                      sizeof(SharedTile)));
+  int block_count = 0;
+  C10_CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&block_count, attention_kernel,
+                                                               kThreads, sizeof(SharedTile)));
+  return block_count;
+}
 """
 CPP_SOURCE: str = (
     "void run(torch::Tensor qkv, torch::Tensor k_cache, torch::Tensor v_cache, "
@@ -816,13 +885,12 @@ CPP_SOURCE: str = (
     "torch::Tensor k_scale, torch::Tensor v_scale, torch::Tensor inv_freq, torch::Tensor out, "
     "int64_t window, double qk_scale_factor, double sm_scale, torch::Tensor partial_out, "
     "torch::Tensor partial_max, torch::Tensor partial_sum, torch::Tensor arrival_count, "
-    "int64_t keys_per_split);"
+    "int64_t keys_per_split); int64_t resident_blocks_per_sm();"
 )
 HEAD_DIM: int = 64
 ROPE_PAIR_STRIDE: int = 2
 MAX_ROWS: int = 64
 TILE_KEYS: int = 64
-TARGET_BLOCKS_PER_SM: int = 4
 MAX_SPLITS: int = 64
 _extension_cache: dict[str, object] = {}
 _inv_freq_cache: dict[tuple[float, torch.device], torch.Tensor] = {}
@@ -840,10 +908,10 @@ def _get_extension() -> object:
     """
     if "module" not in _extension_cache:
         _extension_cache["module"] = load_inline(
-            name="muse_fused_attention_tensor_cores",
+            name="muse_fused_attention_cp_async",
             cpp_sources=CPP_SOURCE,
             cuda_sources=CUDA_SOURCE,
-            functions=["run"],
+            functions=["run", "resident_blocks_per_sm"],
             extra_cuda_cflags=["-O3"],
         )
     return _extension_cache["module"]
@@ -879,7 +947,7 @@ def _plan_splits(data: dict) -> tuple[int, int]:
 
     Returns:
         The split count and the cached keys per split (a multiple of 64), so that every key a
-        request can hold falls in a split and the grid has about `TARGET_BLOCKS_PER_SM` per SM.
+        request can hold falls in a split and the grid fits in one wave of resident blocks.
 
     Example:
         >>> split_count, keys_per_split = _plan_splits(data)
@@ -888,8 +956,9 @@ def _plan_splits(data: dict) -> tuple[int, int]:
     span_keys: int = config["window"] or data["page_table"].shape[1] * config["page_size"]
     tile_count: int = -(-span_keys // TILE_KEYS)
     sm_count: int = torch.cuda.get_device_properties(data["qkv"].device).multi_processor_count
+    slot_count: int = sm_count * _get_extension().resident_blocks_per_sm()
     group_count: int = config["batch"] * config["num_kv_heads"]
-    wanted_split_count: int = max(1, -(-TARGET_BLOCKS_PER_SM * sm_count // group_count))
+    wanted_split_count: int = max(1, slot_count // group_count)
     wanted_split_count = min(wanted_split_count, MAX_SPLITS)
     keys_per_split: int = -(-tile_count // min(tile_count, wanted_split_count)) * TILE_KEYS
     return -(-span_keys // keys_per_split), keys_per_split
