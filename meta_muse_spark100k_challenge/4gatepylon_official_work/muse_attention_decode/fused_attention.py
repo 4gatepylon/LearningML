@@ -105,6 +105,7 @@ constexpr float kRmsEps = 1e-5f;
 constexpr int kLanesPerOutputRow = 8;
 constexpr int kDimsPerOutputLane = kHeadDim / kLanesPerOutputRow;
 constexpr float kLog2e = 1.4426950408889634f;
+constexpr unsigned kFullWarpMask = 0xffffffffu;
 
 /**
  * @brief `Params` carries the kernel's inputs, outputs, shapes and workspace, built once by `run`.
@@ -319,7 +320,7 @@ __device__ float* warp_out_row(SharedTile& tile, int warp, int row_in_tile) {
 template <int kLaneCount>
 __device__ float lane_group_sum(float x) {
   for (int offset = kLaneCount / 2; offset > 0; offset /= 2) {
-    x += __shfl_xor_sync(0xffffffffu, x, offset);
+    x += __shfl_xor_sync(kFullWarpMask, x, offset);
   }
   return x;
 }
@@ -467,6 +468,34 @@ __device__ int swizzled_dim(int key, int dim) {
 }
 
 /**
+ * @brief `encode_smem_descriptor` packs a `wgmma` shared-memory matrix descriptor: the start
+ * address, the leading and stride byte offsets (all in 16-byte units), and the swizzle mode.
+ *
+ * @param[in] first_byte The matrix's first byte in shared memory.
+ * @param[in] leading_bytes Leading byte offset (ignored by the swizzled K-major layouts).
+ * @param[in] stride_bytes Byte offset between consecutive groups of 8 rows.
+ * @param[in] swizzle_mode 0 for none, 1 for 128-byte, 2 for 64-byte swizzle.
+ * @return The 64-bit descriptor.
+ *
+ * @par Example
+ * @code
+ * const uint64_t descriptor = encode_smem_descriptor(keys, 16, 512, kSwizzle64BytesMode);
+ * @endcode
+ */
+__device__ uint64_t encode_smem_descriptor(const void* first_byte, uint64_t leading_bytes,
+                                           uint64_t stride_bytes, uint64_t swizzle_mode) {
+  constexpr uint64_t kAddressMask = 0x3FFFF;
+  constexpr int kUnitShift = 4;
+  constexpr int kLeadingOffsetBit = 16;
+  constexpr int kStrideOffsetBit = 32;
+  constexpr int kSwizzleModeBit = 62;
+  const uint64_t address = static_cast<uint32_t>(__cvta_generic_to_shared(first_byte));
+  return ((address & kAddressMask) >> kUnitShift) |
+         ((leading_bytes >> kUnitShift) << kLeadingOffsetBit) |
+         ((stride_bytes >> kUnitShift) << kStrideOffsetBit) | (swizzle_mode << kSwizzleModeBit);
+}
+
+/**
  * @brief `make_key_descriptor` builds the `wgmma` shared-memory descriptor of 64 FP8 keys x 32 head
  * dimensions in the 64-byte swizzle of `swizzled_dim`.
  *
@@ -483,10 +512,7 @@ __device__ int swizzled_dim(int key, int dim) {
  *   - The step's keys must start at a multiple of `kSwizzleAtomBytes`, where the swizzle repeats.
  */
 __device__ uint64_t make_key_descriptor(const uint8_t* first_byte) {
-  const uint64_t address = static_cast<uint32_t>(__cvta_generic_to_shared(first_byte));
-  const uint64_t unused_leading_bytes = 16;
-  return ((address & 0x3FFFF) >> 4) | ((unused_leading_bytes >> 4) << 16) |
-         (static_cast<uint64_t>(kSwizzleAtomBytes >> 4) << 32) | (kSwizzle64BytesMode << 62);
+  return encode_smem_descriptor(first_byte, kBytesPerLoad, kSwizzleAtomBytes, kSwizzle64BytesMode);
 }
 
 /**
@@ -632,10 +658,8 @@ __device__ int swizzled_value_dim(int key, int dim) {
  *   - `tile.v` must start at a multiple of `kValueAtomBytes`, where the swizzle repeats.
  */
 __device__ uint64_t make_value_descriptor(const __half* first_key_row) {
-  const uint64_t address = static_cast<uint32_t>(__cvta_generic_to_shared(first_key_row));
-  const uint64_t unused_leading_bytes = 16;
-  return ((address & 0x3FFFF) >> 4) | ((unused_leading_bytes >> 4) << 16) |
-         (static_cast<uint64_t>(kValueAtomBytes >> 4) << 32) | (kSwizzle128BytesMode << 62);
+  return encode_smem_descriptor(first_key_row, kBytesPerLoad, kValueAtomBytes,
+                                kSwizzle128BytesMode);
 }
 
 /**
@@ -1213,8 +1237,8 @@ __device__ void attend_keys(const Params& p, const SharedTile& tile,
             fmaxf(step_max, fmaxf(scores[chunk][n][2 * half], scores[chunk][n][2 * half + 1]));
       }
     }
-    step_max = fmaxf(step_max, __shfl_xor_sync(0xffffffffu, step_max, 1));
-    step_max = fmaxf(step_max, __shfl_xor_sync(0xffffffffu, step_max, 2));
+    step_max = fmaxf(step_max, __shfl_xor_sync(kFullWarpMask, step_max, 1));
+    step_max = fmaxf(step_max, __shfl_xor_sync(kFullWarpMask, step_max, 2));
     const float new_max = fmaxf(state.max_log2[half], step_max * logit_scale_log2);
     const float safe_max = new_max == -INFINITY ? 0.0f : new_max;
     const float rescale = fast_exp2(state.max_log2[half] - safe_max);
@@ -1256,7 +1280,7 @@ __device__ void attend_keys(const Params& p, const SharedTile& tile,
 /**
  * @brief `combine_warps` merges the softmax states of the warps that share query rows into the
  * block's state, in place: warp w's outputs sit in rows 16 w to 16 w + 15 of `out`, and the merged
- * output of query row r lands in row r. It also writes the row maxima (natural-log units) and sums.
+ * output of query row r lands in row r. It also writes the row maxima (base-2 logits) and sums.
  * One thread per row computes the row's merge weights once, then every thread merges `float4`s.
  *
  * @param[in,out] tile Shared memory tile: reads the warps' states, writes `out`, `row_max` and
@@ -1288,7 +1312,7 @@ __device__ void combine_warps(SharedTile& tile, int row_count, int m_tile_count,
       merged_sum += weight * tile.warp_sum[warp][row_in_tile];
       tile.warp_max[warp][row_in_tile] = weight;
     }
-    tile.row_max[row] = merged_max / kLog2e;
+    tile.row_max[row] = merged_max;
     tile.row_sum[row] = merged_sum;
   }
   __syncthreads();
@@ -1310,8 +1334,8 @@ __device__ void combine_warps(SharedTile& tile, int row_count, int m_tile_count,
 }
 
 /**
- * @brief `publish_state` writes the block's softmax state (unnormalized outputs, row maxima in
- * natural-log units, row sums) to one workspace slot.
+ * @brief `publish_state` writes the block's softmax state (unnormalized outputs, row maxima as
+ * base-2 logits, row sums) to one workspace slot.
  *
  * @param[in] p Kernel parameters.
  * @param[in] tile Shared memory tile with the state.
@@ -1397,10 +1421,10 @@ __device__ void merge_slots(const Params& p, SharedTile& tile, int64_t first_slo
     const float slot_max = is_slot ? tile.merge.split_weight[lane][row] : -INFINITY;
     float merged_max = slot_max;
     for (int offset = kMergeFanIn / 2; offset > 0; offset /= 2) {
-      merged_max = fmaxf(merged_max, __shfl_xor_sync(0xffffffffu, merged_max, offset));
+      merged_max = fmaxf(merged_max, __shfl_xor_sync(kFullWarpMask, merged_max, offset));
     }
     const float safe_max = merged_max == -INFINITY ? 0.0f : merged_max;
-    const float weight = is_slot ? expf(slot_max - safe_max) : 0.0f;
+    const float weight = is_slot ? exp2f(slot_max - safe_max) : 0.0f;
     if (is_slot) {
       tile.merge.split_weight[lane][row] = weight;
     }
@@ -1539,13 +1563,13 @@ __device__ void merge_rows(const Params& p, SharedTile& tile, int64_t first_slot
       merged_max = fmaxf(merged_max, tile.merge.row_weight[s * my_row_count + local_row]);
     }
     for (int offset = kWarpSize / 2; offset > 0; offset /= 2) {
-      merged_max = fmaxf(merged_max, __shfl_xor_sync(0xffffffffu, merged_max, offset));
+      merged_max = fmaxf(merged_max, __shfl_xor_sync(kFullWarpMask, merged_max, offset));
     }
     const float safe_max = merged_max == -INFINITY ? 0.0f : merged_max;
     float merged_sum = 0.0f;
     for (int s = lane; s < p.split_count; s += kWarpSize) {
       const int index = s * my_row_count + local_row;
-      const float weight = expf(tile.merge.row_weight[index] - safe_max);
+      const float weight = exp2f(tile.merge.row_weight[index] - safe_max);
       tile.merge.row_weight[index] = weight;
       merged_sum += weight * tile.merge.row_split_sum[index];
     }
@@ -1884,8 +1908,8 @@ __device__ void combine_block_state(SharedTile& tile, const BlockWork& work, War
   __syncthreads();
   // DANGEROUS DANGEROUS DANGEROUS IF YOU CHANGE THIS THEN THE 4-WARP BUILD WILL LOSE 3% (D52)
   for (int half = 0; half < 2 && work.is_active; ++half) {
-    state.sum[half] += __shfl_xor_sync(0xffffffffu, state.sum[half], 1);
-    state.sum[half] += __shfl_xor_sync(0xffffffffu, state.sum[half], 2);
+    state.sum[half] += __shfl_xor_sync(kFullWarpMask, state.sum[half], 1);
+    state.sum[half] += __shfl_xor_sync(kFullWarpMask, state.sum[half], 2);
     const int row = lane / 4 + 8 * half;
     if (lane % 4 == 0) {
       tile.warp_max[work.warp][row] = state.max_log2[half];
@@ -1902,7 +1926,7 @@ __device__ void combine_block_state(SharedTile& tile, const BlockWork& work, War
     combine_warps(tile, work.row_count, work.m_tile_count, work.key_group_count);
   } else {
     for (int row = threadIdx.x; row < work.row_count; row += thread_count()) {
-      tile.row_max[row] = tile.warp_max[row / kMmaRows][row % kMmaRows] / kLog2e;
+      tile.row_max[row] = tile.warp_max[row / kMmaRows][row % kMmaRows];
       tile.row_sum[row] = tile.warp_sum[row / kMmaRows][row % kMmaRows];
     }
   }
@@ -2091,7 +2115,9 @@ KernelBuild select_kernel(int64_t row_count, int64_t window, int64_t group_count
  * @param[out] partial_out float32 [B, Hkv, splits, 64, 64] workspace: each split's outputs.
  * @param[out] partial_max float32 [B, Hkv, splits, 64] workspace: each split's row maxima.
  * @param[out] partial_sum float32 [B, Hkv, splits, 64] workspace: each split's row sums.
- * @param[in,out] arrival_count int32 [B, Hkv, 17], zero before and after each call.
+ * @param[in,out] arrival_count int32 [B, Hkv, 17], zero before and after each call. Decode's
+ * merge tree counts arrivals per group of 16 splits in counters 0 to 15 and group mergers in 16;
+ * verify's parallel merge counts arrivals in counter 0 and finished mergers in 1.
  * @param[in] keys_per_split Cached keys per split, a multiple of 64.
  * @throws c10::Error A tensor has the wrong dtype, shape or layout, or the page size is not a power
  * of 2.
@@ -2229,7 +2255,7 @@ def _get_extension() -> object:
     """
     if "module" not in _extension_cache:
         _extension_cache["module"] = load_inline(
-            name="muse_fused_attention_epilogue_phases",
+            name="muse_fused_attention_named_fields",
             cpp_sources=CPP_SOURCE,
             cuda_sources=CUDA_SOURCE,
             functions=["run", "resident_blocks_per_sm"],
