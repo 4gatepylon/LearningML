@@ -984,18 +984,26 @@ __device__ void store_new_keys(const Params& p, SharedTile& tile, int b, int kv_
  * @par Must know
  * - Gotchas:
  *   - All 128 threads of the warpgroup must call `accumulate_values_wgmma` together.
+ * - Performance:
+ *   - All of P is packed before `wgmma.fence`, or ptxas serializes the `wgmma`s (warning C7520).
  */
 template <int kChunkCount>
 __device__ void accumulate_values_wgmma(float (&out)[32],
                                         const float (&probabilities)[kChunkCount][2][4],
                                         const __half (*values)[kHeadDim]) {
 #if defined(__CUDA_ARCH_FEAT_SM90_ALL)
-  asm volatile("wgmma.fence.sync.aligned;\n" ::: "memory");
+  uint32_t p_fragments[kChunkCount][4];
   for (int chunk = 0; chunk < kChunkCount; ++chunk) {
     const float (&p)[2][4] = probabilities[chunk];
-    const uint32_t p_fragment[4] = {pack_halves(p[0][0], p[0][1]), pack_halves(p[0][2], p[0][3]),
-                                    pack_halves(p[1][0], p[1][1]), pack_halves(p[1][2], p[1][3])};
-    wgmma_64x64x16_f16(out, p_fragment, make_value_descriptor(values[kHalfMmaDepth * chunk]));
+    p_fragments[chunk][0] = pack_halves(p[0][0], p[0][1]);
+    p_fragments[chunk][1] = pack_halves(p[0][2], p[0][3]);
+    p_fragments[chunk][2] = pack_halves(p[1][0], p[1][1]);
+    p_fragments[chunk][3] = pack_halves(p[1][2], p[1][3]);
+  }
+  asm volatile("wgmma.fence.sync.aligned;\n" ::: "memory");
+  for (int chunk = 0; chunk < kChunkCount; ++chunk) {
+    wgmma_64x64x16_f16(out, p_fragments[chunk],
+                       make_value_descriptor(values[kHalfMmaDepth * chunk]));
   }
   asm volatile("wgmma.commit_group.sync.aligned;\n" ::: "memory");
   asm volatile("wgmma.wait_group.sync.aligned 0;\n" ::: "memory");
@@ -1442,7 +1450,7 @@ __global__ void __launch_bounds__(kWarpCount* kWarpSize, kMinBlocksPerSm)
     const int start = first_position_incl + step * kStepKeys;
     const bool is_masked = start + kStepKeys > end_position_excl ||
                            (p.window != 0 && start < window_start_incl + p.L - 1);
-    if (is_active) {
+    if (kUseWgmma || is_active) {
       attend_keys<kChunksPerWarp, kUseWgmma>(p, tile, tile.ring.raw_k[step % kStages], q_fragments,
                                              key_group * kChunksPerWarp * kChunkKeys, first_row,
                                              seq_len, logit_scale_log2, is_masked, state);
@@ -1454,7 +1462,7 @@ __global__ void __launch_bounds__(kWarpCount* kWarpSize, kMinBlocksPerSm)
     store_new_keys(p, tile, b, kv_head, seq_len);
     if constexpr (kUseWgmma) asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
     __syncthreads();
-    if (is_active) {
+    if (kUseWgmma || is_active) {
       attend_keys<kChunksPerWarp, kUseWgmma>(p, tile, tile.ring.raw_k[0], q_fragments,
                                              key_group * kChunksPerWarp * kChunkKeys, first_row,
                                              seq_len, logit_scale_log2, true, state);
@@ -1678,7 +1686,7 @@ def _get_extension() -> object:
     """
     if "module" not in _extension_cache:
         _extension_cache["module"] = load_inline(
-            name="muse_fused_attention_lean_new_keys",
+            name="muse_fused_attention_wgmma_overlap",
             cpp_sources=CPP_SOURCE,
             cuda_sources=CUDA_SOURCE,
             functions=["run", "resident_blocks_per_sm"],
