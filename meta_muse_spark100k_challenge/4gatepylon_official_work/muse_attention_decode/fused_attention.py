@@ -2044,7 +2044,7 @@ def _get_extension() -> object:
     """
     if "module" not in _extension_cache:
         _extension_cache["module"] = load_inline(
-            name="muse_fused_attention_tree_lanes",
+            name="muse_fused_attention_verify_splits",
             cpp_sources=CPP_SOURCE,
             cuda_sources=CUDA_SOURCE,
             functions=["run", "resident_blocks_per_sm"],
@@ -2083,9 +2083,9 @@ def _plan_splits(data: dict) -> tuple[int, int]:
 
     Returns:
         The split count and the cached keys per split (a multiple of 64), so that every key a
-        request can hold falls in a split and the grid fits in one wave of resident blocks. Short
-        spans (at most 32 steps, such as the 2,048-token window) use at most 16 splits, so the
-        merge needs one level.
+        request can hold falls in a split and the grid fits in one wave of resident blocks. In
+        decode, short spans (at most 32 steps, such as the 2,048-token window) use at most 16
+        splits, so the merge tree needs one level.
 
     Example:
         >>> split_count, keys_per_split = _plan_splits(data)
@@ -2102,7 +2102,7 @@ def _plan_splits(data: dict) -> tuple[int, int]:
     slot_count: int = sm_count * resident_count
     wanted_split_count: int = max(1, slot_count // group_count)
     wanted_split_count = min(wanted_split_count, MAX_SPLITS)
-    if tile_count <= 2 * MERGE_FAN_IN:
+    if tile_count <= 2 * MERGE_FAN_IN and config["q_len"] == 1:
         wanted_split_count = min(wanted_split_count, MERGE_FAN_IN)
     keys_per_split: int = -(-tile_count // min(tile_count, wanted_split_count)) * TILE_KEYS
     return -(-span_keys // keys_per_split), keys_per_split
