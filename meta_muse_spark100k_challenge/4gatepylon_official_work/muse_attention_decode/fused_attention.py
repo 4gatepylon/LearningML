@@ -33,8 +33,8 @@ Example:
 Must know:
     Limitations:
         - The verify builds use `wgmma`, so the kernel builds for and runs on Hopper (sm_90a).
-        - A block needs at most 16 query rows (decode) or 49 to 64 (verify) per KV head; both head
-          layouts in `TASK.md` give 8 or 64.
+        - Every KV head serves 8 query heads (`kGroupSize`), as in both head layouts of `TASK.md`,
+          and a block needs at most 16 query rows (decode) or 49 to 64 (verify).
     Gotchas:
         - The arrival counters live across calls; each merging block resets its counter to 0.
         - Verify launches cooperatively, so all of its blocks are resident while mergers wait.
@@ -102,6 +102,7 @@ constexpr int kFloatsPerVector = 4;
 constexpr int kVectorsPerRow = kHeadDim / kFloatsPerVector;
 constexpr int kPiecesPerRow = kHeadDim * 2 / kBytesPerLoad;
 constexpr float kRmsEps = 1e-5f;
+constexpr int kGroupSize = 8;
 constexpr int kLanesPerOutputRow = 8;
 constexpr int kDimsPerOutputLane = kHeadDim / kLanesPerOutputRow;
 constexpr float kLog2e = 1.4426950408889634f;
@@ -147,7 +148,7 @@ struct Params {
  *
  * @par Example
  * @code
- * normalize_query_row(tile, tile.start.q[row], row, row_count, group_size, first_dim);
+ * normalize_query_row(tile, tile.start.q[row], row, row_count, first_dim);
  * @endcode
  */
 struct StartTile {
@@ -370,7 +371,6 @@ __device__ float2 normalize_and_rotate(float2 x, float2 rotation) {
  */
 __device__ void write_gated_output(const Params& p, const SharedTile& tile, int b, int kv_head,
                                    int row_count, int first_row, int row_step) {
-  const int group_size = p.q_head_count / p.kv_head_count;
   const int rows_per_warp = kWarpSize / kLanesPerOutputRow;
   const int lane = threadIdx.x % kWarpSize;
   const int first_dim = lane % kLanesPerOutputRow * kDimsPerOutputLane;
@@ -399,8 +399,8 @@ __device__ void write_gated_output(const Params& p, const SharedTile& tile, int 
                       __fdividef(o[2 * i + 1] * inv_rms, 1.0f + __expf(-g.y))));
     }
     if (warp_row + lane / kLanesPerOutputRow < my_row_count) {
-      const int token = b * p.L + row / group_size;
-      const int head = kv_head * group_size + row % group_size;
+      const int token = b * p.L + row / kGroupSize;
+      const int head = kv_head * kGroupSize + row % kGroupSize;
       *reinterpret_cast<uint4*>(p.out_device + (token * p.q_head_count + head) * kHeadDim +
                                 first_dim) = out_bits;
     }
@@ -883,13 +883,12 @@ __device__ void wait_for_copies() {
  */
 __device__ void start_rows_copy(const Params& p, __nv_bfloat16 (*rows)[kHeadDim], int b,
                                 int kv_head, int row_count, int first_head_column) {
-  const int group_size = p.q_head_count / p.kv_head_count;
   const int qkv_row_size = (2 * p.q_head_count + 2 * p.kv_head_count) * kHeadDim;
   for (int piece = threadIdx.x; piece < row_count * kPiecesPerRow; piece += thread_count()) {
     const int row = piece / kPiecesPerRow;
     const int column = (piece % kPiecesPerRow) * kHalvesPerLoad;
-    const int head = kv_head * group_size + row % group_size;
-    const __nv_bfloat16* source = p.qkv_device + (b * p.L + row / group_size) * qkv_row_size +
+    const int head = kv_head * kGroupSize + row % kGroupSize;
+    const __nv_bfloat16* source = p.qkv_device + (b * p.L + row / kGroupSize) * qkv_row_size +
                                   first_head_column + head * kHeadDim + column;
     copy_async_16(&rows[row][column], source, true);
   }
@@ -1023,12 +1022,11 @@ __device__ void convert_step(SharedTile& tile, int stage) {
  * @param[out] q_row The row's FP8 bytes.
  * @param[in] row Query row; rows past `row_count` become zeros.
  * @param[in] row_count Query rows (L x query heads per KV head).
- * @param[in] group_size Query heads per KV head.
  * @param[in] first_dim This lane's first dimension, a multiple of 8.
  *
  * @par Example
  * @code
- * normalize_query_row(tile, tile.start.q[row], row, row_count, group_size, lane % 8 * 8);
+ * normalize_query_row(tile, tile.start.q[row], row, row_count, lane % 8 * 8);
  * @endcode
  *
  * @par Must know
@@ -1036,7 +1034,7 @@ __device__ void convert_step(SharedTile& tile, int stage) {
  *   - All 32 lanes must call `normalize_query_row` together (it sums over groups of 8 lanes).
  */
 __device__ void normalize_query_row(const SharedTile& tile, uint8_t* q_row, int row, int row_count,
-                                    int group_size, int first_dim) {
+                                    int first_dim) {
   float q[kDimsPerOutputLane] = {};
   float square_sum = 0.0f;
   if (row < row_count) {
@@ -1051,9 +1049,10 @@ __device__ void normalize_query_row(const SharedTile& tile, uint8_t* q_row, int 
   }
   const float inv_rms = rsqrtf(lane_group_sum<kLanesPerOutputRow>(square_sum) / kHeadDim + kRmsEps);
   uint8_t bytes[kDimsPerOutputLane];
+  const int token = row < row_count ? row / kGroupSize : 0;
   for (int i = 0; i < kDimsPerOutputLane / 2; ++i) {
-    const float2 rotation = row < row_count ? tile.rotation[row / group_size][first_dim / 2 + i]
-                                            : make_float2(1.0f, 0.0f);
+    const float2 rotation =
+        row < row_count ? tile.rotation[token][first_dim / 2 + i] : make_float2(1.0f, 0.0f);
     const float x = q[2 * i] * inv_rms;
     const float y = q[2 * i + 1] * inv_rms;
     bytes[2 * i] = __nv_fp8_e4m3(x * rotation.x - y * rotation.y).__x;
@@ -1199,7 +1198,6 @@ __device__ void attend_keys(const Params& p, const SharedTile& tile,
                             int first_row, int seq_len, float logit_scale_log2, bool is_masked,
                             WarpState& state) {
   const int lane = threadIdx.x % kWarpSize;
-  const int group_size = p.q_head_count / p.kv_head_count;
   // DANGEROUS DANGEROUS DANGEROUS IF YOU CHANGE THIS THEN THE 4-WARP BUILD WILL LOSE 2% (D40)
   const int warpgroup_first_key = kChunkCount * kChunkKeys == kStepKeys ? 0 : first_key;
   float scores[kChunkCount][2][4] = {};
@@ -1221,7 +1219,7 @@ __device__ void attend_keys(const Params& p, const SharedTile& tile,
   }
   if (is_masked) {
     for (int half = 0; half < 2; ++half) {
-      const int query_position = seq_len + (first_row + lane / 4 + 8 * half) / group_size;
+      const int query_position = seq_len + (first_row + lane / 4 + 8 * half) / kGroupSize;
       for (int chunk = 0; chunk < kChunkCount; ++chunk) {
         for (int n = 0; n < 2; ++n) {
           for (int e = 2 * half; e < 2 * half + 2; ++e) {
@@ -1702,7 +1700,7 @@ __device__ bool merge_splits(const Params& p, SharedTile& tile, int b, int kv_he
  */
 struct BlockWork {
   int split, kv_head, b, warp, lane;
-  int group_size, row_count, m_tile_count, key_group_count, m_tile, key_group;
+  int row_count, m_tile_count, key_group_count, m_tile, key_group;
   bool is_active;
   int seq_len, window_start_incl, first_position_incl, end_position_excl;
 };
@@ -1728,8 +1726,7 @@ __device__ BlockWork describe_block(const Params& p) {
   work.b = blockIdx.z;
   work.warp = threadIdx.x / kWarpSize;
   work.lane = threadIdx.x % kWarpSize;
-  work.group_size = p.q_head_count / p.kv_head_count;
-  work.row_count = p.L * work.group_size;
+  work.row_count = p.L * kGroupSize;
   work.m_tile_count = (work.row_count + kMmaRows - 1) / kMmaRows;
   work.key_group_count = kWarpCount / work.m_tile_count;
   work.m_tile = work.warp % work.m_tile_count;
@@ -1805,7 +1802,7 @@ __device__ void load_query_fragments(SharedTile& tile, const BlockWork& work,
   for (int warp_row = work.warp * kQueryRowsPerWarp; warp_row < work.m_tile_count * kMmaRows;
        warp_row += warp_count() * kQueryRowsPerWarp) {
     const int row = warp_row + work.lane / kLanesPerOutputRow;
-    normalize_query_row(tile, tile.start.q[row], row, work.row_count, work.group_size,
+    normalize_query_row(tile, tile.start.q[row], row, work.row_count,
                         work.lane % kLanesPerOutputRow * kDimsPerOutputLane);
   }
   __syncthreads();
@@ -2153,8 +2150,8 @@ void run(torch::Tensor qkv, torch::Tensor k_cache, torch::Tensor v_cache, torch:
               keys_per_split);
   TORCH_CHECK(qkv.size(1) <= kMaxTokens, "L must be <= ", kMaxTokens);
   TORCH_CHECK(partial_max.size(2) <= kMaxSplits, "at most ", kMaxSplits, " splits");
-  TORCH_CHECK(qkv.size(1) * q_head_count / k_cache.size(2) <= kMaxRows,
-              "L * Hq / Hkv must be <= ", kMaxRows);
+  TORCH_CHECK(q_head_count == kGroupSize * k_cache.size(2), "query heads per KV head must be ",
+              kGroupSize, ", got ", q_head_count, " / ", k_cache.size(2));
   TORCH_CHECK(qkv.scalar_type() == at::kBFloat16 && k_cache.scalar_type() == at::kFloat8_e4m3fn &&
                   page_table.scalar_type() == at::kInt && seq_lens.scalar_type() == at::kInt &&
                   cache_loc.scalar_type() == at::kLong && out.scalar_type() == at::kBFloat16,
@@ -2261,7 +2258,7 @@ def _get_extension() -> object:
     """
     if "module" not in _extension_cache:
         _extension_cache["module"] = load_inline(
-            name="muse_fused_attention_fast_epilogue",
+            name="muse_fused_attention_group_size",
             cpp_sources=CPP_SOURCE,
             cuda_sources=CUDA_SOURCE,
             functions=["run", "resident_blocks_per_sm"],
