@@ -1662,6 +1662,132 @@ __device__ bool merge_splits(const Params& p, SharedTile& tile, int b, int kv_he
 }
 
 /**
+ * @brief `BlockWork` describes what one block of `attention_kernel` works on: its split, KV head
+ * and request, its warp's place among the query rows and keys, and its split's key positions.
+ *
+ * @par Example
+ * @code
+ * const BlockWork work = describe_block<4>(p);
+ * @endcode
+ */
+struct BlockWork {
+  int split, kv_head, b, warp, lane;
+  int group_size, row_count, m_tile_count, key_group_count, m_tile, key_group;
+  bool is_active;
+  int seq_len, window_start_incl, first_position_incl, end_position_excl;
+};
+
+/**
+ * @brief `describe_block` returns this block's and this warp's `BlockWork`; it starts the read of
+ * the request's length.
+ *
+ * @tparam kWarpCount Warps per block.
+ * @param[in] p Kernel parameters; the grid is (splits, KV heads, requests).
+ * @return The block's work.
+ *
+ * @par Example
+ * @code
+ * const BlockWork work = describe_block<kWarpCount>(p);
+ * @endcode
+ */
+template <int kWarpCount>
+__device__ BlockWork describe_block(const Params& p) {
+  BlockWork work;
+  work.split = blockIdx.x;
+  work.kv_head = blockIdx.y;
+  work.b = blockIdx.z;
+  work.warp = threadIdx.x / kWarpSize;
+  work.lane = threadIdx.x % kWarpSize;
+  work.group_size = p.q_head_count / p.kv_head_count;
+  work.row_count = p.L * work.group_size;
+  work.m_tile_count = (work.row_count + kMmaRows - 1) / kMmaRows;
+  work.key_group_count = kWarpCount / work.m_tile_count;
+  work.m_tile = work.warp % work.m_tile_count;
+  work.key_group = work.warp / work.m_tile_count;
+  work.is_active = work.key_group < work.key_group_count;
+  work.seq_len = p.seq_lens_device[work.b];
+  work.window_start_incl = p.window == 0 ? 0 : max(0, work.seq_len - p.window + 1);
+  work.first_position_incl = work.window_start_incl + work.split * p.keys_per_split;
+  work.end_position_excl = min(work.first_position_incl + p.keys_per_split, work.seq_len);
+  return work;
+}
+
+/**
+ * @brief `start_block` starts copying the block's query rows, its new tokens (first split only)
+ * and its first `kStages - 1` steps of keys and values, reads the scales and the new tokens'
+ * cache rows, fills the RoPE table, and waits for the query rows.
+ *
+ * @tparam kThreadCount Threads per block.
+ * @param[in] p Kernel parameters.
+ * @param[in,out] tile Shared memory tile.
+ * @param[in] work The block's work.
+ * @return The page-table entries of the next step to copy, still in flight.
+ *
+ * @par Example
+ * @code
+ * KeyAddresses addresses = start_block<128>(p, tile, work);
+ * @endcode
+ */
+template <int kThreadCount>
+__device__ KeyAddresses start_block(const Params& p, SharedTile& tile, const BlockWork& work) {
+  if (work.split == 0) {
+    start_new_token_copy(p, tile, work.b, work.kv_head);
+  }
+  start_rows_copy(p, tile.start.q_in, work.b, work.kv_head, work.row_count, 0);
+  KeyAddresses addresses = locate_keys<kThreadCount>(
+      p, work.b, work.kv_head, work.first_position_incl, work.end_position_excl);
+  for (int stage = 0; stage < kStages - 1; ++stage) {
+    const KeyAddresses next_addresses = locate_keys<kThreadCount>(
+        p, work.b, work.kv_head, work.first_position_incl + (stage + 1) * kStepKeys,
+        work.end_position_excl);
+    start_step_copy<kThreadCount>(p, tile, work.kv_head, addresses, stage);
+    addresses = next_addresses;
+  }
+  if (threadIdx.x < p.L) {
+    tile.new_cache_loc[threadIdx.x] = p.cache_loc_device[work.b * p.L + threadIdx.x];
+  }
+  if (threadIdx.x == kWarpSize) {
+    tile.k_scale = *p.k_scale_device;
+    tile.v_scale = *p.v_scale_device;
+  }
+  fill_rotation_table(p, tile, work.seq_len);
+  wait_for_copies<kStages - 1>();
+  __syncthreads();
+  return addresses;
+}
+
+/**
+ * @brief `load_query_fragments` normalizes, rotates and rounds the block's query rows to FP8, then
+ * loads this warp's 16 rows as `mma` A fragments.
+ *
+ * @param[in,out] tile Shared memory tile with the copied query rows.
+ * @param[in] work The block's work.
+ * @param[out] q_fragments This thread's query fragments, one per 32 head dimensions.
+ *
+ * @par Example
+ * @code
+ * load_query_fragments(tile, work, q_fragments);
+ * @endcode
+ */
+__device__ void load_query_fragments(SharedTile& tile, const BlockWork& work,
+                                     uint32_t (&q_fragments)[kQkSteps][4]) {
+  constexpr int kQueryRowsPerWarp = kWarpSize / kLanesPerOutputRow;
+  for (int warp_row = work.warp * kQueryRowsPerWarp; warp_row < work.m_tile_count * kMmaRows;
+       warp_row += warp_count() * kQueryRowsPerWarp) {
+    const int row = warp_row + work.lane / kLanesPerOutputRow;
+    normalize_query_row(tile, tile.start.q[row], row, work.row_count, work.group_size,
+                        work.lane % kLanesPerOutputRow * kDimsPerOutputLane);
+  }
+  __syncthreads();
+  for (int depth = 0; depth < kQkSteps; ++depth) {
+    load_matrices<false>(
+        q_fragments[depth],
+        &tile.start.q[work.m_tile * kMmaRows + 8 * ((work.lane / 8) % 2) + work.lane % 8]
+                     [kFp8MmaDepth * depth + kBytesPerLoad * (work.lane / 16)]);
+  }
+}
+
+/**
  * @brief `attention_kernel` attends one split of one request's keys for one KV head group; the
  * first split also writes the block's new keys and values, and the merging blocks write the
  * output.
@@ -1685,58 +1811,25 @@ __global__ void __launch_bounds__(kWarpCount* kWarpSize, kMinBlocksPerSm)
     attention_kernel(const Params p) {
   extern __shared__ __align__(16) unsigned char shared_bytes[];
   SharedTile& tile = *reinterpret_cast<SharedTile*>(shared_bytes);
-  const int split = blockIdx.x;
-  const int kv_head = blockIdx.y;
-  const int b = blockIdx.z;
-  const int warp = threadIdx.x / kWarpSize;
-  const int lane = threadIdx.x % kWarpSize;
-  const int group_size = p.q_head_count / p.kv_head_count;
-  const int row_count = p.L * group_size;
-  const int m_tile_count = (row_count + kMmaRows - 1) / kMmaRows;
-  const int key_group_count = kWarpCount / m_tile_count;
-  const int m_tile = warp % m_tile_count;
-  const int key_group = warp / m_tile_count;
-  const bool is_active = key_group < key_group_count;
-  const int seq_len = p.seq_lens_device[b];
-  const int window_start_incl = p.window == 0 ? 0 : max(0, seq_len - p.window + 1);
-  const int first_position_incl = window_start_incl + split * p.keys_per_split;
-  const int end_position_excl = min(first_position_incl + p.keys_per_split, seq_len);
-  if (split == 0) {
-    start_new_token_copy(p, tile, b, kv_head);
-  }
-  start_rows_copy(p, tile.start.q_in, b, kv_head, row_count, 0);
-  KeyAddresses addresses =
-      locate_keys<kWarpCount * kWarpSize>(p, b, kv_head, first_position_incl, end_position_excl);
-  for (int stage = 0; stage < kStages - 1; ++stage) {
-    const KeyAddresses next_addresses = locate_keys<kWarpCount * kWarpSize>(
-        p, b, kv_head, first_position_incl + (stage + 1) * kStepKeys, end_position_excl);
-    start_step_copy<kWarpCount * kWarpSize>(p, tile, kv_head, addresses, stage);
-    addresses = next_addresses;
-  }
-  if (threadIdx.x < p.L) {
-    tile.new_cache_loc[threadIdx.x] = p.cache_loc_device[b * p.L + threadIdx.x];
-  }
-  if (threadIdx.x == kWarpSize) {
-    tile.k_scale = *p.k_scale_device;
-    tile.v_scale = *p.v_scale_device;
-  }
-  fill_rotation_table(p, tile, seq_len);
-  wait_for_copies<kStages - 1>();
-  __syncthreads();
-  constexpr int kQueryRowsPerWarp = kWarpSize / kLanesPerOutputRow;
-  for (int warp_row = warp * kQueryRowsPerWarp; warp_row < m_tile_count * kMmaRows;
-       warp_row += warp_count() * kQueryRowsPerWarp) {
-    const int row = warp_row + lane / kLanesPerOutputRow;
-    normalize_query_row(tile, tile.start.q[row], row, row_count, group_size,
-                        lane % kLanesPerOutputRow * kDimsPerOutputLane);
-  }
-  __syncthreads();
+  const BlockWork work = describe_block<kWarpCount>(p);
+  const int split = work.split;
+  const int kv_head = work.kv_head;
+  const int b = work.b;
+  const int warp = work.warp;
+  const int lane = work.lane;
+  const int row_count = work.row_count;
+  const int m_tile_count = work.m_tile_count;
+  const int key_group_count = work.key_group_count;
+  const int key_group = work.key_group;
+  const int m_tile = work.m_tile;
+  const bool is_active = work.is_active;
+  const int seq_len = work.seq_len;
+  const int window_start_incl = work.window_start_incl;
+  const int first_position_incl = work.first_position_incl;
+  const int end_position_excl = work.end_position_excl;
+  KeyAddresses addresses = start_block<kWarpCount * kWarpSize>(p, tile, work);
   uint32_t q_fragments[kQkSteps][4];
-  for (int depth = 0; depth < kQkSteps; ++depth) {
-    load_matrices<false>(q_fragments[depth],
-                         &tile.start.q[m_tile * kMmaRows + 8 * ((lane / 8) % 2) + lane % 8]
-                                      [kFp8MmaDepth * depth + kBytesPerLoad * (lane / 16)]);
-  }
+  load_query_fragments(tile, work, q_fragments);
   WarpState state = {};
   state.max_log2[0] = state.max_log2[1] = -INFINITY;
   const float logit_scale_log2 = p.sm_scale * p.qk_scale_factor * tile.k_scale * kLog2e;
@@ -2035,7 +2128,7 @@ def _get_extension() -> object:
     """
     if "module" not in _extension_cache:
         _extension_cache["module"] = load_inline(
-            name="muse_fused_attention_dead_code",
+            name="muse_fused_attention_block_start",
             cpp_sources=CPP_SOURCE,
             cuda_sources=CUDA_SOURCE,
             functions=["run", "resident_blocks_per_sm"],
