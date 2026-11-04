@@ -96,7 +96,6 @@ constexpr int kMergeFanIn = 16;
 constexpr int kMaxMergeGroups = kMaxSplits / kMergeFanIn;
 constexpr int kCountersPerGroup = kMaxMergeGroups + 1;
 constexpr int kMaxMergers = 64;
-constexpr int kMaxMergeWeights = kMaxSplits * kMaxRows / kMaxMergers;
 constexpr int kMaxThreads = kMaxWarps * kWarpSize;
 constexpr int kFloatsPerVector = 4;
 constexpr int kVectorsPerRow = kHeadDim / kFloatsPerVector;
@@ -175,8 +174,8 @@ struct RingTile {
 
 /**
  * @brief `MergeTile` holds what the merge and the output need after the loop: each merged slot's
- * row maximum (then its weight) and softmax sum per row (`split_*` for the decode tree, `row_*`
- * for the verify mergers' rows), the verify mergers' partial sums, and the block's gate rows.
+ * row maximum (then its weight) and softmax sum per row for the decode tree, each verify merger
+ * thread's part of a row's vector with its maximum and sum, and the block's gate rows.
  *
  * @par Example
  * @code
@@ -186,9 +185,9 @@ struct RingTile {
 struct MergeTile {
   float split_weight[kMergeFanIn][kMaxRows];
   float split_sum[kMergeFanIn][kMaxRows];
-  float row_weight[kMaxMergeWeights];
-  float row_split_sum[kMaxMergeWeights];
-  float4 partial_sums[kMaxThreads];
+  float4 part_out[kMaxThreads];
+  float part_max[kMaxThreads];
+  float part_sum[kMaxThreads];
   __nv_bfloat16 gate[kMaxRows][kHeadDim];
 };
 
@@ -1537,9 +1536,12 @@ __device__ void wait_for_all_splits(const Params& p, int group, int split_count)
  * @brief `merge_rows` merges every split's state for this block's rows (`rank`, `rank + mergers`,
  * ...) into `tile`: row sums, and unnormalized outputs relative to the merged maximum.
  *
- * @tparam kSplitUnroll Splits each thread's output loop keeps in flight: 4 in the 8-warp build,
- * whose batch-1 merges run over 100 or more splits; 1 in the 4-warp build, whose registers are
- * full.
+ * Each thread folds a part of the splits into one 4-float vector of one row, online: it loads each
+ * split's row maximum, row sum and vector together, so the loads of all its splits are in flight
+ * at once. When several threads share a vector, the block then folds their parts.
+ *
+ * @tparam kSplitUnroll Splits each thread keeps in flight: 4 in the 8-warp build, whose batch-1
+ * merges run over 100 or more splits; 1 in the 4-warp build, whose registers are full.
  * @param[in] p Kernel parameters.
  * @param[in,out] tile Shared memory tile: gets `out` and `row_sum` for this block's rows.
  * @param[in] first_slot The group's first workspace slot.
@@ -1557,69 +1559,66 @@ template <int kSplitUnroll>
 __device__ void merge_rows(const Params& p, SharedTile& tile, int64_t first_slot, int rank,
                            int mergers, int row_count, int split_count) {
   const int my_row_count = (row_count - rank + mergers - 1) / mergers;
-  const int warp = threadIdx.x / kWarpSize;
-  const int lane = threadIdx.x % kWarpSize;
-  for (int index = threadIdx.x; index < split_count * my_row_count; index += thread_count()) {
-    const int row = rank + index % my_row_count * mergers;
-    const int64_t slot = first_slot + index / my_row_count;
-    tile.merge.row_weight[index] = __ldcg(&p.partial_max_device[slot * kMaxRows + row]);
-    tile.merge.row_split_sum[index] = __ldcg(&p.partial_sum_device[slot * kMaxRows + row]);
-  }
-  __syncthreads();
-  for (int local_row = warp; local_row < my_row_count; local_row += warp_count()) {
-    float merged_max = -INFINITY;
-    for (int s = lane; s < split_count; s += kWarpSize) {
-      merged_max = fmaxf(merged_max, tile.merge.row_weight[s * my_row_count + local_row]);
-    }
-    for (int offset = kWarpSize / 2; offset > 0; offset /= 2) {
-      merged_max = fmaxf(merged_max, __shfl_xor_sync(kFullWarpMask, merged_max, offset));
-    }
-    const float safe_max = merged_max == -INFINITY ? 0.0f : merged_max;
-    float merged_sum = 0.0f;
-    for (int s = lane; s < split_count; s += kWarpSize) {
-      const int index = s * my_row_count + local_row;
-      const float weight = fast_exp2(tile.merge.row_weight[index] - safe_max);
-      tile.merge.row_weight[index] = weight;
-      merged_sum += weight * tile.merge.row_split_sum[index];
-    }
-    merged_sum = lane_group_sum<kWarpSize>(merged_sum);
-    if (lane == 0) {
-      tile.row_sum[rank + local_row * mergers] = merged_sum;
-    }
-  }
-  __syncthreads();
   const int vector_count = my_row_count * kVectorsPerRow;
   const int part_count = max(1, thread_count() / vector_count);
   for (int task = threadIdx.x; task < vector_count * part_count; task += thread_count()) {
     const int vector = task % vector_count;
-    const int local_row = vector / kVectorsPerRow;
-    const int row = rank + local_row * mergers;
+    const int row = rank + vector / kVectorsPerRow * mergers;
+    float merged_max = -INFINITY;
+    float merged_sum = 0.0f;
     float4 merged = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
 #pragma unroll kSplitUnroll
     for (int s = task / vector_count; s < split_count; s += part_count) {
+      const int64_t slot = first_slot + s;
+      const float split_max = __ldcg(&p.partial_max_device[slot * kMaxRows + row]);
+      const float split_sum = __ldcg(&p.partial_sum_device[slot * kMaxRows + row]);
       const float4 x = __ldcg(&reinterpret_cast<const float4*>(
           p.partial_out_device +
-          (first_slot + s) * kMaxRows * kHeadDim)[row * kVectorsPerRow + vector % kVectorsPerRow]);
-      const float weight = tile.merge.row_weight[s * my_row_count + local_row];
-      merged = make_float4(merged.x + weight * x.x, merged.y + weight * x.y,
-                           merged.z + weight * x.z, merged.w + weight * x.w);
+          slot * kMaxRows * kHeadDim)[row * kVectorsPerRow + vector % kVectorsPerRow]);
+      const float new_max = fmaxf(merged_max, split_max);
+      const float safe_max = new_max == -INFINITY ? 0.0f : new_max;
+      const float old_weight = fast_exp2(merged_max - safe_max);
+      const float weight = fast_exp2(split_max - safe_max);
+      merged_max = new_max;
+      merged_sum = old_weight * merged_sum + weight * split_sum;
+      merged =
+          make_float4(old_weight * merged.x + weight * x.x, old_weight * merged.y + weight * x.y,
+                      old_weight * merged.z + weight * x.z, old_weight * merged.w + weight * x.w);
     }
     if (part_count == 1) {
       reinterpret_cast<float4*>(tile.out[row])[vector % kVectorsPerRow] = merged;
+      if (vector % kVectorsPerRow == 0) {
+        tile.row_sum[row] = merged_sum;
+      }
     } else {
-      tile.merge.partial_sums[task] = merged;
+      tile.merge.part_out[task] = merged;
+      tile.merge.part_max[task] = merged_max;
+      tile.merge.part_sum[task] = merged_sum;
     }
   }
   __syncthreads();
   for (int vector = threadIdx.x; vector < vector_count && part_count > 1;
        vector += thread_count()) {
+    float merged_max = -INFINITY;
+    for (int part = 0; part < part_count; ++part) {
+      merged_max = fmaxf(merged_max, tile.merge.part_max[part * vector_count + vector]);
+    }
+    const float safe_max = merged_max == -INFINITY ? 0.0f : merged_max;
+    float merged_sum = 0.0f;
     float4 merged = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
     for (int part = 0; part < part_count; ++part) {
-      const float4 x = tile.merge.partial_sums[part * vector_count + vector];
-      merged = make_float4(merged.x + x.x, merged.y + x.y, merged.z + x.z, merged.w + x.w);
+      const int task = part * vector_count + vector;
+      const float weight = fast_exp2(tile.merge.part_max[task] - safe_max);
+      const float4 x = tile.merge.part_out[task];
+      merged_sum += weight * tile.merge.part_sum[task];
+      merged = make_float4(merged.x + weight * x.x, merged.y + weight * x.y,
+                           merged.z + weight * x.z, merged.w + weight * x.w);
     }
     const int row = rank + vector / kVectorsPerRow * mergers;
     reinterpret_cast<float4*>(tile.out[row])[vector % kVectorsPerRow] = merged;
+    if (vector % kVectorsPerRow == 0) {
+      tile.row_sum[row] = merged_sum;
+    }
   }
   __syncthreads();
 }
@@ -2363,7 +2362,7 @@ def _get_extension() -> object:
     """
     if "module" not in _extension_cache:
         _extension_cache["module"] = load_inline(
-            name="muse_fused_attention_balanced_splits",
+            name="muse_fused_attention_online_merge",
             cpp_sources=CPP_SOURCE,
             cuda_sources=CUDA_SOURCE,
             functions=["run", "resident_blocks_per_sm"],
