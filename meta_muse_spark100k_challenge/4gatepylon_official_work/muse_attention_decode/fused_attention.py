@@ -53,7 +53,12 @@ constexpr int kDimTiles = kHeadDim / kMmaCols;
 constexpr int kRowStride = kHeadDim + 8;
 constexpr int kLoadsPerThread = kStepKeys * kLoadsPerRow / kThreads;
 constexpr int kMaxSplits = 64;
+constexpr int kMmaDepth = 16;
+constexpr int kChunkKeys = 16;
+constexpr int kChunksPerStep = kStepKeys / kChunkKeys;
+constexpr int kDepthSteps = kHeadDim / kMmaDepth;
 constexpr float kRmsEps = 1e-5f;
+constexpr float kLog2e = 1.4426950408889634f;
 
 struct Params {
   const __nv_bfloat16* qkv_device;
@@ -764,6 +769,196 @@ __global__ void __launch_bounds__(kThreads) attention_kernel(const Params p) {
   }
 }
 
+/**
+ * @brief `attend_chunk` folds 16 keys from shared memory into one warp's online softmax over its
+ * 16 query rows: S = Q K^T and O += P V on tensor cores, the masks and the rescaling in between.
+ *
+ * @param[in] p Kernel parameters.
+ * @param[in] tile Shared memory tile with the step's keys, values and key positions.
+ * @param[in] q_fragments This warp's query rows as A fragments, one per 16 head dimensions.
+ * @param[in] first_key First of the 16 keys, within the step.
+ * @param[in] first_row First of the warp's 16 query rows.
+ * @param[in] seq_len Cached tokens of this request: the first new token's position.
+ * @param[in] logit_scale_log2 Factor from Q K^T to base-2 logits.
+ * @param[in,out] state This thread's part of the warp's softmax state and outputs.
+ *
+ * @par Example
+ * @code
+ * attend_chunk(p, tile, q_fragments, chunk * kChunkKeys, first_row, seq_len, scale, state);
+ * @endcode
+ */
+__device__ void attend_chunk(const Params& p, const SharedTile& tile,
+                             const uint32_t (&q_fragments)[kDepthSteps][4], int first_key,
+                             int first_row, int seq_len, float logit_scale_log2, WarpState& state) {
+  const int lane = threadIdx.x % kWarpSize;
+  const int group_size = p.q_head_count / p.kv_head_count;
+  float scores[2][4] = {};
+  for (int n = 0; n < 2; ++n) {
+    for (int pair = 0; pair < kDepthSteps / 2; ++pair) {
+      uint32_t b[4];
+      load_matrices<false>(
+          b, &tile.k[first_key + n * kMmaCols + lane % 8][32 * pair + 8 * (lane / 8)]);
+      mma_16x8x16(scores[n], q_fragments[2 * pair], b[0], b[1]);
+      mma_16x8x16(scores[n], q_fragments[2 * pair + 1], b[2], b[3]);
+    }
+  }
+  for (int half = 0; half < 2; ++half) {
+    const int query_position = seq_len + (first_row + lane / 4 + 8 * half) / group_size;
+    float chunk_max = -INFINITY;
+    for (int n = 0; n < 2; ++n) {
+      for (int e = 2 * half; e < 2 * half + 2; ++e) {
+        const int key_position =
+            tile.key_position[first_key + n * kMmaCols + 2 * (lane % 4) + e % 2];
+        const bool is_visible = key_position >= 0 && key_position <= query_position &&
+                                (p.window == 0 || key_position > query_position - p.window);
+        scores[n][e] = is_visible ? scores[n][e] * logit_scale_log2 : -INFINITY;
+        chunk_max = fmaxf(chunk_max, scores[n][e]);
+      }
+    }
+    chunk_max = fmaxf(chunk_max, __shfl_xor_sync(0xffffffffu, chunk_max, 1));
+    chunk_max = fmaxf(chunk_max, __shfl_xor_sync(0xffffffffu, chunk_max, 2));
+    const float new_max = fmaxf(state.max_log2[half], chunk_max);
+    const float safe_max = new_max == -INFINITY ? 0.0f : new_max;
+    const float rescale = exp2f(state.max_log2[half] - safe_max);
+    state.max_log2[half] = new_max;
+    state.sum[half] *= rescale;
+    for (int d = 0; d < kDimTiles; ++d) {
+      state.out[d][2 * half] *= rescale;
+      state.out[d][2 * half + 1] *= rescale;
+    }
+    for (int n = 0; n < 2; ++n) {
+      for (int e = 2 * half; e < 2 * half + 2; ++e) {
+        scores[n][e] = exp2f(scores[n][e] - safe_max);
+        state.sum[half] += scores[n][e];
+      }
+    }
+  }
+  const uint32_t p_fragment[4] = {
+      pack_halves(scores[0][0], scores[0][1]), pack_halves(scores[0][2], scores[0][3]),
+      pack_halves(scores[1][0], scores[1][1]), pack_halves(scores[1][2], scores[1][3])};
+  for (int pair = 0; pair < kDimTiles / 2; ++pair) {
+    uint32_t b[4];
+    load_matrices<true>(
+        b, &tile.v[first_key + 8 * ((lane / 8) % 2) + lane % 8][16 * pair + 8 * (lane / 16)]);
+    mma_16x8x16(state.out[2 * pair], p_fragment, b[0], b[1]);
+    mma_16x8x16(state.out[2 * pair + 1], p_fragment, b[2], b[3]);
+  }
+}
+
+/**
+ * @brief `combine_warps` merges the softmax states of the warps that share query rows into the
+ * block's state: unnormalized outputs in `out`, row maxima (natural-log units) and row sums.
+ *
+ * @param[in,out] tile Shared memory tile: reads the warps' states, writes `out`, `row_max` and
+ * `row_sum`.
+ * @param[in] row_count Query rows (L x query heads per KV head).
+ * @param[in] m_tile_count Groups of 16 query rows.
+ * @param[in] key_group_count Warps per group of 16 query rows, each over its own keys.
+ *
+ * @par Example
+ * @code
+ * combine_warps(tile, row_count, m_tile_count, key_group_count);
+ * @endcode
+ */
+__device__ void combine_warps(SharedTile& tile, int row_count, int m_tile_count,
+                              int key_group_count) {
+  for (int element = threadIdx.x; element < row_count * kHeadDim; element += kThreads) {
+    const int row = element / kHeadDim;
+    const int d = element % kHeadDim;
+    const int m_tile = row / kMmaRows;
+    const int row_in_tile = row % kMmaRows;
+    float merged_max = -INFINITY;
+    for (int group = 0; group < key_group_count; ++group) {
+      merged_max = fmaxf(merged_max, tile.warp_max[group * m_tile_count + m_tile][row_in_tile]);
+    }
+    const float safe_max = merged_max == -INFINITY ? 0.0f : merged_max;
+    float merged_sum = 0.0f;
+    float merged_out = 0.0f;
+    for (int group = 0; group < key_group_count; ++group) {
+      const int warp = group * m_tile_count + m_tile;
+      const float weight = exp2f(tile.warp_max[warp][row_in_tile] - safe_max);
+      merged_sum += weight * tile.warp_sum[warp][row_in_tile];
+      merged_out += weight * tile.warp_out[warp][row_in_tile][d];
+    }
+    tile.out[row][d] = merged_out;
+    if (d == 0) {
+      tile.row_max[row] = merged_max / kLog2e;
+      tile.row_sum[row] = merged_sum;
+    }
+  }
+}
+
+/**
+ * @brief `merge_splits` publishes this block's softmax state and, in the last block of its
+ * request and KV head to arrive, merges every split's state into `out` and `row_sum`.
+ *
+ * @param[in] p Kernel parameters.
+ * @param[in,out] tile Shared memory tile with this block's state; the merging block gets the
+ * merged state and uses `split_weight` for each split's weight per row.
+ * @param[in] b Request index.
+ * @param[in] kv_head Key/value head index.
+ * @param[in] split This block's split.
+ * @param[in] row_count Query rows (L x query heads per KV head).
+ * @return Whether this block merged and must write the output.
+ *
+ * @par Example
+ * @code
+ * if (merge_splits(p, tile, b, kv_head, split, row_count)) { ... }
+ * @endcode
+ */
+__device__ bool merge_splits(const Params& p, SharedTile& tile, int b, int kv_head, int split,
+                             int row_count) {
+  const int group = b * p.kv_head_count + kv_head;
+  const int64_t first_slot = static_cast<int64_t>(group) * p.split_count * kMaxRows;
+  const int64_t own_slot = first_slot + static_cast<int64_t>(split) * kMaxRows;
+  for (int element = threadIdx.x; element < row_count * kHeadDim; element += kThreads) {
+    p.partial_out_device[own_slot * kHeadDim + element] =
+        tile.out[element / kHeadDim][element % kHeadDim];
+  }
+  for (int row = threadIdx.x; row < row_count; row += kThreads) {
+    p.partial_max_device[own_slot + row] = tile.row_max[row];
+    p.partial_sum_device[own_slot + row] = tile.row_sum[row];
+  }
+  __threadfence();
+  __syncthreads();
+  if (threadIdx.x == 0) {
+    tile.is_last_split = atomicAdd(&p.arrival_count_device[group], 1) == p.split_count - 1;
+  }
+  __syncthreads();
+  if (!tile.is_last_split) {
+    return false;
+  }
+  __threadfence();
+  for (int row = threadIdx.x; row < row_count; row += kThreads) {
+    float merged_max = -INFINITY;
+    for (int s = 0; s < p.split_count; ++s) {
+      tile.split_weight[s][row] = __ldcg(&p.partial_max_device[first_slot + s * kMaxRows + row]);
+      merged_max = fmaxf(merged_max, tile.split_weight[s][row]);
+    }
+    float merged_sum = 0.0f;
+    for (int s = 0; s < p.split_count; ++s) {
+      tile.split_weight[s][row] = expf(tile.split_weight[s][row] - merged_max);
+      merged_sum += tile.split_weight[s][row] *
+                    __ldcg(&p.partial_sum_device[first_slot + s * kMaxRows + row]);
+    }
+    tile.row_sum[row] = merged_sum;
+  }
+  __syncthreads();
+  for (int element = threadIdx.x; element < row_count * kHeadDim; element += kThreads) {
+    float merged_out = 0.0f;
+    for (int s = 0; s < p.split_count; ++s) {
+      merged_out += tile.split_weight[s][element / kHeadDim] *
+                    __ldcg(&p.partial_out_device[(first_slot + s * kMaxRows) * kHeadDim + element]);
+    }
+    tile.out[element / kHeadDim][element % kHeadDim] = merged_out;
+  }
+  if (threadIdx.x == 0) {
+    p.arrival_count_device[group] = 0;
+  }
+  __syncthreads();
+  return true;
+}
+
 }  // namespace
 
 /**
@@ -871,7 +1066,7 @@ def _get_extension() -> object:
     """
     if "module" not in _extension_cache:
         _extension_cache["module"] = load_inline(
-            name="muse_fused_attention_fp16_staging",
+            name="muse_fused_attention_mma_pieces",
             cpp_sources=CPP_SOURCE,
             cuda_sources=CUDA_SOURCE,
             functions=["run"],
