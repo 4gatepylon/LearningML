@@ -6,12 +6,13 @@ one request and one key/value head, for every query head of that group and every
 block. It:
 
 1. Copies its query and gate rows to shared memory in one `cp.async` batch, RMS-normalizes the
-   queries, scales them by `qk_scale_factor`, applies RoPE from a per-token cos/sin table and
-   rounds them to bf16, as `reference.py` does.
+   queries, applies RoPE from a per-token cos/sin table and rounds them to FP8 E4M3, as FA3 does
+   (`qk_scale_factor` joins the softmax scale).
 2. Streams its chunk of cached FP8 keys and values 64 at a time through a 4-stage `cp.async`
-   ring in shared memory, converting each step to fp16. Each warp attends its 16 query rows over
-   its share of the step's keys: S = Q K^T and O += P V run on tensor cores (`mma.sync`), with one
-   online-softmax update per step. Only steps at the edge of the window or chunk apply the mask.
+   ring in shared memory. Each warp attends its 16 query rows over its share of the step's keys:
+   S = Q K^T runs on FP8 tensor cores straight from the ring, the values are converted to fp16
+   for O += P V, and the online softmax updates once per step. Only steps at the edge of the
+   window or chunk apply the mask.
 3. In the first chunk's block only: normalizes the block's new keys, applies RoPE, writes the new
    keys and values to the FP8 cache, and attends to them as one last, causal step.
 4. Combines its warps' softmax states and publishes the block's state. A two-level tree merges
@@ -53,11 +54,12 @@ constexpr int kWarps = kThreads / kWarpSize;
 constexpr int kStepKeys = 64;
 constexpr int kMmaRows = 16;
 constexpr int kMmaCols = 8;
-constexpr int kMmaDepth = 16;
 constexpr int kChunkKeys = 16;
 constexpr int kDimTiles = kHeadDim / kMmaCols;
-constexpr int kDepthSteps = kHeadDim / kMmaDepth;
 constexpr int kRowStride = kHeadDim + 8;
+constexpr int kRawStride = kHeadDim + 16;
+constexpr int kFp8MmaDepth = 32;
+constexpr int kQkSteps = kHeadDim / kFp8MmaDepth;
 constexpr int kBytesPerLoad = 16;
 constexpr int kLoadsPerRow = kHeadDim / kBytesPerLoad;
 constexpr int kLoadsPerThread = kStepKeys * kLoadsPerRow / kThreads;
@@ -96,13 +98,12 @@ struct Params {
 };
 
 struct StepTile {
-  __half k[kStepKeys][kRowStride];
   __half v[kStepKeys][kRowStride];
 };
 
 struct StartTile {
   __nv_bfloat16 q_in[kMaxRows][kHeadDim];
-  __half q[kMaxRows][kRowStride];
+  uint8_t q[kMaxRows][kRawStride];
 };
 
 struct MergeTile {
@@ -121,7 +122,7 @@ struct SharedTile {
     float out[kMaxRows][kHeadDim];
   };
   float2 rotation[kMaxTokens][kHeadDim / 2];
-  uint8_t raw_k[kStages][kStepKeys][kHeadDim];
+  uint8_t raw_k[kStages][kStepKeys][kRawStride];
   uint8_t raw_v[kStages][kStepKeys][kHeadDim];
   int raw_position[kStages][kStepKeys];
   int key_position[kStepKeys];
@@ -241,6 +242,28 @@ __device__ void mma_16x8x16(float (&d)[4], const uint32_t (&a)[4], uint32_t b0, 
 }
 
 /**
+ * @brief `mma_16x8x32_fp8` accumulates D += A B on tensor cores for one warp: A is 16 x 32 and B is
+ * 32 x 8, both FP8 E4M3, in the `mma.sync.m16n8k32` fragment layouts; D is fp32.
+ *
+ * @param[in,out] d This thread's 4 accumulator elements.
+ * @param[in] a This thread's A fragment (4 registers of 4 FP8 values).
+ * @param[in] b0 First register of this thread's B fragment.
+ * @param[in] b1 Second register of this thread's B fragment.
+ *
+ * @par Example
+ * @code
+ * mma_16x8x32_fp8(scores[n], q_fragments[s], b[0], b[1]);
+ * @endcode
+ */
+__device__ void mma_16x8x32_fp8(float (&d)[4], const uint32_t (&a)[4], uint32_t b0, uint32_t b1) {
+  asm volatile(
+      "mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, "
+      "{%8, %9}, {%0, %1, %2, %3};\n"
+      : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
+      : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
+}
+
+/**
  * @brief `load_matrices` loads four 8 x 8 fp16 matrices from shared memory into one register each
  * per thread (`ldmatrix.x4`), optionally transposed.
  *
@@ -254,7 +277,7 @@ __device__ void mma_16x8x16(float (&d)[4], const uint32_t (&a)[4], uint32_t b0, 
  * @endcode
  */
 template <bool kIsTransposed>
-__device__ void load_matrices(uint32_t (&r)[4], const __half* row_address) {
+__device__ void load_matrices(uint32_t (&r)[4], const void* row_address) {
   const uint32_t address = static_cast<uint32_t>(__cvta_generic_to_shared(row_address));
   if (kIsTransposed) {
     asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0, %1, %2, %3}, [%4];\n"
@@ -292,7 +315,7 @@ __device__ uint32_t pack_halves(float low, float high) {
  *
  * @par Example
  * @code
- * store_fp8_as_halves(raw_bytes, &tile.step.k[key][dim]);
+ * store_fp8_as_halves(raw_bytes, &tile.step.v[key][dim]);
  * @endcode
  */
 __device__ void store_fp8_as_halves(const uint4& bytes, __half* destination) {
@@ -467,10 +490,10 @@ __device__ void start_step_copy(const Params& p, SharedTile& tile, int kv_head,
 }
 
 /**
- * @brief `convert_step` converts this thread's pieces of a ring stage to the fp16 keys and values
- * that the tensor cores read.
+ * @brief `convert_step` converts this thread's pieces of a ring stage's values to the fp16 that
+ * the P V tensor cores read; the keys stay FP8.
  *
- * @param[in,out] tile Shared memory tile: reads the stage, writes keys, values and key positions.
+ * @param[in,out] tile Shared memory tile: reads the stage, writes values and key positions.
  * @param[in] stage Ring stage whose copies this thread has waited for.
  *
  * @par Example
@@ -483,8 +506,6 @@ __device__ void convert_step(SharedTile& tile, int stage) {
     const int piece = i * kThreads + threadIdx.x;
     const int key = piece / kLoadsPerRow;
     const int dim = (piece % kLoadsPerRow) * kBytesPerLoad;
-    store_fp8_as_halves(*reinterpret_cast<const uint4*>(&tile.raw_k[stage][key][dim]),
-                        &tile.step.k[key][dim]);
     store_fp8_as_halves(*reinterpret_cast<const uint4*>(&tile.raw_v[stage][key][dim]),
                         &tile.step.v[key][dim]);
     if (piece % kLoadsPerRow == 0) {
@@ -498,7 +519,8 @@ __device__ void convert_step(SharedTile& tile, int stage) {
  * values to the FP8 cache, and puts the stored values in shared memory as a step of keys.
  *
  * @param[in] p Kernel parameters.
- * @param[out] tile Shared memory tile: keys 0 to L - 1 are the new ones, the rest are missing.
+ * @param[out] tile Shared memory tile: ring stage 0 holds the new FP8 keys in rows 0 to L - 1, the
+ * fp16 values tile their values, and the other keys are missing.
  * @param[in] b Request index.
  * @param[in] kv_head Key/value head index.
  * @param[in] seq_len Cached tokens of this request: the first new token's position.
@@ -513,8 +535,8 @@ __device__ void store_new_keys(const Params& p, SharedTile& tile, int b, int kv_
   const int lane = threadIdx.x % kWarpSize;
   const int qkv_row_size = (2 * p.q_head_count + 2 * p.kv_head_count) * kHeadDim;
   for (int key = warp; key < kStepKeys; key += kWarps) {
-    __half2 k_stored = __floats2half2_rn(0.0f, 0.0f);
-    __half2 v_stored = k_stored;
+    __nv_fp8_e4m3 k_stored[2] = {__nv_fp8_e4m3(0.0f), __nv_fp8_e4m3(0.0f)};
+    __half2 v_stored = __floats2half2_rn(0.0f, 0.0f);
     if (key < p.L) {
       const __nv_bfloat162* token =
           reinterpret_cast<const __nv_bfloat162*>(p.qkv_device + (b * p.L + key) * qkv_row_size);
@@ -533,10 +555,12 @@ __device__ void store_new_keys(const Params& p, SharedTile& tile, int b, int kv_
       p.k_cache_device[offset + 1] = k_fp8[1];
       p.v_cache_device[offset] = v_fp8[0];
       p.v_cache_device[offset + 1] = v_fp8[1];
-      k_stored = __floats2half2_rn(static_cast<float>(k_fp8[0]), static_cast<float>(k_fp8[1]));
+      k_stored[0] = k_fp8[0];
+      k_stored[1] = k_fp8[1];
       v_stored = __floats2half2_rn(static_cast<float>(v_fp8[0]), static_cast<float>(v_fp8[1]));
     }
-    reinterpret_cast<__half2*>(&tile.step.k[key][0])[lane] = k_stored;
+    tile.raw_k[0][key][2 * lane] = k_stored[0].__x;
+    tile.raw_k[0][key][2 * lane + 1] = k_stored[1].__x;
     reinterpret_cast<__half2*>(&tile.step.v[key][0])[lane] = v_stored;
     if (lane == 0) {
       tile.key_position[key] = key < p.L ? seq_len + key : -1;
@@ -547,12 +571,13 @@ __device__ void store_new_keys(const Params& p, SharedTile& tile, int b, int kv_
 /**
  * @brief `attend_keys` folds this warp's keys of a step (`kChunkCount` chunks of 16) into its
  * online softmax over its 16 query rows: S = Q K^T on tensor cores, one max and one rescale for
- * all of them, then O += P V on tensor cores.
+ * all of them, then O += P V on tensor cores. S uses FP8 keys and queries, P V uses fp16.
  *
  * @tparam kChunkCount Chunks of 16 keys this warp attends in the step.
  * @param[in] p Kernel parameters.
- * @param[in] tile Shared memory tile with the step's keys, values and key positions.
- * @param[in] q_fragments This warp's query rows as A fragments, one per 16 head dimensions.
+ * @param[in] tile Shared memory tile with the step's fp16 values and key positions.
+ * @param[in] keys The step's FP8 keys, one padded row per key.
+ * @param[in] q_fragments This warp's FP8 query rows as A fragments, one per 32 head dimensions.
  * @param[in] first_key First of the warp's keys, within the step.
  * @param[in] first_row First of the warp's 16 query rows.
  * @param[in] seq_len Cached tokens of this request: the first new token's position.
@@ -563,26 +588,25 @@ __device__ void store_new_keys(const Params& p, SharedTile& tile, int b, int kv_
  *
  * @par Example
  * @code
- * attend_keys<4>(p, tile, q_fragments, 0, first_row, seq_len, scale, is_masked, state);
+ * attend_keys<4>(p, tile, keys, q_fragments, 0, first_row, seq_len, scale, is_masked, state);
  * @endcode
  */
 template <int kChunkCount>
 __device__ void attend_keys(const Params& p, const SharedTile& tile,
-                            const uint32_t (&q_fragments)[kDepthSteps][4], int first_key,
+                            const uint8_t (*keys)[kRawStride],
+                            const uint32_t (&q_fragments)[kQkSteps][4], int first_key,
                             int first_row, int seq_len, float logit_scale_log2, bool is_masked,
                             WarpState& state) {
   const int lane = threadIdx.x % kWarpSize;
   const int group_size = p.q_head_count / p.kv_head_count;
   float scores[kChunkCount][2][4] = {};
   for (int chunk = 0; chunk < kChunkCount; ++chunk) {
-    for (int pair = 0; pair < kDepthSteps / 2; ++pair) {
-      for (int n = 0; n < 2; ++n) {
-        const int key = first_key + chunk * kChunkKeys + n * kMmaCols + lane % 8;
-        uint32_t b[4];
-        load_matrices<false>(b, &tile.step.k[key][32 * pair + 8 * (lane / 8)]);
-        mma_16x8x16(scores[chunk][n], q_fragments[2 * pair], b[0], b[1]);
-        mma_16x8x16(scores[chunk][n], q_fragments[2 * pair + 1], b[2], b[3]);
-      }
+    for (int n = 0; n < 2; ++n) {
+      uint32_t b[4];
+      load_matrices<false>(b, &keys[first_key + chunk * kChunkKeys + n * kMmaCols + lane % 8]
+                                   [kBytesPerLoad * (lane / 8)]);
+      mma_16x8x32_fp8(scores[chunk][n], q_fragments[0], b[0], b[1]);
+      mma_16x8x32_fp8(scores[chunk][n], q_fragments[1], b[2], b[3]);
     }
   }
   for (int half = 0; half < 2; ++half) {
@@ -643,8 +667,9 @@ __device__ void attend_keys(const Params& p, const SharedTile& tile,
  * @brief `attend_step` hands this warp's share of a step's 64 keys to `attend_keys`.
  *
  * @param[in] p Kernel parameters.
- * @param[in] tile Shared memory tile with the step's keys, values and key positions.
- * @param[in] q_fragments This warp's query rows as A fragments.
+ * @param[in] tile Shared memory tile with the step's fp16 values and key positions.
+ * @param[in] keys The step's FP8 keys, one padded row per key.
+ * @param[in] q_fragments This warp's FP8 query rows as A fragments.
  * @param[in] key_group This warp's share: keys `key_group * 64 / key_group_count` onwards.
  * @param[in] key_group_count Warps sharing the same query rows: 4, 2 or 1.
  * @param[in] first_row First of the warp's 16 query rows.
@@ -655,23 +680,24 @@ __device__ void attend_keys(const Params& p, const SharedTile& tile,
  *
  * @par Example
  * @code
- * attend_step(p, tile, q_fragments, key_group, 4, first_row, seq_len, scale, false, state);
+ * attend_step(p, tile, keys, q_fragments, key_group, 4, first_row, seq_len, scale, false, state);
  * @endcode
  */
 __device__ void attend_step(const Params& p, const SharedTile& tile,
-                            const uint32_t (&q_fragments)[kDepthSteps][4], int key_group,
+                            const uint8_t (*keys)[kRawStride],
+                            const uint32_t (&q_fragments)[kQkSteps][4], int key_group,
                             int key_group_count, int first_row, int seq_len, float logit_scale_log2,
                             bool is_masked, WarpState& state) {
   const int first_key = key_group * kStepKeys / key_group_count;
   if (key_group_count == 4) {
-    attend_keys<1>(p, tile, q_fragments, first_key, first_row, seq_len, logit_scale_log2, is_masked,
-                   state);
+    attend_keys<1>(p, tile, keys, q_fragments, first_key, first_row, seq_len, logit_scale_log2,
+                   is_masked, state);
   } else if (key_group_count == 2) {
-    attend_keys<2>(p, tile, q_fragments, first_key, first_row, seq_len, logit_scale_log2, is_masked,
-                   state);
+    attend_keys<2>(p, tile, keys, q_fragments, first_key, first_row, seq_len, logit_scale_log2,
+                   is_masked, state);
   } else {
-    attend_keys<4>(p, tile, q_fragments, first_key, first_row, seq_len, logit_scale_log2, is_masked,
-                   state);
+    attend_keys<4>(p, tile, keys, q_fragments, first_key, first_row, seq_len, logit_scale_log2,
+                   is_masked, state);
   }
 }
 
@@ -930,38 +956,37 @@ __global__ void __launch_bounds__(kThreads) attention_kernel(const Params p) {
     if (row < row_count) {
       const float2 q_in = __bfloat1622float2(
           reinterpret_cast<const __nv_bfloat162*>(&tile.start.q_in[row][0])[lane]);
-      q = normalize_and_rotate(q_in, p.qk_scale_factor, tile.rotation[row / group_size][lane]);
+      q = normalize_and_rotate(q_in, 1.0f, tile.rotation[row / group_size][lane]);
     }
-    const __nv_bfloat162 q_bf16 = __float22bfloat162_rn(q);
-    reinterpret_cast<__half2*>(&tile.start.q[row][0])[lane] =
-        __float22half2_rn(__bfloat1622float2(q_bf16));
+    tile.start.q[row][2 * lane] = __nv_fp8_e4m3(q.x).__x;
+    tile.start.q[row][2 * lane + 1] = __nv_fp8_e4m3(q.y).__x;
   }
   __syncthreads();
-  uint32_t q_fragments[kDepthSteps][4];
-  for (int depth = 0; depth < kDepthSteps; ++depth) {
+  uint32_t q_fragments[kQkSteps][4];
+  for (int depth = 0; depth < kQkSteps; ++depth) {
     load_matrices<false>(q_fragments[depth],
                          &tile.start.q[m_tile * kMmaRows + 8 * ((lane / 8) % 2) + lane % 8]
-                                      [kMmaDepth * depth + 8 * (lane / 16)]);
+                                      [kFp8MmaDepth * depth + kBytesPerLoad * (lane / 16)]);
   }
   WarpState state = {};
   state.max_log2[0] = state.max_log2[1] = -INFINITY;
-  const float logit_scale_log2 = p.sm_scale * *p.k_scale_device * kLog2e;
+  const float logit_scale_log2 = p.sm_scale * p.qk_scale_factor * *p.k_scale_device * kLog2e;
   const int first_row = m_tile * kMmaRows;
   for (int step = 0; first_position_incl + step * kStepKeys < end_position_excl; ++step) {
+    wait_for_copies<kStages - 2>();
+    __syncthreads();
+    convert_step(tile, step % kStages);
     const KeyAddresses next_addresses = locate_keys(
         p, b, kv_head, first_position_incl + (step + kStages) * kStepKeys, end_position_excl);
     start_step_copy(p, tile, kv_head, addresses, (step + kStages - 1) % kStages);
     addresses = next_addresses;
-    wait_for_copies<kStages - 1>();
-    __syncthreads();
-    convert_step(tile, step % kStages);
     __syncthreads();
     const int start = first_position_incl + step * kStepKeys;
     const bool is_masked = start + kStepKeys > end_position_excl ||
                            (p.window != 0 && start < window_start_incl + p.L - 1);
     if (is_active) {
-      attend_step(p, tile, q_fragments, key_group, key_group_count, first_row, seq_len,
-                  logit_scale_log2, is_masked, state);
+      attend_step(p, tile, tile.raw_k[step % kStages], q_fragments, key_group, key_group_count,
+                  first_row, seq_len, logit_scale_log2, is_masked, state);
     }
   }
   wait_for_copies<0>();
@@ -970,8 +995,8 @@ __global__ void __launch_bounds__(kThreads) attention_kernel(const Params p) {
     store_new_keys(p, tile, b, kv_head, seq_len);
     __syncthreads();
     if (is_active) {
-      attend_step(p, tile, q_fragments, key_group, key_group_count, first_row, seq_len,
-                  logit_scale_log2, true, state);
+      attend_step(p, tile, tile.raw_k[0], q_fragments, key_group, key_group_count, first_row,
+                  seq_len, logit_scale_log2, true, state);
     }
   }
   __syncthreads();
@@ -1131,7 +1156,7 @@ def _get_extension() -> object:
     """
     if "module" not in _extension_cache:
         _extension_cache["module"] = load_inline(
-            name="muse_fused_attention_step_softmax",
+            name="muse_fused_attention_fp8_scores",
             cpp_sources=CPP_SOURCE,
             cuda_sources=CUDA_SOURCE,
             functions=["run", "resident_blocks_per_sm"],
