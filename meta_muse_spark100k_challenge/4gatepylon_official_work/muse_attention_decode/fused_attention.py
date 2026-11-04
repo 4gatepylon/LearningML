@@ -1378,7 +1378,8 @@ __device__ bool arrive(const Params& p, SharedTile& tile, int counter, int expec
 }
 
 /**
- * @brief `merge_slots` merges up to 16 published softmax states into the block's state in `tile`.
+ * @brief `merge_slots` merges up to 16 published softmax states into the block's state in `tile`,
+ * with one warp per row and one lane per slot for the weights.
  *
  * @param[in] p Kernel parameters.
  * @param[in,out] tile Shared memory tile: gets the merged outputs, row maxima and row sums; uses
@@ -1404,22 +1405,24 @@ __device__ void merge_slots(const Params& p, SharedTile& tile, int64_t first_slo
         __ldcg(&p.partial_sum_device[slot * kMaxRows + index % row_count]);
   }
   __syncthreads();
-  for (int row = threadIdx.x; row < row_count; row += thread_count()) {
-    float merged_max = -INFINITY;
-    for (int s = 0; s < slot_count; ++s) {
-      merged_max = fmaxf(merged_max, tile.merge.split_weight[s][row]);
+  const int lane = threadIdx.x % kWarpSize;
+  for (int row = threadIdx.x / kWarpSize; row < row_count; row += warp_count()) {
+    const bool is_slot = lane < slot_count;
+    const float slot_max = is_slot ? tile.merge.split_weight[lane][row] : -INFINITY;
+    float merged_max = slot_max;
+    for (int offset = kMergeFanIn / 2; offset > 0; offset /= 2) {
+      merged_max = fmaxf(merged_max, __shfl_xor_sync(0xffffffffu, merged_max, offset));
     }
     const float safe_max = merged_max == -INFINITY ? 0.0f : merged_max;
-    float merged_sum = 0.0f;
-#pragma unroll
-    for (int s = 0; s < kMergeFanIn; ++s) {
-      if (s < slot_count) {
-        tile.merge.split_weight[s][row] = expf(tile.merge.split_weight[s][row] - safe_max);
-        merged_sum += tile.merge.split_weight[s][row] * tile.merge.split_sum[s][row];
-      }
+    const float weight = is_slot ? expf(slot_max - safe_max) : 0.0f;
+    if (is_slot) {
+      tile.merge.split_weight[lane][row] = weight;
     }
-    tile.row_max[row] = merged_max;
-    tile.row_sum[row] = merged_sum;
+    const float merged_sum = warp_sum(is_slot ? weight * tile.merge.split_sum[lane][row] : 0.0f);
+    if (lane == 0) {
+      tile.row_max[row] = merged_max;
+      tile.row_sum[row] = merged_sum;
+    }
   }
   __syncthreads();
   for (int vector = threadIdx.x; vector < row_count * kVectorsPerRow; vector += thread_count()) {
@@ -2041,7 +2044,7 @@ def _get_extension() -> object:
     """
     if "module" not in _extension_cache:
         _extension_cache["module"] = load_inline(
-            name="muse_fused_attention_merge_unroll",
+            name="muse_fused_attention_tree_lanes",
             cpp_sources=CPP_SOURCE,
             cuda_sources=CUDA_SOURCE,
             functions=["run", "resident_blocks_per_sm"],
