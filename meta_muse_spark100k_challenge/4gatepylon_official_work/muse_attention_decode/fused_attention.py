@@ -93,6 +93,9 @@ constexpr int kMaxTokens = 8;
 constexpr int kMergeFanIn = 16;
 constexpr int kMaxMergeGroups = kMaxSplits / kMergeFanIn;
 constexpr int kCountersPerGroup = kMaxMergeGroups + 1;
+constexpr int kMaxMergers = 16;
+constexpr int kMaxMergeWeights = kMaxSplits * kMaxRows / kMaxMergers;
+constexpr int kMaxThreads = kMaxWarps * kWarpSize;
 constexpr int kFloatsPerVector = 4;
 constexpr int kVectorsPerRow = kHeadDim / kFloatsPerVector;
 constexpr int kPiecesPerRow = kHeadDim * 2 / kBytesPerLoad;
@@ -167,7 +170,8 @@ struct RingTile {
 
 /**
  * @brief `MergeTile` holds what the merge and the output need after the loop: each merged slot's
- * weight and softmax sum per row, and the block's gate rows.
+ * weight and softmax sum per row (`split_*` for the decode tree, `row_*` for the verify mergers'
+ * rows), the verify mergers' partial sums, and the block's gate rows.
  *
  * @par Example
  * @code
@@ -177,6 +181,9 @@ struct RingTile {
 struct MergeTile {
   float split_weight[kMergeFanIn][kMaxRows];
   float split_sum[kMergeFanIn][kMaxRows];
+  float row_weight[kMaxMergeWeights];
+  float row_split_sum[kMaxMergeWeights];
+  float4 partial_sums[kMaxThreads];
   __nv_bfloat16 gate[kMaxRows][kHeadDim];
 };
 
@@ -215,6 +222,7 @@ struct SharedTile {
   float row_max[kMaxRows];
   float row_sum[kMaxRows];
   bool is_last_split;
+  int merge_rank;
   int64_t new_cache_loc[kMaxTokens];
   float k_scale;
   float v_scale;
@@ -362,21 +370,25 @@ __device__ float2 normalize_and_rotate(float2 x, float gain, float2 rotation) {
  * @param[in] b Request index.
  * @param[in] kv_head Key/value head index.
  * @param[in] row_count Query rows (L x query heads per KV head).
+ * @param[in] first_row First row this block writes.
+ * @param[in] row_step Distance between the rows this block writes.
  *
  * @par Example
  * @code
- * write_gated_output(p, tile, b, kv_head, row_count);
+ * write_gated_output(p, tile, b, kv_head, row_count, merge_rank, merger_count);
  * @endcode
  */
 __device__ void write_gated_output(const Params& p, const SharedTile& tile, int b, int kv_head,
-                                   int row_count) {
+                                   int row_count, int first_row, int row_step) {
   const int group_size = p.q_head_count / p.kv_head_count;
   const int rows_per_warp = kWarpSize / kLanesPerOutputRow;
   const int lane = threadIdx.x % kWarpSize;
   const int first_dim = lane % kLanesPerOutputRow * kDimsPerOutputLane;
-  for (int warp_row = threadIdx.x / kWarpSize * rows_per_warp; warp_row < row_count;
+  const int my_row_count = (row_count - first_row + row_step - 1) / row_step;
+  for (int warp_row = threadIdx.x / kWarpSize * rows_per_warp; warp_row < my_row_count;
        warp_row += warp_count() * rows_per_warp) {
-    const int row = min(warp_row + lane / kLanesPerOutputRow, row_count - 1);
+    const int row =
+        first_row + min(warp_row + lane / kLanesPerOutputRow, my_row_count - 1) * row_step;
     const float scale = tile.v_scale / tile.row_sum[row];
     float o[kDimsPerOutputLane];
     float square_sum = 0.0f;
@@ -395,7 +407,7 @@ __device__ void write_gated_output(const Params& p, const SharedTile& tile, int 
       outs[i] = __float22bfloat162_rn(make_float2(o[2 * i] * inv_rms / (1.0f + expf(-g.x)),
                                                   o[2 * i + 1] * inv_rms / (1.0f + expf(-g.y))));
     }
-    if (warp_row + lane / kLanesPerOutputRow < row_count) {
+    if (warp_row + lane / kLanesPerOutputRow < my_row_count) {
       const int token = b * p.L + row / group_size;
       const int head = kv_head * group_size + row % group_size;
       *reinterpret_cast<uint4*>(p.out_device + (token * p.q_head_count + head) * kHeadDim +
@@ -1428,6 +1440,99 @@ __device__ void merge_slots(const Params& p, SharedTile& tile, int64_t first_slo
 }
 
 /**
+ * @brief `merger_count` returns how many blocks merge each request and KV head's splits: one
+ * per slice of rows, at most `kMaxMergers`.
+ *
+ * @param[in] p Kernel parameters.
+ * @param[in] row_count Query rows (L x query heads per KV head).
+ * @return The merger count.
+ *
+ * @par Example
+ * @code
+ * const int mergers = merger_count(p, row_count);
+ * @endcode
+ */
+__device__ int merger_count(const Params& p, int row_count) {
+  return min(kMaxMergers, min(p.split_count, row_count));
+}
+
+/**
+ * @brief `take_merge_rank` counts this block in once its state is published, and returns its rank
+ * among the last `merger_count` blocks to arrive, which merge; earlier blocks get a negative rank.
+ *
+ * @param[in] p Kernel parameters.
+ * @param[in,out] tile Shared memory tile: its `merge_rank`.
+ * @param[in] group Request x KV-head group.
+ * @param[in] mergers `merger_count`.
+ * @return The merge rank, or a negative number.
+ *
+ * @par Example
+ * @code
+ * const int rank = take_merge_rank(p, tile, group, mergers);
+ * @endcode
+ */
+__device__ int take_merge_rank(const Params& p, SharedTile& tile, int group, int mergers) {
+  __threadfence();
+  __syncthreads();
+  if (threadIdx.x == 0) {
+    tile.merge_rank = atomicAdd(&p.arrival_count_device[kCountersPerGroup * group], 1) -
+                      (p.split_count - mergers);
+  }
+  __syncthreads();
+  return tile.merge_rank;
+}
+
+/**
+ * @brief `wait_for_all_splits` returns once every split of the group has published its state.
+ *
+ * @param[in] p Kernel parameters.
+ * @param[in] group Request x KV-head group.
+ *
+ * @par Example
+ * @code
+ * wait_for_all_splits(p, group);
+ * @endcode
+ *
+ * @par Must know
+ * - Gotchas:
+ *   - The kernel launches cooperatively, so every split is resident and the wait ends.
+ */
+__device__ void wait_for_all_splits(const Params& p, int group) {
+  if (threadIdx.x == 0) {
+    const int* counter = &p.arrival_count_device[kCountersPerGroup * group];
+    int arrived = 0;
+    do {
+      asm volatile("ld.acquire.gpu.global.b32 %0, [%1];\n" : "=r"(arrived) : "l"(counter));
+    } while (arrived < p.split_count);
+  }
+  __syncthreads();
+  __threadfence();
+}
+
+/**
+ * @brief `finish_merge` counts this merger out; the last one resets the group's counters to 0 for
+ * the next call.
+ *
+ * @param[in] p Kernel parameters.
+ * @param[in] group Request x KV-head group.
+ * @param[in] mergers `merger_count`.
+ *
+ * @par Example
+ * @code
+ * finish_merge(p, group, mergers);
+ * @endcode
+ */
+__device__ void finish_merge(const Params& p, int group, int mergers) {
+  if (threadIdx.x == 0) {
+    int* counters = &p.arrival_count_device[kCountersPerGroup * group];
+    if (atomicAdd(&counters[1], 1) == mergers - 1) {
+      counters[0] = 0;
+      counters[1] = 0;
+    }
+  }
+}
+
+/**
  * @brief `merge_splits` merges every split's softmax state with a two-level tree: the last block
  * of each group of 16 splits merges its group, and the last group merger merges the groups.
  *
@@ -1616,7 +1721,7 @@ __global__ void __launch_bounds__(kWarpCount* kWarpSize, kMinBlocksPerSm)
   wait_for_copies<0>();
   __syncthreads();
   if (is_merging_block) {
-    write_gated_output(p, tile, b, kv_head, row_count);
+    write_gated_output(p, tile, b, kv_head, row_count, 0, 1);
   }
 }
 
@@ -1624,7 +1729,8 @@ using attention_kernel_t = void (*)(Params);
 
 /**
  * @brief `KernelBuild` names one compiled kernel build: the kernel, its threads per block, and the
- * blocks per SM its launch bounds and the split plan target.
+ * blocks per SM its launch bounds and the split plan target, and whether it launches
+ * cooperatively (its mergers wait for the other blocks).
  *
  * @par Example
  * @code
@@ -1635,6 +1741,7 @@ struct KernelBuild {
   attention_kernel_t kernel;
   int thread_count;
   int blocks_per_sm;
+  bool is_cooperative;
 };
 
 /**
@@ -1655,18 +1762,18 @@ struct KernelBuild {
 KernelBuild select_kernel(int64_t row_count, int64_t window, int64_t group_count) {
   const int64_t m_tile_count = (row_count + kMmaRows - 1) / kMmaRows;
   if (m_tile_count == 1) {
-    return {attention_kernel<4, 1, kDecodeBlocksPerSm>, kMinThreads, kDecodeBlocksPerSm};
+    return {attention_kernel<4, 1, kDecodeBlocksPerSm>, kMinThreads, kDecodeBlocksPerSm, false};
   }
   if (m_tile_count == 2) {
-    return {attention_kernel<4, 2, kVerifyBlocksPerSm>, kMinThreads, kVerifyBlocksPerSm};
+    return {attention_kernel<4, 2, kVerifyBlocksPerSm>, kMinThreads, kVerifyBlocksPerSm, false};
   }
   TORCH_CHECK(m_tile_count == 4, "verify needs 64 query rows per KV head (4 row tiles), got ",
               row_count, " rows");
   if (window != 0 || group_count <= kMaxWideFullGroups) {
-    return {attention_kernel<8, 2, kWideVerifyBlocksPerSm>, 2 * kMinThreads,
-            kWideVerifyBlocksPerSm};
+    return {attention_kernel<8, 2, kWideVerifyBlocksPerSm>, 2 * kMinThreads, kWideVerifyBlocksPerSm,
+            true};
   }
-  return {attention_kernel<4, 4, kVerifyBlocksPerSm>, kMinThreads, kVerifyBlocksPerSm};
+  return {attention_kernel<4, 4, kVerifyBlocksPerSm>, kMinThreads, kVerifyBlocksPerSm, false};
 }
 
 }  // namespace
@@ -1753,9 +1860,19 @@ void run(torch::Tensor qkv, torch::Tensor k_cache, torch::Tensor v_cache, torch:
                                           qkv.size(0) * p.kv_head_count);
   C10_CUDA_CHECK(cudaFuncSetAttribute(build.kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
                                       sizeof(SharedTile)));
-  build.kernel<<<dim3(p.split_count, k_cache.size(2), qkv.size(0)), build.thread_count,
-                 sizeof(SharedTile), at::cuda::getCurrentCUDAStream()>>>(p);
-  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  cudaLaunchConfig_t config = {};
+  config.gridDim = dim3(p.split_count, k_cache.size(2), qkv.size(0));
+  config.blockDim = dim3(build.thread_count);
+  config.dynamicSmemBytes = sizeof(SharedTile);
+  config.stream = at::cuda::getCurrentCUDAStream();
+  cudaLaunchAttribute cooperative_attribute = {};
+  cooperative_attribute.id = cudaLaunchAttributeCooperative;
+  cooperative_attribute.val.cooperative = 1;
+  if (build.is_cooperative) {
+    config.attrs = &cooperative_attribute;
+    config.numAttrs = 1;
+  }
+  C10_CUDA_CHECK(cudaLaunchKernelEx(&config, build.kernel, p));
 }
 /**
  * @brief `resident_blocks_per_sm` returns how many blocks of `attention_kernel` fit on one SM.
@@ -1813,7 +1930,7 @@ def _get_extension() -> object:
     """
     if "module" not in _extension_cache:
         _extension_cache["module"] = load_inline(
-            name="muse_fused_attention_documented",
+            name="muse_fused_attention_merge_sync",
             cpp_sources=CPP_SOURCE,
             cuda_sources=CUDA_SOURCE,
             functions=["run", "resident_blocks_per_sm"],
