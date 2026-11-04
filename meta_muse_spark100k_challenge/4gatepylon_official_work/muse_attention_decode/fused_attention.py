@@ -92,6 +92,8 @@ constexpr int kFloatsPerVector = 4;
 constexpr int kVectorsPerRow = kHeadDim / kFloatsPerVector;
 constexpr int kPiecesPerRow = kHeadDim * 2 / kBytesPerLoad;
 constexpr float kRmsEps = 1e-5f;
+constexpr int kLanesPerOutputRow = 8;
+constexpr int kDimsPerOutputLane = kHeadDim / kLanesPerOutputRow;
 constexpr float kLog2e = 1.4426950408889634f;
 
 struct Params {
@@ -211,6 +213,27 @@ __device__ float* warp_out_row(SharedTile& tile, int warp, int row_in_tile) {
 }
 
 /**
+ * @brief `lane_group_sum` returns the sum of `x` over each aligned group of `kLaneCount` lanes, in
+ * every lane of the group.
+ *
+ * @tparam kLaneCount Lanes per group, a power of 2 up to 32.
+ * @param[in] x This lane's value.
+ * @return The group's sum.
+ *
+ * @par Example
+ * @code
+ * const float row_total = lane_group_sum<8>(partial);
+ * @endcode
+ */
+template <int kLaneCount>
+__device__ float lane_group_sum(float x) {
+  for (int offset = kLaneCount / 2; offset > 0; offset /= 2) {
+    x += __shfl_xor_sync(0xffffffffu, x, offset);
+  }
+  return x;
+}
+
+/**
  * @brief `warp_sum` returns the sum of `x` over the 32 lanes of a warp, in every lane.
  *
  * @param[in] x This lane's value.
@@ -250,7 +273,8 @@ __device__ float2 normalize_and_rotate(float2 x, float gain, float2 rotation) {
 
 /**
  * @brief `write_gated_output` divides each query row's merged output by its softmax sum, applies
- * the per-head RMSNorm and the sigmoid gate, and writes the result as bf16.
+ * the per-head RMSNorm and the sigmoid gate, and writes the result as bf16. Each row takes 8 lanes
+ * of 8 dimensions, which load and store 16 bytes each.
  *
  * @param[in] p Kernel parameters.
  * @param[in] tile Shared memory tile with the merged, unnormalized outputs, row sums and gates.
@@ -265,24 +289,37 @@ __device__ float2 normalize_and_rotate(float2 x, float gain, float2 rotation) {
  */
 __device__ void write_gated_output(const Params& p, const SharedTile& tile, int b, int kv_head,
                                    int row_count) {
-  const int warp = threadIdx.x / kWarpSize;
-  const int lane = threadIdx.x % kWarpSize;
   const int group_size = p.q_head_count / p.kv_head_count;
-#pragma unroll 4
-  for (int row = warp; row < row_count; row += warp_count()) {
-    const int token = b * p.L + row / group_size;
-    const int head = kv_head * group_size + row % group_size;
+  const int rows_per_warp = kWarpSize / kLanesPerOutputRow;
+  const int lane = threadIdx.x % kWarpSize;
+  const int first_dim = lane % kLanesPerOutputRow * kDimsPerOutputLane;
+  for (int warp_row = threadIdx.x / kWarpSize * rows_per_warp; warp_row < row_count;
+       warp_row += warp_count() * rows_per_warp) {
+    const int row = min(warp_row + lane / kLanesPerOutputRow, row_count - 1);
     const float scale = *p.v_scale_device / tile.row_sum[row];
-    const float2 o =
-        make_float2(tile.out[row][2 * lane] * scale, tile.out[row][2 * lane + 1] * scale);
-    const float inv_rms = rsqrtf(warp_sum(o.x * o.x + o.y * o.y) / kHeadDim + kRmsEps);
-    const float2 g =
-        __bfloat1622float2(reinterpret_cast<const __nv_bfloat162*>(&tile.merge.gate[row][0])[lane]);
-    const float2 gated =
-        make_float2(o.x * inv_rms / (1.0f + expf(-g.x)), o.y * inv_rms / (1.0f + expf(-g.y)));
-    __nv_bfloat162* out_row = reinterpret_cast<__nv_bfloat162*>(
-        p.out_device + (token * p.q_head_count + head) * kHeadDim);
-    out_row[lane] = __float22bfloat162_rn(gated);
+    float o[kDimsPerOutputLane];
+    float square_sum = 0.0f;
+    for (int i = 0; i < kDimsPerOutputLane; ++i) {
+      o[i] = tile.out[row][first_dim + i] * scale;
+      square_sum += o[i] * o[i];
+    }
+    const float inv_rms =
+        rsqrtf(lane_group_sum<kLanesPerOutputRow>(square_sum) / kHeadDim + kRmsEps);
+    const uint4 gate_bits = *reinterpret_cast<const uint4*>(&tile.merge.gate[row][first_dim]);
+    const __nv_bfloat162* gates = reinterpret_cast<const __nv_bfloat162*>(&gate_bits);
+    uint4 out_bits;
+    __nv_bfloat162* outs = reinterpret_cast<__nv_bfloat162*>(&out_bits);
+    for (int i = 0; i < kDimsPerOutputLane / 2; ++i) {
+      const float2 g = __bfloat1622float2(gates[i]);
+      outs[i] = __float22bfloat162_rn(make_float2(o[2 * i] * inv_rms / (1.0f + expf(-g.x)),
+                                                  o[2 * i + 1] * inv_rms / (1.0f + expf(-g.y))));
+    }
+    if (warp_row + lane / kLanesPerOutputRow < row_count) {
+      const int token = b * p.L + row / group_size;
+      const int head = kv_head * group_size + row % group_size;
+      *reinterpret_cast<uint4*>(p.out_device + (token * p.q_head_count + head) * kHeadDim +
+                                first_dim) = out_bits;
+    }
   }
 }
 
@@ -1558,7 +1595,7 @@ def _get_extension() -> object:
     """
     if "module" not in _extension_cache:
         _extension_cache["module"] = load_inline(
-            name="muse_fused_attention_two_pass_combine",
+            name="muse_fused_attention_vector_output",
             cpp_sources=CPP_SOURCE,
             cuda_sources=CUDA_SOURCE,
             functions=["run", "resident_blocks_per_sm"],
