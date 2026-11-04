@@ -1507,15 +1507,13 @@ __device__ void publish_state(const Params& p, const SharedTile& tile, int64_t s
  * @endcode
  */
 __device__ bool arrive(const Params& p, SharedTile& tile, int counter, int expected_count) {
-  __threadfence();
   __syncthreads();
   if (threadIdx.x == 0) {
+    __threadfence();
     tile.is_last_split = atomicAdd(&p.arrival_count_device[counter], 1) == expected_count - 1;
-  }
-  __syncthreads();
-  if (tile.is_last_split) {
     __threadfence();
   }
+  __syncthreads();
   return tile.is_last_split;
 }
 
@@ -1622,9 +1620,9 @@ __device__ int merger_count(int split_count, int row_count) {
  */
 __device__ int take_merge_rank(const Params& p, SharedTile& tile, int group, int split_count,
                                int mergers) {
-  __threadfence();
   __syncthreads();
   if (threadIdx.x == 0) {
+    __threadfence();
     tile.merge_rank =
         atomicAdd(&p.arrival_count_device[kCountersPerGroup * group], 1) - (split_count - mergers);
   }
@@ -2551,7 +2549,7 @@ def _get_extension() -> object:
     """
     if "module" not in _extension_cache:
         _extension_cache["module"] = load_inline(
-            name="muse_fused_attention_alu_values_decode",
+            name="muse_fused_attention_fence_once",
             cpp_sources=CPP_SOURCE,
             cuda_sources=CUDA_SOURCE,
             functions=["run", "resident_blocks_per_sm"],
