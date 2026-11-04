@@ -1026,9 +1026,11 @@ __device__ void attend_keys(const Params& p, const SharedTile& tile,
  * @brief `combine_warps` merges the softmax states of the warps that share query rows into the
  * block's state, in place: warp w's outputs sit in rows 16 w to 16 w + 15 of `out`, and the merged
  * output of query row r lands in row r. It also writes the row maxima (natural-log units) and sums.
+ * One thread per row computes the row's merge weights once, then every thread merges `float4`s.
  *
  * @param[in,out] tile Shared memory tile: reads the warps' states, writes `out`, `row_max` and
- * `row_sum`. Each output element reads only its own rows, so merging in place is safe.
+ * `row_sum`, and overwrites `warp_max` with each warp's merge weights. Each output element reads
+ * only its own rows, so merging in place is safe.
  * @param[in] row_count Query rows (L x query heads per KV head).
  * @param[in] m_tile_count Groups of 16 query rows.
  * @param[in] key_group_count Warps per group of 16 query rows, each over its own keys.
@@ -1040,9 +1042,7 @@ __device__ void attend_keys(const Params& p, const SharedTile& tile,
  */
 __device__ void combine_warps(SharedTile& tile, int row_count, int m_tile_count,
                               int key_group_count) {
-  for (int element = threadIdx.x; element < row_count * kHeadDim; element += thread_count()) {
-    const int row = element / kHeadDim;
-    const int d = element % kHeadDim;
+  for (int row = threadIdx.x; row < row_count; row += thread_count()) {
     const int m_tile = row / kMmaRows;
     const int row_in_tile = row % kMmaRows;
     float merged_max = -INFINITY;
@@ -1051,18 +1051,30 @@ __device__ void combine_warps(SharedTile& tile, int row_count, int m_tile_count,
     }
     const float safe_max = merged_max == -INFINITY ? 0.0f : merged_max;
     float merged_sum = 0.0f;
-    float merged_out = 0.0f;
     for (int group = 0; group < key_group_count; ++group) {
       const int warp = group * m_tile_count + m_tile;
       const float weight = exp2f(tile.warp_max[warp][row_in_tile] - safe_max);
       merged_sum += weight * tile.warp_sum[warp][row_in_tile];
-      merged_out += weight * warp_out_row(tile, warp, row_in_tile)[d];
+      tile.warp_max[warp][row_in_tile] = weight;
     }
-    tile.out[row][d] = merged_out;
-    if (d == 0) {
-      tile.row_max[row] = merged_max / kLog2e;
-      tile.row_sum[row] = merged_sum;
+    tile.row_max[row] = merged_max / kLog2e;
+    tile.row_sum[row] = merged_sum;
+  }
+  __syncthreads();
+  for (int vector = threadIdx.x; vector < row_count * kVectorsPerRow; vector += thread_count()) {
+    const int row = vector / kVectorsPerRow;
+    const int m_tile = row / kMmaRows;
+    const int row_in_tile = row % kMmaRows;
+    float4 merged = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+    for (int group = 0; group < key_group_count; ++group) {
+      const int warp = group * m_tile_count + m_tile;
+      const float weight = tile.warp_max[warp][row_in_tile];
+      const float4 x = reinterpret_cast<const float4*>(
+          warp_out_row(tile, warp, row_in_tile))[vector % kVectorsPerRow];
+      merged = make_float4(merged.x + weight * x.x, merged.y + weight * x.y,
+                           merged.z + weight * x.z, merged.w + weight * x.w);
     }
+    reinterpret_cast<float4*>(&tile.out[0][0])[vector] = merged;
   }
 }
 
@@ -1546,7 +1558,7 @@ def _get_extension() -> object:
     """
     if "module" not in _extension_cache:
         _extension_cache["module"] = load_inline(
-            name="muse_fused_attention_fast_exp2",
+            name="muse_fused_attention_two_pass_combine",
             cpp_sources=CPP_SOURCE,
             cuda_sources=CUDA_SOURCE,
             functions=["run", "resident_blocks_per_sm"],
