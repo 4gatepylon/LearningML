@@ -790,6 +790,26 @@ __device__ void store_fp8_as_halves(const uint4& bytes, __half* low, __half* hig
 }
 
 /**
+ * @brief `step_piece` returns which of a step's 16-byte pieces this thread copies or converts in
+ * round `i`: each warp owns a contiguous run of the step's keys (16 keys per warp in decode, the
+ * keys its `mma` reads), so a decode warp needs no block barrier to use them.
+ *
+ * @tparam kThreadCount Threads per block.
+ * @param[in] i Round, below `kPiecesPerStep / kThreadCount`.
+ * @return The piece: key `piece / kLoadsPerRow`, bytes `16 (piece % kLoadsPerRow)` of its row.
+ *
+ * @par Example
+ * @code
+ * const int piece = step_piece<128>(i);
+ * @endcode
+ */
+template <int kThreadCount>
+__device__ int step_piece(int i) {
+  constexpr int kPiecesPerWarp = kPiecesPerStep / (kThreadCount / kWarpSize);
+  return threadIdx.x / kWarpSize * kPiecesPerWarp + i * kWarpSize + threadIdx.x % kWarpSize;
+}
+
+/**
  * @brief `locate_keys` starts reading the page table for up to 64 keys of one request and KV head;
  * missing keys get position -1.
  *
@@ -814,7 +834,7 @@ __device__ KeyAddresses locate_keys(const Params& p, int b, int kv_head, int fir
   KeyAddresses addresses;
   static_assert(kPiecesPerStep % kThreadCount == 0, "each thread copies whole pieces");
   for (int i = 0; i < kPiecesPerStep / kThreadCount; ++i) {
-    const int piece = i * kThreadCount + threadIdx.x;
+    const int piece = step_piece<kThreadCount>(i);
     const int position = first_position_incl + piece / kLoadsPerRow;
     addresses.position[i] = position < end_position_excl ? position : -1;
     addresses.page[i] = 0;
@@ -970,7 +990,7 @@ __device__ void start_step_copy(const Params& p, SharedTile& tile, int kv_head,
                                 const KeyAddresses& addresses, int stage) {
   static_assert(kPiecesPerStep % kThreadCount == 0, "each thread copies whole pieces");
   for (int i = 0; i < kPiecesPerStep / kThreadCount; ++i) {
-    const int piece = i * kThreadCount + threadIdx.x;
+    const int piece = step_piece<kThreadCount>(i);
     const int key = piece / kLoadsPerRow;
     const int dim = (piece % kLoadsPerRow) * kBytesPerLoad;
     const int position = addresses.position[i];
@@ -1004,7 +1024,7 @@ template <int kThreadCount>
 __device__ void convert_step(SharedTile& tile, int stage) {
   static_assert(kPiecesPerStep % kThreadCount == 0, "each thread copies whole pieces");
   for (int i = 0; i < kPiecesPerStep / kThreadCount; ++i) {
-    const int piece = i * kThreadCount + threadIdx.x;
+    const int piece = step_piece<kThreadCount>(i);
     const int key = piece / kLoadsPerRow;
     const int dim = (piece % kLoadsPerRow) * kBytesPerLoad;
     store_fp8_as_halves(*reinterpret_cast<const uint4*>(&tile.ring.raw_v[stage][key][dim]),
@@ -1939,8 +1959,12 @@ __device__ void attend_split(const Params& p, SharedTile& tile, const BlockWork&
   constexpr int kStageCount = kIsVerify ? kVerifyStages : kStages;
   for (int step = 0; work.first_position_incl + step * kStepKeys < work.end_position_excl; ++step) {
     wait_for_copies<kStageCount - 2>();
-    if constexpr (kIsVerify) asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
-    __syncthreads();
+    if constexpr (kIsVerify) {
+      asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
+      __syncthreads();
+    } else {
+      __syncwarp();
+    }
     convert_step<kThreadCount>(tile, step % kStageCount);
     const KeyAddresses next_addresses = locate_keys<kThreadCount>(
         p, work.b, work.kv_head, work.first_position_incl + (step + kStageCount) * kStepKeys,
@@ -1948,8 +1972,12 @@ __device__ void attend_split(const Params& p, SharedTile& tile, const BlockWork&
     start_step_copy<kThreadCount>(p, tile, work.kv_head, addresses,
                                   (step + kStageCount - 1) % kStageCount);
     addresses = next_addresses;
-    if constexpr (kIsVerify) asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
-    __syncthreads();
+    if constexpr (kIsVerify) {
+      asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
+      __syncthreads();
+    } else {
+      __syncwarp();
+    }
     const int start_incl = work.first_position_incl + step * kStepKeys;
     const bool is_masked = start_incl + kStepKeys > work.end_position_excl ||
                            (p.window != 0 && start_incl < work.window_start_incl + p.L - 1);
@@ -2384,7 +2412,7 @@ def _get_extension() -> object:
     """
     if "module" not in _extension_cache:
         _extension_cache["module"] = load_inline(
-            name="muse_fused_attention_stages_per_build_d4_v2",
+            name="muse_fused_attention_warp_local_decode",
             cpp_sources=CPP_SOURCE,
             cuda_sources=CUDA_SOURCE,
             functions=["run", "resident_blocks_per_sm"],
