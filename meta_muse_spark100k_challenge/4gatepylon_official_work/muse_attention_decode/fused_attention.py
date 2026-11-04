@@ -5,9 +5,9 @@ Each request's keys are split into chunks, and one thread block handles one chun
 and one key/value head, for every query head of that group and every token of the block. A block
 has 4 warps, or 8 for verify on sliding layers or with few requests. It:
 
-1. Copies its query and gate rows to shared memory in one `cp.async` batch, RMS-normalizes the
-   queries, applies RoPE from a per-token cos/sin table and rounds them to FP8 E4M3, as FA3 does
-   (`qk_scale_factor` joins the softmax scale).
+1. Copies its query rows to shared memory with `cp.async`, RMS-normalizes them, applies RoPE from
+   a per-token cos/sin table and rounds them to FP8 E4M3, as FA3 does (`qk_scale_factor` joins
+   the softmax scale).
 2. Streams its chunk of cached FP8 keys and values 64 at a time through a 3-stage `cp.async`
    ring in shared memory, whose space the merge reuses afterwards. Each warp attends its 16
    query rows over its share of the step's keys: S = Q K^T runs on FP8 tensor cores straight
@@ -18,10 +18,10 @@ has 4 warps, or 8 for verify on sliding layers or with few requests. It:
 3. In the first chunk's block only: normalizes the block's new keys (staged in shared memory at
    the start), applies RoPE, writes the new keys and values to the FP8 cache, and attends to them
    as one last, causal step.
-4. Combines its warps' softmax states and publishes the block's state. A two-level tree merges
-   the chunks: the last block of each group of up to 16 chunks merges that group, then the last
-   group merger merges the groups, divides by the softmax sum, and applies the per-head RMSNorm
-   and the sigmoid gate.
+4. Combines its warps' softmax states, starts copying its gate rows, and publishes the block's
+   state. A two-level tree merges the chunks: the last block of each group of up to 16 chunks
+   merges that group, then the last group merger merges the groups, divides by the softmax sum,
+   and applies the per-head RMSNorm and the sigmoid gate.
 
 Interface:
     kernel_fn(data): `TASK.md`'s timed call; returns bfloat16 [B, L, Hq * 64].
@@ -38,7 +38,10 @@ Must know:
         - The arrival counters live across calls; each merging block resets its counter to 0.
     Performance:
         - The page-table reads for a step are issued one step before its keys and values.
-        - The split count fills exactly one wave of resident blocks, from the occupancy calculator.
+        - The copies fetch whole 128-byte L2 lines, which hold a token's keys (or values) for both
+          KV heads, so the other head's block hits in L2.
+        - The split count fills one wave of resident blocks: the occupancy calculator's count,
+          capped at each build's intended blocks per SM.
         - Each build compiles one path: decode (4 warps, 1 chunk per warp per step, 3 blocks per
           SM), full verify (4 warps, 4 chunks, 4 blocks per SM) or verify on sliding layers or with
           at most 8 request x KV-head groups (8 warps, 2 chunks, 2 blocks per SM).
@@ -98,6 +101,18 @@ constexpr int kLanesPerOutputRow = 8;
 constexpr int kDimsPerOutputLane = kHeadDim / kLanesPerOutputRow;
 constexpr float kLog2e = 1.4426950408889634f;
 
+/**
+ * @brief `Params` carries the kernel's inputs, outputs, shapes and workspace, built once by `run`.
+ *
+ * @par Example
+ * @code
+ * attention_kernel<4, 1, kDecodeBlocksPerSm><<<grid, kMinThreads, sizeof(SharedTile)>>>(p);
+ * @endcode
+ *
+ * @par Must know
+ * - Gotchas:
+ *   - Pointers ending in `_device` point to device memory; `run` checks their dtypes and shapes.
+ */
 struct Params {
   const __nv_bfloat16* qkv_device;
   __nv_fp8_e4m3* k_cache_device;
@@ -120,11 +135,29 @@ struct Params {
   int split_count, keys_per_split;
 };
 
+/**
+ * @brief `StartTile` holds the block's bf16 query rows as copied and their FP8 E4M3 version, padded
+ * rows that `ldmatrix` turns into the query fragments.
+ *
+ * @par Example
+ * @code
+ * normalize_query_row(tile, tile.start.q[row], row, row_count, group_size, first_dim);
+ * @endcode
+ */
 struct StartTile {
   __nv_bfloat16 q_in[kMaxRows][kHeadDim];
   uint8_t q[kMaxRows][kRawStride];
 };
 
+/**
+ * @brief `RingTile` is the `cp.async` ring: per stage, a step's 64 FP8 keys (one 64-byte row each,
+ * in `wgmma`'s 64-byte swizzle), their FP8 values and their positions (-1 for a missing key).
+ *
+ * @par Example
+ * @code
+ * copy_async_16(&tile.ring.raw_k[stage][key][swizzled_dim(key, dim)], source, is_present);
+ * @endcode
+ */
 struct RingTile {
   // DANGEROUS DANGEROUS DANGEROUS IF YOU CHANGE THIS THEN WGMMA WILL READ WRONGLY SWIZZLED KEYS
   alignas(kSwizzleAtomBytes) uint8_t raw_k[kStages][kStepKeys][kHeadDim];
@@ -132,12 +165,35 @@ struct RingTile {
   int raw_position[kStages][kStepKeys];
 };
 
+/**
+ * @brief `MergeTile` holds what the merge and the output need after the loop: each merged slot's
+ * weight and softmax sum per row, and the block's gate rows.
+ *
+ * @par Example
+ * @code
+ * merge_slots(p, tile, first_slot, 1, slot_count, row_count);
+ * @endcode
+ */
 struct MergeTile {
   float split_weight[kMergeFanIn][kMaxRows];
   float split_sum[kMergeFanIn][kMaxRows];
   __nv_bfloat16 gate[kMaxRows][kHeadDim];
 };
 
+/**
+ * @brief `SharedTile` lays out the block's dynamic shared memory. Its two unions share space
+ * between phases: the query rows, then the step's fp16 values, then the merged outputs; and the
+ * ring, then the merge tile and the warps' outputs past 64 rows.
+ *
+ * @par Example
+ * @code
+ * SharedTile& tile = *reinterpret_cast<SharedTile*>(shared_bytes);
+ * @endcode
+ *
+ * @par Must know
+ * - Gotchas:
+ *   - Members that `cp.async` fills must stay 16-byte aligned: add new scalars at the end.
+ */
 struct SharedTile {
   union {
     StartTile start;
@@ -164,11 +220,30 @@ struct SharedTile {
   float v_scale;
 };
 
+/**
+ * @brief `KeyAddresses` holds this thread's page and position for each piece of one step's
+ * copies, loaded a step before the copies start.
+ *
+ * @par Example
+ * @code
+ * const KeyAddresses addresses = locate_keys<128>(p, b, kv_head, first_position, end_position);
+ * @endcode
+ */
 struct KeyAddresses {
   int page[kLoadsPerThread];
   int position[kLoadsPerThread];
 };
 
+/**
+ * @brief `WarpState` is one thread's part of its warp's online softmax: unnormalized outputs (in
+ * the `mma.sync` C layout of 8 dimension tiles), and the running max (base-2 logits) and sum of
+ * its two rows.
+ *
+ * @par Example
+ * @code
+ * WarpState state = {};
+ * @endcode
+ */
 struct WarpState {
   float out[kDimTiles][4];
   float max_log2[2];
@@ -1547,6 +1622,15 @@ __global__ void __launch_bounds__(kWarpCount* kWarpSize, kMinBlocksPerSm)
 
 using attention_kernel_t = void (*)(Params);
 
+/**
+ * @brief `KernelBuild` names one compiled kernel build: the kernel, its threads per block, and the
+ * blocks per SM its launch bounds and the split plan target.
+ *
+ * @par Example
+ * @code
+ * const KernelBuild build = select_kernel(row_count, window, group_count);
+ * @endcode
+ */
 struct KernelBuild {
   attention_kernel_t kernel;
   int thread_count;
@@ -1729,7 +1813,7 @@ def _get_extension() -> object:
     """
     if "module" not in _extension_cache:
         _extension_cache["module"] = load_inline(
-            name="muse_fused_attention_query_lanes",
+            name="muse_fused_attention_documented",
             cpp_sources=CPP_SOURCE,
             cuda_sources=CUDA_SOURCE,
             functions=["run", "resident_blocks_per_sm"],
