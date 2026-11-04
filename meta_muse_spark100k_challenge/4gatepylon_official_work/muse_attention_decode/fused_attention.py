@@ -22,7 +22,7 @@ has 4 warps, or 8 for verify on sliding layers or with few requests. It:
    state. In decode, a two-level tree merges the splits: the last block of each group of up to 16
    splits merges that group, then the last group merger merges the groups, divides by the
    softmax sum, and applies the per-head RMSNorm and the sigmoid gate. In verify, the last blocks
-   to arrive (up to 16) wait for the rest, then each merges and writes its own slice of the rows.
+   to arrive (up to 64) wait for the rest, then each merges and writes its own slice of the rows.
 
 Interface:
     kernel_fn(data): `TASK.md`'s timed call; returns bfloat16 [B, L, Hq * 64].
@@ -95,7 +95,7 @@ constexpr int kMaxTokens = 8;
 constexpr int kMergeFanIn = 16;
 constexpr int kMaxMergeGroups = kMaxSplits / kMergeFanIn;
 constexpr int kCountersPerGroup = kMaxMergeGroups + 1;
-constexpr int kMaxMergers = 16;
+constexpr int kMaxMergers = 64;
 constexpr int kMaxMergeWeights = kMaxSplits * kMaxRows / kMaxMergers;
 constexpr int kMaxThreads = kMaxWarps * kWarpSize;
 constexpr int kFloatsPerVector = 4;
@@ -2260,7 +2260,7 @@ def _get_extension() -> object:
     """
     if "module" not in _extension_cache:
         _extension_cache["module"] = load_inline(
-            name="muse_fused_attention_row_count",
+            name="muse_fused_attention_64_mergers",
             cpp_sources=CPP_SOURCE,
             cuda_sources=CUDA_SOURCE,
             functions=["run", "resident_blocks_per_sm"],
