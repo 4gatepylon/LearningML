@@ -544,6 +544,24 @@ __device__ void load_matrices(uint32_t (&r)[4], const void* row_address) {
 }
 
 /**
+ * @brief `fast_exp2` returns 2^x from the special-function unit (`ex2.approx.ftz`), with
+ * denormal results flushed to 0.
+ *
+ * @param[in] x The exponent.
+ * @return 2^x, or 0 for x = -inf.
+ *
+ * @par Example
+ * @code
+ * const float probability = fast_exp2(fmaf(score, logit_scale_log2, -max_log2));
+ * @endcode
+ */
+__device__ float fast_exp2(float x) {
+  float result;
+  asm("ex2.approx.ftz.f32 %0, %1;\n" : "=f"(result) : "f"(x));
+  return result;
+}
+
+/**
  * @brief `pack_halves` rounds two floats to fp16 and packs them in one register, `low` first.
  *
  * @param[in] low Element with the lower index.
@@ -914,8 +932,13 @@ __device__ void accumulate_values_wgmma(float (&out)[32], const float (&probabil
  *
  * @par Example
  * @code
- * attend_keys<4>(p, tile, keys, q_fragments, 0, first_row, seq_len, scale, is_masked, state);
+ * attend_keys<4, true>(p, tile, keys, q_fragments, 0, first_row, seq_len, scale, is_masked,
+ *                      state);
  * @endcode
+ *
+ * @par Must know
+ * - Gotchas:
+ *   - `logit_scale_log2` must be positive: the step's max is taken before scaling.
  */
 template <int kChunkCount, bool kUseWgmma>
 __device__ void attend_keys(const Params& p, const SharedTile& tile,
@@ -947,7 +970,7 @@ __device__ void attend_keys(const Params& p, const SharedTile& tile,
     for (int chunk = 0; chunk < kChunkCount; ++chunk) {
       for (int n = 0; n < 2; ++n) {
         for (int e = 2 * half; e < 2 * half + 2; ++e) {
-          float score = scores[chunk][n][e] * logit_scale_log2;
+          float score = scores[chunk][n][e];
           if (is_masked) {
             const int key_position = tile.key_position[first_key + chunk * kChunkKeys +
                                                        n * kMmaCols + 2 * (lane % 4) + e % 2];
@@ -962,9 +985,9 @@ __device__ void attend_keys(const Params& p, const SharedTile& tile,
     }
     step_max = fmaxf(step_max, __shfl_xor_sync(0xffffffffu, step_max, 1));
     step_max = fmaxf(step_max, __shfl_xor_sync(0xffffffffu, step_max, 2));
-    const float new_max = fmaxf(state.max_log2[half], step_max);
+    const float new_max = fmaxf(state.max_log2[half], step_max * logit_scale_log2);
     const float safe_max = new_max == -INFINITY ? 0.0f : new_max;
-    const float rescale = exp2f(state.max_log2[half] - safe_max);
+    const float rescale = fast_exp2(state.max_log2[half] - safe_max);
     state.max_log2[half] = new_max;
     state.sum[half] *= rescale;
     for (int d = 0; d < kDimTiles; ++d) {
@@ -974,7 +997,7 @@ __device__ void attend_keys(const Params& p, const SharedTile& tile,
     for (int chunk = 0; chunk < kChunkCount; ++chunk) {
       for (int n = 0; n < 2; ++n) {
         for (int e = 2 * half; e < 2 * half + 2; ++e) {
-          scores[chunk][n][e] = exp2f(scores[chunk][n][e] - safe_max);
+          scores[chunk][n][e] = fast_exp2(fmaf(scores[chunk][n][e], logit_scale_log2, -safe_max));
           state.sum[half] += scores[chunk][n][e];
         }
       }
@@ -1523,7 +1546,7 @@ def _get_extension() -> object:
     """
     if "module" not in _extension_cache:
         _extension_cache["module"] = load_inline(
-            name="muse_fused_attention_wgmma_values",
+            name="muse_fused_attention_fast_exp2",
             cpp_sources=CPP_SOURCE,
             cuda_sources=CUDA_SOURCE,
             functions=["run", "resident_blocks_per_sm"],
