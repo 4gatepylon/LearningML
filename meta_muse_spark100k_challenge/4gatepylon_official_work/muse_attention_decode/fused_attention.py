@@ -10,12 +10,12 @@ block. It:
    rounds them to bf16, as `reference.py` does.
 2. Streams its chunk of cached FP8 keys and values 64 at a time through a 4-stage `cp.async`
    ring in shared memory, converting each step to fp16. Each warp attends its 16 query rows over
-   its share of the step's keys: S = Q K^T and O += P V run on tensor cores (`mma.sync`), with an
-   online softmax in between.
+   its share of the step's keys: S = Q K^T and O += P V run on tensor cores (`mma.sync`), with one
+   online-softmax update per step. Only steps at the edge of the window or chunk apply the mask.
 3. In the first chunk's block only: normalizes the block's new keys, applies RoPE, writes the new
    keys and values to the FP8 cache, and attends to them as one last, causal step.
 4. Combines its warps' softmax states and publishes the block's state. A two-level tree merges
-   the chunks: the last block of each group of up to 8 chunks merges that group, then the last
+   the chunks: the last block of each group of up to 16 chunks merges that group, then the last
    group merger merges the groups, divides by the softmax sum, and applies the per-head RMSNorm
    and the sigmoid gate.
 
@@ -55,17 +55,16 @@ constexpr int kMmaRows = 16;
 constexpr int kMmaCols = 8;
 constexpr int kMmaDepth = 16;
 constexpr int kChunkKeys = 16;
-constexpr int kChunksPerStep = kStepKeys / kChunkKeys;
 constexpr int kDimTiles = kHeadDim / kMmaCols;
 constexpr int kDepthSteps = kHeadDim / kMmaDepth;
 constexpr int kRowStride = kHeadDim + 8;
 constexpr int kBytesPerLoad = 16;
 constexpr int kLoadsPerRow = kHeadDim / kBytesPerLoad;
 constexpr int kLoadsPerThread = kStepKeys * kLoadsPerRow / kThreads;
-constexpr int kMaxSplits = 64;
+constexpr int kMaxSplits = 256;
 constexpr int kStages = 4;
 constexpr int kMaxTokens = 8;
-constexpr int kMergeFanIn = 8;
+constexpr int kMergeFanIn = 16;
 constexpr int kMaxMergeGroups = kMaxSplits / kMergeFanIn;
 constexpr int kCountersPerGroup = kMaxMergeGroups + 1;
 constexpr int kFloatsPerVector = 4;
@@ -546,54 +545,68 @@ __device__ void store_new_keys(const Params& p, SharedTile& tile, int b, int kv_
 }
 
 /**
- * @brief `attend_chunk` folds 16 keys from shared memory into one warp's online softmax over its
- * 16 query rows: S = Q K^T and O += P V on tensor cores, the masks and the rescaling in between.
+ * @brief `attend_keys` folds this warp's keys of a step (`kChunkCount` chunks of 16) into its
+ * online softmax over its 16 query rows: S = Q K^T on tensor cores, one max and one rescale for
+ * all of them, then O += P V on tensor cores.
  *
+ * @tparam kChunkCount Chunks of 16 keys this warp attends in the step.
  * @param[in] p Kernel parameters.
  * @param[in] tile Shared memory tile with the step's keys, values and key positions.
  * @param[in] q_fragments This warp's query rows as A fragments, one per 16 head dimensions.
- * @param[in] first_key First of the 16 keys, within the step.
+ * @param[in] first_key First of the warp's keys, within the step.
  * @param[in] first_row First of the warp's 16 query rows.
  * @param[in] seq_len Cached tokens of this request: the first new token's position.
  * @param[in] logit_scale_log2 Factor from Q K^T to base-2 logits.
+ * @param[in] is_masked Whether some key may be missing or invisible to some row; steps inside
+ * the window and the split skip the mask.
  * @param[in,out] state This thread's part of the warp's softmax state and outputs.
  *
  * @par Example
  * @code
- * attend_chunk(p, tile, q_fragments, chunk * kChunkKeys, first_row, seq_len, scale, state);
+ * attend_keys<4>(p, tile, q_fragments, 0, first_row, seq_len, scale, is_masked, state);
  * @endcode
  */
-__device__ void attend_chunk(const Params& p, const SharedTile& tile,
-                             const uint32_t (&q_fragments)[kDepthSteps][4], int first_key,
-                             int first_row, int seq_len, float logit_scale_log2, WarpState& state) {
+template <int kChunkCount>
+__device__ void attend_keys(const Params& p, const SharedTile& tile,
+                            const uint32_t (&q_fragments)[kDepthSteps][4], int first_key,
+                            int first_row, int seq_len, float logit_scale_log2, bool is_masked,
+                            WarpState& state) {
   const int lane = threadIdx.x % kWarpSize;
   const int group_size = p.q_head_count / p.kv_head_count;
-  float scores[2][4] = {};
-  for (int n = 0; n < 2; ++n) {
+  float scores[kChunkCount][2][4] = {};
+  for (int chunk = 0; chunk < kChunkCount; ++chunk) {
     for (int pair = 0; pair < kDepthSteps / 2; ++pair) {
-      uint32_t b[4];
-      load_matrices<false>(
-          b, &tile.step.k[first_key + n * kMmaCols + lane % 8][32 * pair + 8 * (lane / 8)]);
-      mma_16x8x16(scores[n], q_fragments[2 * pair], b[0], b[1]);
-      mma_16x8x16(scores[n], q_fragments[2 * pair + 1], b[2], b[3]);
+      for (int n = 0; n < 2; ++n) {
+        const int key = first_key + chunk * kChunkKeys + n * kMmaCols + lane % 8;
+        uint32_t b[4];
+        load_matrices<false>(b, &tile.step.k[key][32 * pair + 8 * (lane / 8)]);
+        mma_16x8x16(scores[chunk][n], q_fragments[2 * pair], b[0], b[1]);
+        mma_16x8x16(scores[chunk][n], q_fragments[2 * pair + 1], b[2], b[3]);
+      }
     }
   }
   for (int half = 0; half < 2; ++half) {
     const int query_position = seq_len + (first_row + lane / 4 + 8 * half) / group_size;
-    float chunk_max = -INFINITY;
-    for (int n = 0; n < 2; ++n) {
-      for (int e = 2 * half; e < 2 * half + 2; ++e) {
-        const int key_position =
-            tile.key_position[first_key + n * kMmaCols + 2 * (lane % 4) + e % 2];
-        const bool is_visible = key_position >= 0 && key_position <= query_position &&
-                                (p.window == 0 || key_position > query_position - p.window);
-        scores[n][e] = is_visible ? scores[n][e] * logit_scale_log2 : -INFINITY;
-        chunk_max = fmaxf(chunk_max, scores[n][e]);
+    float step_max = -INFINITY;
+    for (int chunk = 0; chunk < kChunkCount; ++chunk) {
+      for (int n = 0; n < 2; ++n) {
+        for (int e = 2 * half; e < 2 * half + 2; ++e) {
+          float score = scores[chunk][n][e] * logit_scale_log2;
+          if (is_masked) {
+            const int key_position = tile.key_position[first_key + chunk * kChunkKeys +
+                                                       n * kMmaCols + 2 * (lane % 4) + e % 2];
+            const bool is_visible = key_position >= 0 && key_position <= query_position &&
+                                    (p.window == 0 || key_position > query_position - p.window);
+            score = is_visible ? score : -INFINITY;
+          }
+          scores[chunk][n][e] = score;
+          step_max = fmaxf(step_max, score);
+        }
       }
     }
-    chunk_max = fmaxf(chunk_max, __shfl_xor_sync(0xffffffffu, chunk_max, 1));
-    chunk_max = fmaxf(chunk_max, __shfl_xor_sync(0xffffffffu, chunk_max, 2));
-    const float new_max = fmaxf(state.max_log2[half], chunk_max);
+    step_max = fmaxf(step_max, __shfl_xor_sync(0xffffffffu, step_max, 1));
+    step_max = fmaxf(step_max, __shfl_xor_sync(0xffffffffu, step_max, 2));
+    const float new_max = fmaxf(state.max_log2[half], step_max);
     const float safe_max = new_max == -INFINITY ? 0.0f : new_max;
     const float rescale = exp2f(state.max_log2[half] - safe_max);
     state.max_log2[half] = new_max;
@@ -602,22 +615,63 @@ __device__ void attend_chunk(const Params& p, const SharedTile& tile,
       state.out[d][2 * half] *= rescale;
       state.out[d][2 * half + 1] *= rescale;
     }
-    for (int n = 0; n < 2; ++n) {
-      for (int e = 2 * half; e < 2 * half + 2; ++e) {
-        scores[n][e] = exp2f(scores[n][e] - safe_max);
-        state.sum[half] += scores[n][e];
+    for (int chunk = 0; chunk < kChunkCount; ++chunk) {
+      for (int n = 0; n < 2; ++n) {
+        for (int e = 2 * half; e < 2 * half + 2; ++e) {
+          scores[chunk][n][e] = exp2f(scores[chunk][n][e] - safe_max);
+          state.sum[half] += scores[chunk][n][e];
+        }
       }
     }
   }
-  const uint32_t p_fragment[4] = {
-      pack_halves(scores[0][0], scores[0][1]), pack_halves(scores[0][2], scores[0][3]),
-      pack_halves(scores[1][0], scores[1][1]), pack_halves(scores[1][2], scores[1][3])};
-  for (int pair = 0; pair < kDimTiles / 2; ++pair) {
-    uint32_t b[4];
-    load_matrices<true>(
-        b, &tile.step.v[first_key + 8 * ((lane / 8) % 2) + lane % 8][16 * pair + 8 * (lane / 16)]);
-    mma_16x8x16(state.out[2 * pair], p_fragment, b[0], b[1]);
-    mma_16x8x16(state.out[2 * pair + 1], p_fragment, b[2], b[3]);
+  for (int chunk = 0; chunk < kChunkCount; ++chunk) {
+    const uint32_t p_fragment[4] = {pack_halves(scores[chunk][0][0], scores[chunk][0][1]),
+                                    pack_halves(scores[chunk][0][2], scores[chunk][0][3]),
+                                    pack_halves(scores[chunk][1][0], scores[chunk][1][1]),
+                                    pack_halves(scores[chunk][1][2], scores[chunk][1][3])};
+    const int key = first_key + chunk * kChunkKeys + 8 * ((lane / 8) % 2) + lane % 8;
+    for (int pair = 0; pair < kDimTiles / 2; ++pair) {
+      uint32_t b[4];
+      load_matrices<true>(b, &tile.step.v[key][16 * pair + 8 * (lane / 16)]);
+      mma_16x8x16(state.out[2 * pair], p_fragment, b[0], b[1]);
+      mma_16x8x16(state.out[2 * pair + 1], p_fragment, b[2], b[3]);
+    }
+  }
+}
+
+/**
+ * @brief `attend_step` hands this warp's share of a step's 64 keys to `attend_keys`.
+ *
+ * @param[in] p Kernel parameters.
+ * @param[in] tile Shared memory tile with the step's keys, values and key positions.
+ * @param[in] q_fragments This warp's query rows as A fragments.
+ * @param[in] key_group This warp's share: keys `key_group * 64 / key_group_count` onwards.
+ * @param[in] key_group_count Warps sharing the same query rows: 4, 2 or 1.
+ * @param[in] first_row First of the warp's 16 query rows.
+ * @param[in] seq_len Cached tokens of this request.
+ * @param[in] logit_scale_log2 Factor from Q K^T to base-2 logits.
+ * @param[in] is_masked Whether the step needs the visibility mask.
+ * @param[in,out] state This thread's part of the warp's softmax state and outputs.
+ *
+ * @par Example
+ * @code
+ * attend_step(p, tile, q_fragments, key_group, 4, first_row, seq_len, scale, false, state);
+ * @endcode
+ */
+__device__ void attend_step(const Params& p, const SharedTile& tile,
+                            const uint32_t (&q_fragments)[kDepthSteps][4], int key_group,
+                            int key_group_count, int first_row, int seq_len, float logit_scale_log2,
+                            bool is_masked, WarpState& state) {
+  const int first_key = key_group * kStepKeys / key_group_count;
+  if (key_group_count == 4) {
+    attend_keys<1>(p, tile, q_fragments, first_key, first_row, seq_len, logit_scale_log2, is_masked,
+                   state);
+  } else if (key_group_count == 2) {
+    attend_keys<2>(p, tile, q_fragments, first_key, first_row, seq_len, logit_scale_log2, is_masked,
+                   state);
+  } else {
+    attend_keys<4>(p, tile, q_fragments, first_key, first_row, seq_len, logit_scale_log2, is_masked,
+                   state);
   }
 }
 
@@ -719,7 +773,7 @@ __device__ bool arrive(const Params& p, SharedTile& tile, int counter, int expec
 }
 
 /**
- * @brief `merge_slots` merges up to 8 published softmax states into the block's state in `tile`.
+ * @brief `merge_slots` merges up to 16 published softmax states into the block's state in `tile`.
  *
  * @param[in] p Kernel parameters.
  * @param[in,out] tile Shared memory tile: gets the merged outputs, row maxima and row sums; uses
@@ -783,7 +837,7 @@ __device__ void merge_slots(const Params& p, SharedTile& tile, int64_t first_slo
 
 /**
  * @brief `merge_splits` merges every split's softmax state with a two-level tree: the last block
- * of each group of 8 splits merges its group, and the last group merger merges the groups.
+ * of each group of 16 splits merges its group, and the last group merger merges the groups.
  *
  * @param[in] p Kernel parameters.
  * @param[in,out] tile Shared memory tile with this block's state; the block that finishes the
@@ -856,7 +910,6 @@ __global__ void __launch_bounds__(kThreads) attention_kernel(const Params p) {
   const int m_tile = warp % m_tile_count;
   const int key_group = warp / m_tile_count;
   const bool is_active = key_group < key_group_count;
-  const int chunks_per_warp = kChunksPerStep / key_group_count;
   const int seq_len = p.seq_lens_device[b];
   const int window_start_incl = p.window == 0 ? 0 : max(0, seq_len - p.window + 1);
   const int first_position_incl = window_start_incl + split * p.keys_per_split;
@@ -903,9 +956,12 @@ __global__ void __launch_bounds__(kThreads) attention_kernel(const Params p) {
     __syncthreads();
     convert_step(tile, step % kStages);
     __syncthreads();
-    for (int chunk = 0; is_active && chunk < chunks_per_warp; ++chunk) {
-      attend_chunk(p, tile, q_fragments, (key_group * chunks_per_warp + chunk) * kChunkKeys,
-                   first_row, seq_len, logit_scale_log2, state);
+    const int start = first_position_incl + step * kStepKeys;
+    const bool is_masked = start + kStepKeys > end_position_excl ||
+                           (p.window != 0 && start < window_start_incl + p.L - 1);
+    if (is_active) {
+      attend_step(p, tile, q_fragments, key_group, key_group_count, first_row, seq_len,
+                  logit_scale_log2, is_masked, state);
     }
   }
   wait_for_copies<0>();
@@ -913,9 +969,9 @@ __global__ void __launch_bounds__(kThreads) attention_kernel(const Params p) {
   if (split == 0) {
     store_new_keys(p, tile, b, kv_head, seq_len);
     __syncthreads();
-    for (int chunk = 0; is_active && chunk < chunks_per_warp; ++chunk) {
-      attend_chunk(p, tile, q_fragments, (key_group * chunks_per_warp + chunk) * kChunkKeys,
-                   first_row, seq_len, logit_scale_log2, state);
+    if (is_active) {
+      attend_step(p, tile, q_fragments, key_group, key_group_count, first_row, seq_len,
+                  logit_scale_log2, true, state);
     }
   }
   __syncthreads();
@@ -966,7 +1022,7 @@ __global__ void __launch_bounds__(kThreads) attention_kernel(const Params p) {
  * @param[out] partial_out float32 [B, Hkv, splits, 64, 64] workspace: each split's outputs.
  * @param[out] partial_max float32 [B, Hkv, splits, 64] workspace: each split's row maxima.
  * @param[out] partial_sum float32 [B, Hkv, splits, 64] workspace: each split's row sums.
- * @param[in,out] arrival_count int32 [B, Hkv, 9], zero before and after each call.
+ * @param[in,out] arrival_count int32 [B, Hkv, 17], zero before and after each call.
  * @param[in] keys_per_split Cached keys per split, a multiple of 64.
  * @throws c10::Error A tensor has the wrong dtype, shape or layout.
  *
@@ -1057,8 +1113,8 @@ HEAD_DIM: int = 64
 ROPE_PAIR_STRIDE: int = 2
 MAX_ROWS: int = 64
 TILE_KEYS: int = 64
-MAX_SPLITS: int = 64
-COUNTERS_PER_GROUP: int = 9
+MAX_SPLITS: int = 256
+COUNTERS_PER_GROUP: int = 17
 _extension_cache: dict[str, object] = {}
 _inv_freq_cache: dict[tuple[float, torch.device], torch.Tensor] = {}
 _workspace_cache: dict[tuple[int, int, int, torch.device], tuple[torch.Tensor, ...]] = {}
@@ -1075,7 +1131,7 @@ def _get_extension() -> object:
     """
     if "module" not in _extension_cache:
         _extension_cache["module"] = load_inline(
-            name="muse_fused_attention_merge_tree",
+            name="muse_fused_attention_step_softmax",
             cpp_sources=CPP_SOURCE,
             cuda_sources=CUDA_SOURCE,
             functions=["run", "resident_blocks_per_sm"],
@@ -1140,7 +1196,7 @@ def _get_workspace(data: dict, split_count: int) -> tuple[torch.Tensor, ...]:
 
     Returns:
         partial_out [B, Hkv, splits, 64, 64], partial_max and partial_sum [B, Hkv, splits, 64]
-        (float32), and arrival_count [B, Hkv, 9] (int32, zero), allocated once per shape.
+        (float32), and arrival_count [B, Hkv, 17] (int32, zero), allocated once per shape.
 
     Example:
         >>> partial_out, partial_max, partial_sum, arrival_count = _get_workspace(data, 8)
