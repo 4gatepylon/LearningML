@@ -30,6 +30,7 @@ from torch.utils.cpp_extension import load_inline
 CUDA_SOURCE: str = r"""
 #include <ATen/cuda/CUDAContext.h>
 #include <cuda_bf16.h>
+#include <cuda_fp16.h>
 #include <cuda_fp8.h>
 #include <torch/extension.h>
 
@@ -356,6 +357,94 @@ __device__ void load_new_tile(const Params& p, SharedTile& tile, int b, int kv_h
 }
 
 /**
+ * @brief `mma_16x8x16` accumulates D += A B on tensor cores for one warp: A is 16 x 16 and B is
+ * 16 x 8, both fp16, in the `mma.sync.m16n8k16` fragment layouts; D is fp32.
+ *
+ * @param[in,out] d This thread's 4 accumulator elements.
+ * @param[in] a This thread's A fragment (4 registers of 2 halves).
+ * @param[in] b0 First register of this thread's B fragment.
+ * @param[in] b1 Second register of this thread's B fragment.
+ *
+ * @par Example
+ * @code
+ * mma_16x8x16(scores[n], q_fragments[s], b[0], b[1]);
+ * @endcode
+ */
+__device__ void mma_16x8x16(float (&d)[4], const uint32_t (&a)[4], uint32_t b0, uint32_t b1) {
+  asm volatile(
+      "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, "
+      "{%8, %9}, {%0, %1, %2, %3};\n"
+      : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
+      : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
+}
+
+/**
+ * @brief `load_matrices` loads four 8 x 8 fp16 matrices from shared memory into one register each
+ * per thread (`ldmatrix.x4`), optionally transposed.
+ *
+ * @tparam kIsTransposed Whether each matrix is transposed on the way.
+ * @param[out] r This thread's 4 registers.
+ * @param[in] row_address This thread's row: lanes 8 i to 8 i + 7 give the 8 rows of matrix i.
+ *
+ * @par Example
+ * @code
+ * load_matrices<false>(q_fragments[s], &tile.q[row][col]);
+ * @endcode
+ */
+template <bool kIsTransposed>
+__device__ void load_matrices(uint32_t (&r)[4], const __half* row_address) {
+  const uint32_t address = static_cast<uint32_t>(__cvta_generic_to_shared(row_address));
+  if (kIsTransposed) {
+    asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0, %1, %2, %3}, [%4];\n"
+                 : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3])
+                 : "r"(address));
+  } else {
+    asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
+                 : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3])
+                 : "r"(address));
+  }
+}
+
+/**
+ * @brief `pack_halves` rounds two floats to fp16 and packs them in one register, `low` first.
+ *
+ * @param[in] low Element with the lower index.
+ * @param[in] high Element with the higher index.
+ * @return The packed pair.
+ *
+ * @par Example
+ * @code
+ * uint32_t pair = pack_halves(p0, p1);
+ * @endcode
+ */
+__device__ uint32_t pack_halves(float low, float high) {
+  const __half2 pair = __floats2half2_rn(low, high);
+  return *reinterpret_cast<const uint32_t*>(&pair);
+}
+
+/**
+ * @brief `store_fp8_as_halves` converts 16 FP8 E4M3 values to fp16 (exactly) and stores them.
+ *
+ * @param[in] bytes 16 FP8 values.
+ * @param[out] destination 16 fp16 values in shared memory, 16-byte aligned.
+ *
+ * @par Example
+ * @code
+ * store_fp8_as_halves(raw.k[i], &tile.k[key][chunk * kBytesPerLoad]);
+ * @endcode
+ */
+__device__ void store_fp8_as_halves(const uint4& bytes, __half* destination) {
+  const __nv_fp8x2_storage_t* pairs = reinterpret_cast<const __nv_fp8x2_storage_t*>(&bytes);
+  uint32_t halves[kBytesPerLoad / 2];
+  for (int i = 0; i < kBytesPerLoad / 2; ++i) {
+    const __half2_raw pair = __nv_cvt_fp8x2_to_halfraw2(pairs[i], __NV_E4M3);
+    halves[i] = static_cast<uint32_t>(pair.x) | (static_cast<uint32_t>(pair.y) << 16);
+  }
+  reinterpret_cast<uint4*>(destination)[0] = make_uint4(halves[0], halves[1], halves[2], halves[3]);
+  reinterpret_cast<uint4*>(destination)[1] = make_uint4(halves[4], halves[5], halves[6], halves[7]);
+}
+
+/**
  * @brief `merge_splits` publishes this block's softmax state and, in the last block of its
  * request and KV head to arrive, merges every split's state.
  *
@@ -598,7 +687,7 @@ def _get_extension() -> object:
     """
     if "module" not in _extension_cache:
         _extension_cache["module"] = load_inline(
-            name="muse_fused_attention_split_kv",
+            name="muse_fused_attention_mma_primitives",
             cpp_sources=CPP_SOURCE,
             cuda_sources=CUDA_SOURCE,
             functions=["run"],
