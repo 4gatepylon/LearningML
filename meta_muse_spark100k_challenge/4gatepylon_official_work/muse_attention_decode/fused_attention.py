@@ -1515,6 +1515,9 @@ __device__ void wait_for_all_splits(const Params& p, int group) {
  * @brief `merge_rows` merges every split's state for this block's rows (`rank`, `rank + mergers`,
  * ...) into `tile`: row sums, and unnormalized outputs relative to the merged maximum.
  *
+ * @tparam kSplitUnroll Splits each thread's output loop keeps in flight: 4 in the 8-warp build,
+ * whose batch-1 merges run over 100 or more splits; 1 in the 4-warp build, whose registers are
+ * full.
  * @param[in] p Kernel parameters.
  * @param[in,out] tile Shared memory tile: gets `out` and `row_sum` for this block's rows.
  * @param[in] first_slot The group's first workspace slot.
@@ -1524,9 +1527,10 @@ __device__ void wait_for_all_splits(const Params& p, int group) {
  *
  * @par Example
  * @code
- * merge_rows(p, tile, first_slot, rank, mergers, row_count);
+ * merge_rows<4>(p, tile, first_slot, rank, mergers, row_count);
  * @endcode
  */
+template <int kSplitUnroll>
 __device__ void merge_rows(const Params& p, SharedTile& tile, int64_t first_slot, int rank,
                            int mergers, int row_count) {
   const int my_row_count = (row_count - rank + mergers - 1) / mergers;
@@ -1568,6 +1572,7 @@ __device__ void merge_rows(const Params& p, SharedTile& tile, int64_t first_slot
     const int local_row = vector / kVectorsPerRow;
     const int row = rank + local_row * mergers;
     float4 merged = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+#pragma unroll kSplitUnroll
     for (int s = task / vector_count; s < p.split_count; s += part_count) {
       const float4 x = __ldcg(&reinterpret_cast<const float4*>(
           p.partial_out_device +
@@ -1815,7 +1820,8 @@ __global__ void __launch_bounds__(kWarpCount* kWarpSize, kMinBlocksPerSm)
       return;
     }
     wait_for_all_splits(p, group);
-    merge_rows(p, tile, first_slot, merge_rank, mergers, row_count);
+    merge_rows<kWarpCount == kMaxWarps ? 4 : 1>(p, tile, first_slot, merge_rank, mergers,
+                                                row_count);
     wait_for_copies<0>();
     __syncthreads();
     write_gated_output(p, tile, b, kv_head, row_count, merge_rank, mergers);
@@ -2035,7 +2041,7 @@ def _get_extension() -> object:
     """
     if "module" not in _extension_cache:
         _extension_cache["module"] = load_inline(
-            name="muse_fused_attention_parallel_merge",
+            name="muse_fused_attention_merge_unroll",
             cpp_sources=CPP_SOURCE,
             cuda_sources=CUDA_SOURCE,
             functions=["run", "resident_blocks_per_sm"],
