@@ -1867,9 +1867,114 @@ __device__ void attend_new_tokens(const Params& p, SharedTile& tile, const Block
 }
 
 /**
+ * @brief `combine_block_state` writes every warp's softmax state to shared memory and merges the
+ * warps that share query rows into the block's state (`out`, `row_max`, `row_sum`).
+ *
+ * @param[in,out] tile Shared memory tile.
+ * @param[in] work The block's work.
+ * @param[in,out] state This thread's softmax state.
+ *
+ * @par Example
+ * @code
+ * combine_block_state(tile, work, state);
+ * @endcode
+ */
+__device__ void combine_block_state(SharedTile& tile, const BlockWork& work, WarpState& state) {
+  const int lane = work.lane;
+  __syncthreads();
+  // DANGEROUS DANGEROUS DANGEROUS IF YOU CHANGE THIS THEN THE 4-WARP BUILD WILL LOSE 3% (D52)
+  for (int half = 0; half < 2 && work.is_active; ++half) {
+    state.sum[half] += __shfl_xor_sync(0xffffffffu, state.sum[half], 1);
+    state.sum[half] += __shfl_xor_sync(0xffffffffu, state.sum[half], 2);
+    const int row = lane / 4 + 8 * half;
+    if (lane % 4 == 0) {
+      tile.warp_max[work.warp][row] = state.max_log2[half];
+      tile.warp_sum[work.warp][row] = state.sum[half];
+    }
+    for (int d = 0; d < kDimTiles; ++d) {
+      warp_out_row(tile, work.warp, row)[d * kMmaCols + 2 * (lane % 4)] = state.out[d][2 * half];
+      warp_out_row(tile, work.warp, row)[d * kMmaCols + 2 * (lane % 4) + 1] =
+          state.out[d][2 * half + 1];
+    }
+  }
+  __syncthreads();
+  if (work.key_group_count > 1) {
+    combine_warps(tile, work.row_count, work.m_tile_count, work.key_group_count);
+  } else {
+    for (int row = threadIdx.x; row < work.row_count; row += thread_count()) {
+      tile.row_max[row] = tile.warp_max[row / kMmaRows][row % kMmaRows] / kLog2e;
+      tile.row_sum[row] = tile.warp_sum[row / kMmaRows][row % kMmaRows];
+    }
+  }
+  __syncthreads();
+}
+
+/**
+ * @brief `merge_in_parallel` publishes the block's state; the last blocks to arrive wait for the
+ * others, then each merges and writes its own slice of the rows (verify).
+ *
+ * @tparam kWarpCount Warps per block.
+ * @param[in] p Kernel parameters.
+ * @param[in,out] tile Shared memory tile with the block's state and its gate rows in flight.
+ * @param[in] work The block's work.
+ *
+ * @par Example
+ * @code
+ * merge_in_parallel<8>(p, tile, work);
+ * @endcode
+ *
+ * @par Must know
+ * - Gotchas:
+ *   - The kernel must launch cooperatively, so every split is resident while mergers wait.
+ */
+template <int kWarpCount>
+__device__ void merge_in_parallel(const Params& p, SharedTile& tile, const BlockWork& work) {
+  const int group = work.b * p.kv_head_count + work.kv_head;
+  const int64_t first_slot = static_cast<int64_t>(group) * p.split_count;
+  const int mergers = merger_count(p, work.row_count);
+  publish_state(p, tile, first_slot + work.split, work.row_count);
+  const int merge_rank = take_merge_rank(p, tile, group, mergers);
+  if (merge_rank < 0) {
+    wait_for_copies<0>();
+    return;
+  }
+  wait_for_all_splits(p, group);
+  merge_rows<kWarpCount == kMaxWarps ? 4 : 1>(p, tile, first_slot, merge_rank, mergers,
+                                              work.row_count);
+  wait_for_copies<0>();
+  __syncthreads();
+  write_gated_output(p, tile, work.b, work.kv_head, work.row_count, merge_rank, mergers);
+  finish_merge(p, group, mergers);
+}
+
+/**
+ * @brief `merge_with_tree` publishes the block's state into the two-level merge tree; the block
+ * that finishes the tree writes every row (decode).
+ *
+ * @param[in] p Kernel parameters.
+ * @param[in,out] tile Shared memory tile with the block's state and its gate rows in flight.
+ * @param[in] work The block's work.
+ *
+ * @par Example
+ * @code
+ * merge_with_tree(p, tile, work);
+ * @endcode
+ */
+__device__ void merge_with_tree(const Params& p, SharedTile& tile, const BlockWork& work) {
+  const bool is_merging_block =
+      merge_splits(p, tile, work.b, work.kv_head, work.split, work.row_count);
+  wait_for_copies<0>();
+  __syncthreads();
+  if (is_merging_block) {
+    write_gated_output(p, tile, work.b, work.kv_head, work.row_count, 0, 1);
+  }
+}
+
+/**
  * @brief `attention_kernel` attends one split of one request's keys for one KV head group; the
  * first split also writes the block's new keys and values, and the merging blocks write the
- * output.
+ * output. Verify builds (more than one chunk per warp) run on `wgmma` and merge in parallel;
+ * decode builds run on `mma.sync` and merge with the tree.
  *
  * @tparam kWarpCount Warps per block: 4, or 8 for verify on sliding layers or with at most 8
  * request x KV-head groups.
@@ -1888,82 +1993,29 @@ __device__ void attend_new_tokens(const Params& p, SharedTile& tile, const Block
 template <int kWarpCount, int kChunksPerWarp, int kMinBlocksPerSm>
 __global__ void __launch_bounds__(kWarpCount* kWarpSize, kMinBlocksPerSm)
     attention_kernel(const Params p) {
+  constexpr bool kIsVerify = kChunksPerWarp > 1;
   extern __shared__ __align__(16) unsigned char shared_bytes[];
   SharedTile& tile = *reinterpret_cast<SharedTile*>(shared_bytes);
   const BlockWork work = describe_block<kWarpCount>(p);
-  const int split = work.split;
-  const int kv_head = work.kv_head;
-  const int b = work.b;
-  const int warp = work.warp;
-  const int lane = work.lane;
-  const int row_count = work.row_count;
-  const int m_tile_count = work.m_tile_count;
-  const int key_group_count = work.key_group_count;
-  const bool is_active = work.is_active;
   KeyAddresses addresses = start_block<kWarpCount * kWarpSize>(p, tile, work);
   uint32_t q_fragments[kQkSteps][4];
   load_query_fragments(tile, work, q_fragments);
   WarpState state = {};
   state.max_log2[0] = state.max_log2[1] = -INFINITY;
   const float logit_scale_log2 = p.sm_scale * p.qk_scale_factor * tile.k_scale * kLog2e;
-  constexpr bool kIsVerify = kChunksPerWarp > 1;
   attend_split<kWarpCount, kChunksPerWarp, kIsVerify>(p, tile, work, addresses, q_fragments,
                                                       logit_scale_log2, state);
-  if (split == 0) {
+  if (work.split == 0) {
     attend_new_tokens<kChunksPerWarp, kIsVerify>(p, tile, work, q_fragments, logit_scale_log2,
                                                  state);
   }
-  __syncthreads();
-  // DANGEROUS DANGEROUS DANGEROUS IF YOU CHANGE THIS THEN THE 4-WARP BUILD WILL LOSE 3% (D52)
-  for (int half = 0; half < 2 && is_active; ++half) {
-    state.sum[half] += __shfl_xor_sync(0xffffffffu, state.sum[half], 1);
-    state.sum[half] += __shfl_xor_sync(0xffffffffu, state.sum[half], 2);
-    const int row = lane / 4 + 8 * half;
-    if (lane % 4 == 0) {
-      tile.warp_max[warp][row] = state.max_log2[half];
-      tile.warp_sum[warp][row] = state.sum[half];
-    }
-    for (int d = 0; d < kDimTiles; ++d) {
-      warp_out_row(tile, warp, row)[d * kMmaCols + 2 * (lane % 4)] = state.out[d][2 * half];
-      warp_out_row(tile, warp, row)[d * kMmaCols + 2 * (lane % 4) + 1] = state.out[d][2 * half + 1];
-    }
-  }
-  __syncthreads();
-  if (key_group_count > 1) {
-    combine_warps(tile, row_count, m_tile_count, key_group_count);
-  } else {
-    for (int row = threadIdx.x; row < row_count; row += thread_count()) {
-      tile.row_max[row] = tile.warp_max[row / kMmaRows][row % kMmaRows] / kLog2e;
-      tile.row_sum[row] = tile.warp_sum[row / kMmaRows][row % kMmaRows];
-    }
-  }
-  __syncthreads();
-  start_rows_copy(p, tile.merge.gate, b, kv_head, row_count,
+  combine_block_state(tile, work, state);
+  start_rows_copy(p, tile.merge.gate, work.b, work.kv_head, work.row_count,
                   (p.q_head_count + 2 * p.kv_head_count) * kHeadDim);
   if constexpr (kIsVerify) {
-    const int group = b * p.kv_head_count + kv_head;
-    const int64_t first_slot = static_cast<int64_t>(group) * p.split_count;
-    const int mergers = merger_count(p, row_count);
-    publish_state(p, tile, first_slot + split, row_count);
-    const int merge_rank = take_merge_rank(p, tile, group, mergers);
-    if (merge_rank < 0) {
-      wait_for_copies<0>();
-      return;
-    }
-    wait_for_all_splits(p, group);
-    merge_rows<kWarpCount == kMaxWarps ? 4 : 1>(p, tile, first_slot, merge_rank, mergers,
-                                                row_count);
-    wait_for_copies<0>();
-    __syncthreads();
-    write_gated_output(p, tile, b, kv_head, row_count, merge_rank, mergers);
-    finish_merge(p, group, mergers);
+    merge_in_parallel<kWarpCount>(p, tile, work);
   } else {
-    const bool is_merging_block = merge_splits(p, tile, b, kv_head, split, row_count);
-    wait_for_copies<0>();
-    __syncthreads();
-    if (is_merging_block) {
-      write_gated_output(p, tile, b, kv_head, row_count, 0, 1);
-    }
+    merge_with_tree(p, tile, work);
   }
 }
 
@@ -2177,7 +2229,7 @@ def _get_extension() -> object:
     """
     if "module" not in _extension_cache:
         _extension_cache["module"] = load_inline(
-            name="muse_fused_attention_attend_split",
+            name="muse_fused_attention_epilogue_phases",
             cpp_sources=CPP_SOURCE,
             cuda_sources=CUDA_SOURCE,
             functions=["run", "resident_blocks_per_sm"],
