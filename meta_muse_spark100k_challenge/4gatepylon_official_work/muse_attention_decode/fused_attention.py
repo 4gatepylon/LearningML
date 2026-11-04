@@ -33,8 +33,8 @@ Example:
 Must know:
     Limitations:
         - The verify builds use `wgmma`, so the kernel builds for and runs on Hopper (sm_90a).
-        - Every KV head serves 8 query heads (`kGroupSize`), as in both head layouts of `TASK.md`,
-          and a block needs at most 16 query rows (decode) or 49 to 64 (verify).
+        - Every KV head serves 8 query heads (`kGroupSize`) and L is 1 (decode) or 8 (verify), as in
+          `TASK.md`; each build is compiled for its block's 8 or 64 query rows.
     Gotchas:
         - The arrival counters live across calls; each merging block resets its counter to 0.
         - Verify launches cooperatively, so all of its blocks are resident while mergers wait.
@@ -1710,15 +1710,16 @@ struct BlockWork {
  * the request's length.
  *
  * @tparam kWarpCount Warps per block.
+ * @tparam kIsVerify Whether the block serves 8 tokens (64 query rows) rather than 1 (8 rows).
  * @param[in] p Kernel parameters; the grid is (splits, KV heads, requests).
  * @return The block's work.
  *
  * @par Example
  * @code
- * const BlockWork work = describe_block<kWarpCount>(p);
+ * const BlockWork work = describe_block<kWarpCount, kIsVerify>(p);
  * @endcode
  */
-template <int kWarpCount>
+template <int kWarpCount, bool kIsVerify>
 __device__ BlockWork describe_block(const Params& p) {
   BlockWork work;
   work.split = blockIdx.x;
@@ -1726,7 +1727,7 @@ __device__ BlockWork describe_block(const Params& p) {
   work.b = blockIdx.z;
   work.warp = threadIdx.x / kWarpSize;
   work.lane = threadIdx.x % kWarpSize;
-  work.row_count = p.L * kGroupSize;
+  work.row_count = kIsVerify ? kMaxTokens * kGroupSize : kGroupSize;
   work.m_tile_count = (work.row_count + kMmaRows - 1) / kMmaRows;
   work.key_group_count = kWarpCount / work.m_tile_count;
   work.m_tile = work.warp % work.m_tile_count;
@@ -2023,7 +2024,7 @@ __global__ void __launch_bounds__(kWarpCount* kWarpSize, kMinBlocksPerSm)
   constexpr bool kIsVerify = kChunksPerWarp > 1;
   extern __shared__ __align__(16) unsigned char shared_bytes[];
   SharedTile& tile = *reinterpret_cast<SharedTile*>(shared_bytes);
-  const BlockWork work = describe_block<kWarpCount>(p);
+  const BlockWork work = describe_block<kWarpCount, kIsVerify>(p);
   KeyAddresses addresses = start_block<kWarpCount * kWarpSize>(p, tile, work);
   uint32_t q_fragments[kQkSteps][4];
   load_query_fragments(tile, work, q_fragments);
@@ -2148,7 +2149,8 @@ void run(torch::Tensor qkv, torch::Tensor k_cache, torch::Tensor v_cache, torch:
   TORCH_CHECK(keys_per_split > 0 && keys_per_split % kStepKeys == 0,
               "keys_per_split must be a positive multiple of ", kStepKeys, ", got ",
               keys_per_split);
-  TORCH_CHECK(qkv.size(1) <= kMaxTokens, "L must be <= ", kMaxTokens);
+  TORCH_CHECK(qkv.size(1) == 1 || qkv.size(1) == kMaxTokens, "L must be 1 (decode) or ", kMaxTokens,
+              " (verify), got ", qkv.size(1));
   TORCH_CHECK(partial_max.size(2) <= kMaxSplits, "at most ", kMaxSplits, " splits");
   TORCH_CHECK(q_head_count == kGroupSize * k_cache.size(2), "query heads per KV head must be ",
               kGroupSize, ", got ", q_head_count, " / ", k_cache.size(2));
@@ -2258,7 +2260,7 @@ def _get_extension() -> object:
     """
     if "module" not in _extension_cache:
         _extension_cache["module"] = load_inline(
-            name="muse_fused_attention_group_size",
+            name="muse_fused_attention_row_count",
             cpp_sources=CPP_SOURCE,
             cuda_sources=CUDA_SOURCE,
             functions=["run", "resident_blocks_per_sm"],
