@@ -46,6 +46,13 @@ constexpr int kRowsPerPass = kThreads / kHeadDim;
 constexpr int kAccumulatorCount = kMaxRows / kRowsPerPass;
 constexpr int kBytesPerLoad = 16;
 constexpr int kLoadsPerRow = kHeadDim / kBytesPerLoad;
+constexpr int kStepKeys = 64;
+constexpr int kMmaRows = 16;
+constexpr int kMmaCols = 8;
+constexpr int kDimTiles = kHeadDim / kMmaCols;
+constexpr int kRowStride = kHeadDim + 8;
+constexpr int kLoadsPerThread = kStepKeys * kLoadsPerRow / kThreads;
+constexpr int kMaxSplits = 64;
 constexpr float kRmsEps = 1e-5f;
 
 struct Params {
@@ -70,7 +77,7 @@ struct Params {
   int split_count, keys_per_split;
 };
 
-struct SharedTile {
+struct ScalarTile {
   float q[kMaxRows][kHeadDim];
   float k[kTileKeys][kHeadDim + 1];
   float v[kTileKeys][kHeadDim];
@@ -80,6 +87,42 @@ struct SharedTile {
   float row_sum[kMaxRows];
   float row_rescale[kMaxRows];
   bool is_last_split;
+};
+
+struct SharedTile {
+  __half k[kStepKeys][kRowStride];
+  __half v[kStepKeys][kRowStride];
+  union {
+    __half q[kMaxRows][kRowStride];
+    float out[kMaxRows][kHeadDim];
+  };
+  int key_position[kStepKeys];
+  union {
+    float warp_out[kWarps][kMmaRows][kHeadDim];
+    float split_weight[kMaxSplits][kMaxRows];
+  };
+  float warp_max[kWarps][kMmaRows];
+  float warp_sum[kWarps][kMmaRows];
+  float row_max[kMaxRows];
+  float row_sum[kMaxRows];
+  bool is_last_split;
+};
+
+struct KeyAddresses {
+  int page[kLoadsPerThread];
+  int position[kLoadsPerThread];
+};
+
+struct RawKeys {
+  uint4 k[kLoadsPerThread];
+  uint4 v[kLoadsPerThread];
+  int position[kLoadsPerThread];
+};
+
+struct WarpState {
+  float out[kDimTiles][4];
+  float max_log2[2];
+  float sum[2];
 };
 
 /**
@@ -163,7 +206,7 @@ __device__ float2 normalize_and_rotate(float2 x, float gain, int position,
  * load_cached_tile(p, tile, b, kv_head, start, seq_len + p.L);
  * @endcode
  */
-__device__ void load_cached_tile(const Params& p, SharedTile& tile, int b, int kv_head,
+__device__ void load_cached_tile(const Params& p, ScalarTile& tile, int b, int kv_head,
                                  int first_position_incl, int end_position_excl) {
   const int key = threadIdx.x / kLoadsPerRow;
   const int chunk = threadIdx.x % kLoadsPerRow;
@@ -205,7 +248,7 @@ __device__ void load_cached_tile(const Params& p, SharedTile& tile, int b, int k
  * attend_tile(p, tile, accumulators, row_count, seq_len);
  * @endcode
  */
-__device__ void attend_tile(const Params& p, SharedTile& tile, float* accumulators, int row_count,
+__device__ void attend_tile(const Params& p, ScalarTile& tile, float* accumulators, int row_count,
                             int seq_len) {
   const int group_size = p.q_head_count / p.kv_head_count;
   const float logit_scale = p.sm_scale * *p.k_scale_device;
@@ -271,7 +314,7 @@ __device__ void attend_tile(const Params& p, SharedTile& tile, float* accumulato
  * write_gated_output(p, tile, accumulators, b, kv_head, row_count);
  * @endcode
  */
-__device__ void write_gated_output(const Params& p, SharedTile& tile, const float* accumulators,
+__device__ void write_gated_output(const Params& p, ScalarTile& tile, const float* accumulators,
                                    int b, int kv_head, int row_count) {
   const int warp = threadIdx.x / kWarpSize;
   const int lane = threadIdx.x % kWarpSize;
@@ -318,7 +361,7 @@ __device__ void write_gated_output(const Params& p, SharedTile& tile, const floa
  * load_new_tile(p, tile, b, kv_head, seq_len);
  * @endcode
  */
-__device__ void load_new_tile(const Params& p, SharedTile& tile, int b, int kv_head, int seq_len) {
+__device__ void load_new_tile(const Params& p, ScalarTile& tile, int b, int kv_head, int seq_len) {
   const int warp = threadIdx.x / kWarpSize;
   const int lane = threadIdx.x % kWarpSize;
   const int qkv_row_size = (2 * p.q_head_count + 2 * p.kv_head_count) * kHeadDim;
@@ -445,6 +488,147 @@ __device__ void store_fp8_as_halves(const uint4& bytes, __half* destination) {
 }
 
 /**
+ * @brief `locate_keys` starts reading the page table for up to 64 keys of one request and KV head;
+ * missing keys get position -1.
+ *
+ * @param[in] p Kernel parameters.
+ * @param[in] b Request index.
+ * @param[in] kv_head Key/value head index.
+ * @param[in] first_position_incl First key position of the step.
+ * @param[in] end_position_excl Keys at or after this position are missing.
+ * @return The pages of this thread's pieces (thread t's piece i is 16 bytes of key (128 i + t) /
+ * 4), still in flight: nothing here uses them, so the thread does not wait for the reads.
+ *
+ * @par Example
+ * @code
+ * KeyAddresses addresses = locate_keys(p, b, kv_head, start, end);
+ * @endcode
+ */
+__device__ KeyAddresses locate_keys(const Params& p, int b, int kv_head, int first_position_incl,
+                                    int end_position_excl) {
+  KeyAddresses addresses;
+  for (int i = 0; i < kLoadsPerThread; ++i) {
+    const int piece = i * kThreads + threadIdx.x;
+    const int position = first_position_incl + piece / kLoadsPerRow;
+    addresses.position[i] = position < end_position_excl ? position : -1;
+    addresses.page[i] = 0;
+    if (position < end_position_excl) {
+      addresses.page[i] = p.page_table_device[b * p.page_table_stride + position / p.page_size];
+    }
+  }
+  return addresses;
+}
+
+/**
+ * @brief `load_raw_keys` starts loading this thread's pieces of a step's FP8 keys and values into
+ * registers; missing keys get zero bytes.
+ *
+ * @param[in] p Kernel parameters.
+ * @param[in] kv_head Key/value head index.
+ * @param[in] addresses The pieces' pages, from `locate_keys` one step earlier.
+ * @return The pieces, not yet converted.
+ *
+ * @par Example
+ * @code
+ * RawKeys next = load_raw_keys(p, kv_head, next_addresses);
+ * @endcode
+ */
+__device__ RawKeys load_raw_keys(const Params& p, int kv_head, const KeyAddresses& addresses) {
+  RawKeys raw;
+  for (int i = 0; i < kLoadsPerThread; ++i) {
+    const int piece = i * kThreads + threadIdx.x;
+    const int position = addresses.position[i];
+    raw.position[i] = position;
+    raw.k[i] = make_uint4(0, 0, 0, 0);
+    raw.v[i] = make_uint4(0, 0, 0, 0);
+    if (position >= 0) {
+      const int64_t row =
+          static_cast<int64_t>(addresses.page[i]) * p.page_size + position % p.page_size;
+      const int64_t offset =
+          (row * p.kv_head_count + kv_head) * kHeadDim + (piece % kLoadsPerRow) * kBytesPerLoad;
+      raw.k[i] = *reinterpret_cast<const uint4*>(p.k_cache_device + offset);
+      raw.v[i] = *reinterpret_cast<const uint4*>(p.v_cache_device + offset);
+    }
+  }
+  return raw;
+}
+
+/**
+ * @brief `store_raw_keys` converts a step's raw keys and values to fp16 in shared memory.
+ *
+ * @param[in] raw This thread's pieces from `load_raw_keys`.
+ * @param[out] tile Shared memory tile: its keys, values and key positions.
+ *
+ * @par Example
+ * @code
+ * store_raw_keys(current, tile);
+ * @endcode
+ */
+__device__ void store_raw_keys(const RawKeys& raw, SharedTile& tile) {
+  for (int i = 0; i < kLoadsPerThread; ++i) {
+    const int piece = i * kThreads + threadIdx.x;
+    const int key = piece / kLoadsPerRow;
+    const int dim = (piece % kLoadsPerRow) * kBytesPerLoad;
+    store_fp8_as_halves(raw.k[i], &tile.k[key][dim]);
+    store_fp8_as_halves(raw.v[i], &tile.v[key][dim]);
+    if (piece % kLoadsPerRow == 0) {
+      tile.key_position[key] = raw.position[i];
+    }
+  }
+}
+
+/**
+ * @brief `store_new_keys` normalizes and rotates the block's L new keys, writes them and their
+ * values to the FP8 cache, and puts the stored values in shared memory as a step of keys.
+ *
+ * @param[in] p Kernel parameters.
+ * @param[out] tile Shared memory tile: keys 0 to L - 1 are the new ones, the rest are missing.
+ * @param[in] b Request index.
+ * @param[in] kv_head Key/value head index.
+ * @param[in] seq_len Cached tokens of this request: the first new token's position.
+ *
+ * @par Example
+ * @code
+ * store_new_keys(p, tile, b, kv_head, seq_len);
+ * @endcode
+ */
+__device__ void store_new_keys(const Params& p, SharedTile& tile, int b, int kv_head, int seq_len) {
+  const int warp = threadIdx.x / kWarpSize;
+  const int lane = threadIdx.x % kWarpSize;
+  const int qkv_row_size = (2 * p.q_head_count + 2 * p.kv_head_count) * kHeadDim;
+  for (int key = warp; key < kStepKeys; key += kWarps) {
+    __half2 k_stored = __floats2half2_rn(0.0f, 0.0f);
+    __half2 v_stored = k_stored;
+    if (key < p.L) {
+      const __nv_bfloat162* token =
+          reinterpret_cast<const __nv_bfloat162*>(p.qkv_device + (b * p.L + key) * qkv_row_size);
+      const float2 k_in =
+          __bfloat1622float2(token[(p.q_head_count + kv_head) * kHeadDim / 2 + lane]);
+      const float2 v_in = __bfloat1622float2(
+          token[(p.q_head_count + p.kv_head_count + kv_head) * kHeadDim / 2 + lane]);
+      const float2 k = normalize_and_rotate(k_in, 1.0f, seq_len + key, p.inv_freq_device, lane);
+      const __nv_fp8_e4m3 k_fp8[2] = {__nv_fp8_e4m3(k.x / *p.k_scale_device),
+                                      __nv_fp8_e4m3(k.y / *p.k_scale_device)};
+      const __nv_fp8_e4m3 v_fp8[2] = {__nv_fp8_e4m3(v_in.x / *p.v_scale_device),
+                                      __nv_fp8_e4m3(v_in.y / *p.v_scale_device)};
+      const int64_t offset =
+          (p.cache_loc_device[b * p.L + key] * p.kv_head_count + kv_head) * kHeadDim + 2 * lane;
+      p.k_cache_device[offset] = k_fp8[0];
+      p.k_cache_device[offset + 1] = k_fp8[1];
+      p.v_cache_device[offset] = v_fp8[0];
+      p.v_cache_device[offset + 1] = v_fp8[1];
+      k_stored = __floats2half2_rn(static_cast<float>(k_fp8[0]), static_cast<float>(k_fp8[1]));
+      v_stored = __floats2half2_rn(static_cast<float>(v_fp8[0]), static_cast<float>(v_fp8[1]));
+    }
+    reinterpret_cast<__half2*>(&tile.k[key][0])[lane] = k_stored;
+    reinterpret_cast<__half2*>(&tile.v[key][0])[lane] = v_stored;
+    if (lane == 0) {
+      tile.key_position[key] = key < p.L ? seq_len + key : -1;
+    }
+  }
+}
+
+/**
  * @brief `merge_splits` publishes this block's softmax state and, in the last block of its
  * request and KV head to arrive, merges every split's state.
  *
@@ -463,7 +647,7 @@ __device__ void store_fp8_as_halves(const uint4& bytes, __half* destination) {
  * if (merge_splits(p, tile, accumulators, b, kv_head, split, row_count)) { ... }
  * @endcode
  */
-__device__ bool merge_splits(const Params& p, SharedTile& tile, float* accumulators, int b,
+__device__ bool merge_splits(const Params& p, ScalarTile& tile, float* accumulators, int b,
                              int kv_head, int split, int row_count) {
   const int group = b * p.kv_head_count + kv_head;
   const int64_t first_slot = static_cast<int64_t>(group) * p.split_count * kMaxRows;
@@ -538,7 +722,7 @@ __device__ bool merge_splits(const Params& p, SharedTile& tile, float* accumulat
  * @endcode
  */
 __global__ void __launch_bounds__(kThreads) attention_kernel(const Params p) {
-  __shared__ SharedTile tile;
+  __shared__ ScalarTile tile;
   const int split = blockIdx.x;
   const int kv_head = blockIdx.y;
   const int b = blockIdx.z;
@@ -687,7 +871,7 @@ def _get_extension() -> object:
     """
     if "module" not in _extension_cache:
         _extension_cache["module"] = load_inline(
-            name="muse_fused_attention_mma_primitives",
+            name="muse_fused_attention_fp16_staging",
             cpp_sources=CPP_SOURCE,
             cuda_sources=CUDA_SOURCE,
             functions=["run"],
