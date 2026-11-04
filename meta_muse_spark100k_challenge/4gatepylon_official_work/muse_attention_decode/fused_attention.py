@@ -159,6 +159,9 @@ struct SharedTile {
   float row_max[kMaxRows];
   float row_sum[kMaxRows];
   bool is_last_split;
+  int64_t new_cache_loc[kMaxTokens];
+  float k_scale;
+  float v_scale;
 };
 
 struct KeyAddresses {
@@ -299,7 +302,7 @@ __device__ void write_gated_output(const Params& p, const SharedTile& tile, int 
   for (int warp_row = threadIdx.x / kWarpSize * rows_per_warp; warp_row < row_count;
        warp_row += warp_count() * rows_per_warp) {
     const int row = min(warp_row + lane / kLanesPerOutputRow, row_count - 1);
-    const float scale = *p.v_scale_device / tile.row_sum[row];
+    const float scale = tile.v_scale / tile.row_sum[row];
     float o[kDimsPerOutputLane];
     float square_sum = 0.0f;
     for (int i = 0; i < kDimsPerOutputLane; ++i) {
@@ -915,7 +918,8 @@ __device__ void convert_step(SharedTile& tile, int stage) {
  *
  * @param[in] p Kernel parameters.
  * @param[out] tile Shared memory tile: ring stage 0 holds the new FP8 keys in rows 0 to L - 1, the
- * fp16 values tile their values, and the other keys are missing.
+ * fp16 values tile their values, and the other keys are missing (zero values; stale key bytes,
+ * whose scores the mask replaces).
  * @param[in] b Request index.
  * @param[in] kv_head Key/value head index.
  * @param[in] seq_len Cached tokens of this request: the first new token's position.
@@ -928,35 +932,35 @@ __device__ void convert_step(SharedTile& tile, int stage) {
 __device__ void store_new_keys(const Params& p, SharedTile& tile, int b, int kv_head, int seq_len) {
   const int warp = threadIdx.x / kWarpSize;
   const int lane = threadIdx.x % kWarpSize;
-  for (int key = warp; key < kStepKeys; key += warp_count()) {
-    __nv_fp8_e4m3 k_stored[2] = {__nv_fp8_e4m3(0.0f), __nv_fp8_e4m3(0.0f)};
-    __half2 v_stored = __floats2half2_rn(0.0f, 0.0f);
-    if (key < p.L) {
-      const float2 k_in =
-          __bfloat1622float2(reinterpret_cast<const __nv_bfloat162*>(&tile.new_k_in[key][0])[lane]);
-      const float2 v_in =
-          __bfloat1622float2(reinterpret_cast<const __nv_bfloat162*>(&tile.new_v_in[key][0])[lane]);
-      const float2 k = normalize_and_rotate(k_in, 1.0f, tile.rotation[key][lane]);
-      const __nv_fp8_e4m3 k_fp8[2] = {__nv_fp8_e4m3(k.x / *p.k_scale_device),
-                                      __nv_fp8_e4m3(k.y / *p.k_scale_device)};
-      const __nv_fp8_e4m3 v_fp8[2] = {__nv_fp8_e4m3(v_in.x / *p.v_scale_device),
-                                      __nv_fp8_e4m3(v_in.y / *p.v_scale_device)};
-      const int64_t offset =
-          (p.cache_loc_device[b * p.L + key] * p.kv_head_count + kv_head) * kHeadDim + 2 * lane;
-      p.k_cache_device[offset] = k_fp8[0];
-      p.k_cache_device[offset + 1] = k_fp8[1];
-      p.v_cache_device[offset] = v_fp8[0];
-      p.v_cache_device[offset + 1] = v_fp8[1];
-      k_stored[0] = k_fp8[0];
-      k_stored[1] = k_fp8[1];
-      v_stored = __floats2half2_rn(static_cast<float>(v_fp8[0]), static_cast<float>(v_fp8[1]));
+  for (int vector = threadIdx.x; vector < kStepKeys * kHeadDim / kHalvesPerLoad;
+       vector += thread_count()) {
+    if (vector / (kHeadDim / kHalvesPerLoad) >= p.L) {
+      reinterpret_cast<uint4*>(&tile.v[0][0])[vector] = make_uint4(0, 0, 0, 0);
     }
-    tile.ring.raw_k[0][key][swizzled_dim(key, 2 * lane)] = k_stored[0].__x;
-    tile.ring.raw_k[0][key][swizzled_dim(key, 2 * lane + 1)] = k_stored[1].__x;
-    *reinterpret_cast<__half2*>(&tile.v[key][swizzled_value_dim(key, 2 * lane)]) = v_stored;
-    if (lane == 0) {
-      tile.key_position[key] = key < p.L ? seq_len + key : -1;
-    }
+  }
+  for (int key = threadIdx.x; key < kStepKeys; key += thread_count()) {
+    tile.key_position[key] = key < p.L ? seq_len + key : -1;
+  }
+  for (int key = warp; key < p.L; key += warp_count()) {
+    const float2 k_in =
+        __bfloat1622float2(reinterpret_cast<const __nv_bfloat162*>(&tile.new_k_in[key][0])[lane]);
+    const float2 v_in =
+        __bfloat1622float2(reinterpret_cast<const __nv_bfloat162*>(&tile.new_v_in[key][0])[lane]);
+    const float2 k = normalize_and_rotate(k_in, 1.0f, tile.rotation[key][lane]);
+    const __nv_fp8_e4m3 k_fp8[2] = {__nv_fp8_e4m3(k.x / tile.k_scale),
+                                    __nv_fp8_e4m3(k.y / tile.k_scale)};
+    const __nv_fp8_e4m3 v_fp8[2] = {__nv_fp8_e4m3(v_in.x / tile.v_scale),
+                                    __nv_fp8_e4m3(v_in.y / tile.v_scale)};
+    const int64_t offset =
+        (tile.new_cache_loc[key] * p.kv_head_count + kv_head) * kHeadDim + 2 * lane;
+    p.k_cache_device[offset] = k_fp8[0];
+    p.k_cache_device[offset + 1] = k_fp8[1];
+    p.v_cache_device[offset] = v_fp8[0];
+    p.v_cache_device[offset + 1] = v_fp8[1];
+    tile.ring.raw_k[0][key][swizzled_dim(key, 2 * lane)] = k_fp8[0].__x;
+    tile.ring.raw_k[0][key][swizzled_dim(key, 2 * lane + 1)] = k_fp8[1].__x;
+    *reinterpret_cast<__half2*>(&tile.v[key][swizzled_value_dim(key, 2 * lane)]) =
+        __floats2half2_rn(static_cast<float>(v_fp8[0]), static_cast<float>(v_fp8[1]));
   }
 }
 
@@ -1390,6 +1394,13 @@ __global__ void __launch_bounds__(kWarpCount* kWarpSize, kMinBlocksPerSm)
     start_step_copy<kWarpCount * kWarpSize>(p, tile, kv_head, addresses, stage);
     addresses = next_addresses;
   }
+  if (threadIdx.x < p.L) {
+    tile.new_cache_loc[threadIdx.x] = p.cache_loc_device[b * p.L + threadIdx.x];
+  }
+  if (threadIdx.x == kWarpSize) {
+    tile.k_scale = *p.k_scale_device;
+    tile.v_scale = *p.v_scale_device;
+  }
   fill_rotation_table(p, tile, seq_len);
   wait_for_copies<kStages - 1>();
   __syncthreads();
@@ -1413,7 +1424,7 @@ __global__ void __launch_bounds__(kWarpCount* kWarpSize, kMinBlocksPerSm)
   }
   WarpState state = {};
   state.max_log2[0] = state.max_log2[1] = -INFINITY;
-  const float logit_scale_log2 = p.sm_scale * p.qk_scale_factor * *p.k_scale_device * kLog2e;
+  const float logit_scale_log2 = p.sm_scale * p.qk_scale_factor * tile.k_scale * kLog2e;
   const int first_row = m_tile * kMmaRows;
   constexpr bool kUseWgmma = kWarpCount * kChunksPerWarp * kChunkKeys == 4 * kStepKeys;
   for (int step = 0; first_position_incl + step * kStepKeys < end_position_excl; ++step) {
@@ -1667,7 +1678,7 @@ def _get_extension() -> object:
     """
     if "module" not in _extension_cache:
         _extension_cache["module"] = load_inline(
-            name="muse_fused_attention_l2_lines",
+            name="muse_fused_attention_lean_new_keys",
             cpp_sources=CPP_SOURCE,
             cuda_sources=CUDA_SOURCE,
             functions=["run", "resident_blocks_per_sm"],
