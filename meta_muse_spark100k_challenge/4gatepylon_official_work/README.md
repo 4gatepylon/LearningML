@@ -36,3 +36,10 @@ changes nothing. It needs `okc` on PATH, signed in, and `uv`.
 `../.artifacts/okc_runs/<run_id>/`, which keeps the file sent, `command.txt` and the job id. It
 refuses when 2 or fewer runs of that mode are left today (`--min-left`). Run it with
 `uv run --script scripts/okc_runs.py`.
+
+`scripts/roofline_attention_decode.py` computes the roofline of each scored `muse_attention_decode`
+shape: the attention matmuls' FLOP, the bytes a kernel must move, the time each takes at the GPU's
+spec peaks, which one bounds the shape, and the attainable TFLOP/s. The script lists the source of
+every input in `SOURCES` and writes each run to
+`../.artifacts/roofline_attention_decode/<run_id>/` (`command.txt`, `rows.json`). Run it with
+`uv run --script scripts/roofline_attention_decode.py`.
