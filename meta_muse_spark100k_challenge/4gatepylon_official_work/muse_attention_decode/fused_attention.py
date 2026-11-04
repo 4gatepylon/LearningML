@@ -13,8 +13,9 @@ block. It:
    query rows over its share of the step's keys: S = Q K^T runs on FP8 tensor cores straight
    from the ring, the values are converted to fp16 for O += P V, and the online softmax updates
    once per step. Only steps at the edge of the window or chunk apply the mask.
-3. In the first chunk's block only: normalizes the block's new keys, applies RoPE, writes the new
-   keys and values to the FP8 cache, and attends to them as one last, causal step.
+3. In the first chunk's block only: normalizes the block's new keys (staged in shared memory at
+   the start), applies RoPE, writes the new keys and values to the FP8 cache, and attends to them
+   as one last, causal step.
 4. Combines its warps' softmax states and publishes the block's state. A two-level tree merges
    the chunks: the last block of each group of up to 16 chunks merges that group, then the last
    group merger merges the groups, divides by the softmax sum, and applies the per-head RMSNorm
@@ -32,7 +33,8 @@ Must know:
     Performance:
         - The page-table reads for a step are issued one step before its keys and values.
         - The split count fills exactly one wave of resident blocks, from the occupancy calculator.
-        - Decode blocks run a build with 3 blocks per SM (more registers), verify blocks one with 4.
+        - Each build compiles one path: decode (1 chunk per warp per step, 3 blocks per SM) or
+          verify (4 chunks per warp, 4 blocks per SM), so decode keeps fewer registers.
 """
 
 import torch
@@ -66,7 +68,6 @@ constexpr int kLoadsPerRow = kHeadDim / kBytesPerLoad;
 constexpr int kLoadsPerThread = kStepKeys * kLoadsPerRow / kThreads;
 constexpr int kMaxSplits = 256;
 constexpr int kStages = 3;
-constexpr int kMaxDecodeRows = 16;
 constexpr int kDecodeBlocksPerSm = 3;
 constexpr int kVerifyBlocksPerSm = 4;
 constexpr int kMaxTokens = 8;
@@ -128,6 +129,8 @@ struct SharedTile {
     MergeTile merge;
   };
   float2 rotation[kMaxTokens][kHeadDim / 2];
+  __nv_bfloat16 new_k_in[kMaxTokens][kHeadDim];
+  __nv_bfloat16 new_v_in[kMaxTokens][kHeadDim];
   int key_position[kStepKeys];
   float warp_max[kWarps][kMmaRows];
   float warp_sum[kWarps][kMmaRows];
@@ -205,6 +208,7 @@ __device__ void write_gated_output(const Params& p, const SharedTile& tile, int 
   const int warp = threadIdx.x / kWarpSize;
   const int lane = threadIdx.x % kWarpSize;
   const int group_size = p.q_head_count / p.kv_head_count;
+#pragma unroll 4
   for (int row = warp; row < row_count; row += kWarps) {
     const int token = b * p.L + row / group_size;
     const int head = kv_head * group_size + row % group_size;
@@ -433,6 +437,32 @@ __device__ void start_rows_copy(const Params& p, __nv_bfloat16 (*rows)[kHeadDim]
 }
 
 /**
+ * @brief `start_new_token_copy` starts copying the block's new key and value rows for one KV head
+ * from the fused projection output into shared memory; the next `cp.async` commit includes them.
+ *
+ * @param[in] p Kernel parameters.
+ * @param[out] tile Shared memory tile: its `new_k_in` and `new_v_in` rows.
+ * @param[in] b Request index.
+ * @param[in] kv_head Key/value head index.
+ *
+ * @par Example
+ * @code
+ * start_new_token_copy(p, tile, b, kv_head);
+ * @endcode
+ */
+__device__ void start_new_token_copy(const Params& p, SharedTile& tile, int b, int kv_head) {
+  const int qkv_row_size = (2 * p.q_head_count + 2 * p.kv_head_count) * kHeadDim;
+  for (int piece = threadIdx.x; piece < p.L * kPiecesPerRow; piece += kThreads) {
+    const int token = piece / kPiecesPerRow;
+    const int column = (piece % kPiecesPerRow) * (kBytesPerLoad / 2);
+    const __nv_bfloat16* row = p.qkv_device + (b * p.L + token) * qkv_row_size + column;
+    copy_async_16(&tile.new_k_in[token][column], row + (p.q_head_count + kv_head) * kHeadDim, true);
+    copy_async_16(&tile.new_v_in[token][column],
+                  row + (p.q_head_count + p.kv_head_count + kv_head) * kHeadDim, true);
+  }
+}
+
+/**
  * @brief `fill_rotation_table` computes RoPE's (cos, sin) for each new token's position and each
  * pair of head dimensions, or (1, 0) when the layer has no RoPE.
  *
@@ -518,7 +548,8 @@ __device__ void convert_step(SharedTile& tile, int stage) {
 }
 
 /**
- * @brief `store_new_keys` normalizes and rotates the block's L new keys, writes them and their
+ * @brief `store_new_keys` normalizes and rotates the block's L new keys (staged by
+ * `start_new_token_copy`), writes them and their
  * values to the FP8 cache, and puts the stored values in shared memory as a step of keys.
  *
  * @param[in] p Kernel parameters.
@@ -536,17 +567,14 @@ __device__ void convert_step(SharedTile& tile, int stage) {
 __device__ void store_new_keys(const Params& p, SharedTile& tile, int b, int kv_head, int seq_len) {
   const int warp = threadIdx.x / kWarpSize;
   const int lane = threadIdx.x % kWarpSize;
-  const int qkv_row_size = (2 * p.q_head_count + 2 * p.kv_head_count) * kHeadDim;
   for (int key = warp; key < kStepKeys; key += kWarps) {
     __nv_fp8_e4m3 k_stored[2] = {__nv_fp8_e4m3(0.0f), __nv_fp8_e4m3(0.0f)};
     __half2 v_stored = __floats2half2_rn(0.0f, 0.0f);
     if (key < p.L) {
-      const __nv_bfloat162* token =
-          reinterpret_cast<const __nv_bfloat162*>(p.qkv_device + (b * p.L + key) * qkv_row_size);
       const float2 k_in =
-          __bfloat1622float2(token[(p.q_head_count + kv_head) * kHeadDim / 2 + lane]);
-      const float2 v_in = __bfloat1622float2(
-          token[(p.q_head_count + p.kv_head_count + kv_head) * kHeadDim / 2 + lane]);
+          __bfloat1622float2(reinterpret_cast<const __nv_bfloat162*>(&tile.new_k_in[key][0])[lane]);
+      const float2 v_in =
+          __bfloat1622float2(reinterpret_cast<const __nv_bfloat162*>(&tile.new_v_in[key][0])[lane]);
       const float2 k = normalize_and_rotate(k_in, 1.0f, tile.rotation[key][lane]);
       const __nv_fp8_e4m3 k_fp8[2] = {__nv_fp8_e4m3(k.x / *p.k_scale_device),
                                       __nv_fp8_e4m3(k.y / *p.k_scale_device)};
@@ -663,44 +691,6 @@ __device__ void attend_keys(const Params& p, const SharedTile& tile,
       mma_16x8x16(state.out[2 * pair], p_fragment, b[0], b[1]);
       mma_16x8x16(state.out[2 * pair + 1], p_fragment, b[2], b[3]);
     }
-  }
-}
-
-/**
- * @brief `attend_step` hands this warp's share of a step's 64 keys to `attend_keys`.
- *
- * @param[in] p Kernel parameters.
- * @param[in] tile Shared memory tile with the step's fp16 values and key positions.
- * @param[in] keys The step's FP8 keys, one padded row per key.
- * @param[in] q_fragments This warp's FP8 query rows as A fragments.
- * @param[in] key_group This warp's share: keys `key_group * 64 / key_group_count` onwards.
- * @param[in] key_group_count Warps sharing the same query rows: 4, 2 or 1.
- * @param[in] first_row First of the warp's 16 query rows.
- * @param[in] seq_len Cached tokens of this request.
- * @param[in] logit_scale_log2 Factor from Q K^T to base-2 logits.
- * @param[in] is_masked Whether the step needs the visibility mask.
- * @param[in,out] state This thread's part of the warp's softmax state and outputs.
- *
- * @par Example
- * @code
- * attend_step(p, tile, keys, q_fragments, key_group, 4, first_row, seq_len, scale, false, state);
- * @endcode
- */
-__device__ void attend_step(const Params& p, const SharedTile& tile,
-                            const uint8_t (*keys)[kRawStride],
-                            const uint32_t (&q_fragments)[kQkSteps][4], int key_group,
-                            int key_group_count, int first_row, int seq_len, float logit_scale_log2,
-                            bool is_masked, WarpState& state) {
-  const int first_key = key_group * kStepKeys / key_group_count;
-  if (key_group_count == 4) {
-    attend_keys<1>(p, tile, keys, q_fragments, first_key, first_row, seq_len, logit_scale_log2,
-                   is_masked, state);
-  } else if (key_group_count == 2) {
-    attend_keys<2>(p, tile, keys, q_fragments, first_key, first_row, seq_len, logit_scale_log2,
-                   is_masked, state);
-  } else {
-    attend_keys<4>(p, tile, keys, q_fragments, first_key, first_row, seq_len, logit_scale_log2,
-                   is_masked, state);
   }
 }
 
@@ -917,16 +907,18 @@ __device__ bool merge_splits(const Params& p, SharedTile& tile, int b, int kv_he
  * first split also writes the block's new keys and values, and the last to finish writes the
  * output.
  *
+ * @tparam kChunksPerWarp Chunks of 16 keys each warp attends per step: 1 for decode (4 warps share
+ * 16 query rows), 4 for verify (each warp owns 16 rows).
  * @tparam kMinBlocksPerSm Blocks that must fit on one SM: the compiler caps registers to match.
  * @param[in] p Kernel parameters; the grid is (splits, KV heads, requests).
  *
  * @par Example
  * @code
- * attention_kernel<3><<<dim3(split_count, kv_head_count, B), kThreads, sizeof(SharedTile),
+ * attention_kernel<1, 4><<<dim3(split_count, kv_head_count, B), kThreads, sizeof(SharedTile),
  * stream>>>(p);
  * @endcode
  */
-template <int kMinBlocksPerSm>
+template <int kChunksPerWarp, int kMinBlocksPerSm>
 __global__ void __launch_bounds__(kThreads, kMinBlocksPerSm) attention_kernel(const Params p) {
   extern __shared__ __align__(16) unsigned char shared_bytes[];
   SharedTile& tile = *reinterpret_cast<SharedTile*>(shared_bytes);
@@ -946,6 +938,9 @@ __global__ void __launch_bounds__(kThreads, kMinBlocksPerSm) attention_kernel(co
   const int window_start_incl = p.window == 0 ? 0 : max(0, seq_len - p.window + 1);
   const int first_position_incl = window_start_incl + split * p.keys_per_split;
   const int end_position_excl = min(first_position_incl + p.keys_per_split, seq_len);
+  if (split == 0) {
+    start_new_token_copy(p, tile, b, kv_head);
+  }
   start_rows_copy(p, tile.start.q_in, b, kv_head, row_count, 0);
   KeyAddresses addresses = locate_keys(p, b, kv_head, first_position_incl, end_position_excl);
   for (int stage = 0; stage < kStages - 1; ++stage) {
@@ -957,6 +952,7 @@ __global__ void __launch_bounds__(kThreads, kMinBlocksPerSm) attention_kernel(co
   fill_rotation_table(p, tile, seq_len);
   wait_for_copies<kStages - 1>();
   __syncthreads();
+#pragma unroll 4
   for (int row = warp; row < m_tile_count * kMmaRows; row += kWarps) {
     float2 q = make_float2(0.0f, 0.0f);
     if (row < row_count) {
@@ -991,8 +987,9 @@ __global__ void __launch_bounds__(kThreads, kMinBlocksPerSm) attention_kernel(co
     const bool is_masked = start + kStepKeys > end_position_excl ||
                            (p.window != 0 && start < window_start_incl + p.L - 1);
     if (is_active) {
-      attend_step(p, tile, tile.ring.raw_k[step % kStages], q_fragments, key_group, key_group_count,
-                  first_row, seq_len, logit_scale_log2, is_masked, state);
+      attend_keys<kChunksPerWarp>(p, tile, tile.ring.raw_k[step % kStages], q_fragments,
+                                  key_group * kChunksPerWarp * kChunkKeys, first_row, seq_len,
+                                  logit_scale_log2, is_masked, state);
     }
   }
   wait_for_copies<0>();
@@ -1001,8 +998,9 @@ __global__ void __launch_bounds__(kThreads, kMinBlocksPerSm) attention_kernel(co
     store_new_keys(p, tile, b, kv_head, seq_len);
     __syncthreads();
     if (is_active) {
-      attend_step(p, tile, tile.ring.raw_k[0], q_fragments, key_group, key_group_count, first_row,
-                  seq_len, logit_scale_log2, true, state);
+      attend_keys<kChunksPerWarp>(p, tile, tile.ring.raw_k[0], q_fragments,
+                                  key_group * kChunksPerWarp * kChunkKeys, first_row, seq_len,
+                                  logit_scale_log2, true, state);
     }
   }
   __syncthreads();
@@ -1021,7 +1019,14 @@ __global__ void __launch_bounds__(kThreads, kMinBlocksPerSm) attention_kernel(co
     }
   }
   __syncthreads();
-  combine_warps(tile, row_count, m_tile_count, key_group_count);
+  if (key_group_count > 1) {
+    combine_warps(tile, row_count, m_tile_count, key_group_count);
+  } else {
+    for (int row = threadIdx.x; row < row_count; row += kThreads) {
+      tile.row_max[row] = tile.warp_max[row / kMmaRows][row % kMmaRows] / kLog2e;
+      tile.row_sum[row] = tile.warp_sum[row / kMmaRows][row % kMmaRows];
+    }
+  }
   __syncthreads();
   start_rows_copy(p, tile.merge.gate, b, kv_head, row_count,
                   (p.q_head_count + 2 * p.kv_head_count) * kHeadDim);
@@ -1036,8 +1041,8 @@ __global__ void __launch_bounds__(kThreads, kMinBlocksPerSm) attention_kernel(co
 using attention_kernel_t = void (*)(Params);
 
 /**
- * @brief `select_kernel` picks the kernel build for a block's query rows: decode blocks (16 rows or
- * fewer) keep more registers per thread, verify blocks fit one more block per SM.
+ * @brief `select_kernel` picks the kernel build for a block's query rows: the chunks each warp
+ * attends per step, and how many blocks share an SM.
  *
  * @param[in] row_count Query rows per block (L x query heads per KV head).
  * @return The kernel to launch.
@@ -1048,8 +1053,14 @@ using attention_kernel_t = void (*)(Params);
  * @endcode
  */
 attention_kernel_t select_kernel(int64_t row_count) {
-  return row_count <= kMaxDecodeRows ? attention_kernel<kDecodeBlocksPerSm>
-                                     : attention_kernel<kVerifyBlocksPerSm>;
+  const int64_t m_tile_count = (row_count + kMmaRows - 1) / kMmaRows;
+  if (m_tile_count == 1) {
+    return attention_kernel<1, kDecodeBlocksPerSm>;
+  }
+  if (m_tile_count == 2) {
+    return attention_kernel<2, kVerifyBlocksPerSm>;
+  }
+  return attention_kernel<4, kVerifyBlocksPerSm>;
 }
 
 }  // namespace
@@ -1185,7 +1196,7 @@ def _get_extension() -> object:
     """
     if "module" not in _extension_cache:
         _extension_cache["module"] = load_inline(
-            name="muse_fused_attention_two_builds",
+            name="muse_fused_attention_staged_rows",
             cpp_sources=CPP_SOURCE,
             cuda_sources=CUDA_SOURCE,
             functions=["run", "resident_blocks_per_sm"],
