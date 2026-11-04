@@ -46,3 +46,11 @@ shape. The script lists the source of every input in `SOURCES` and writes each r
 `../.artifacts/roofline_attention_decode/<run_id>/` (`command.txt`, `rows.json`, one
 `roofline_<gpu>.png` per measured GPU). Run it with
 `uv run --script scripts/roofline_attention_decode.py`.
+
+`scripts/bench_attention_decode.py` checks and times `muse_attention_decode` implementations on the
+local GPU. For each scored shape it builds the judge's inputs, checks every implementation against
+`reference.py`, and times CUDA graph replays with a cold L2, taking turns, minus an empty graph's
+replay time. It writes `../.artifacts/bench_attention_decode/<run_id>/measurements.json`, which
+`roofline_attention_decode.py --measurements-file` places on that GPU's roofline. It needs a Python
+with torch, e.g. `CUDA_VISIBLE_DEVICES=2 python scripts/bench_attention_decode.py --gpu h100-pcie
+--implementation starter=muse_attention_decode/submission.py`.
