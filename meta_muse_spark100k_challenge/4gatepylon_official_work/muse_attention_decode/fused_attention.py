@@ -1186,8 +1186,9 @@ __device__ void accumulate_values_wgmma(float (&out)[32],
 
 /**
  * @brief `attend_keys` folds this warp's keys of a step (`kChunkCount` chunks of 16) into its
- * online softmax over its 16 query rows: S = Q K^T on tensor cores, one max and one rescale for
- * all of them, then O += P V on tensor cores. S uses FP8 keys and queries, P V uses fp16.
+ * online softmax over its 16 query rows: S = Q K^T on `wgmma`, one max and one rescale for all of
+ * them, then O += P V on `wgmma`. S uses FP8 keys and queries, P V uses fp16. Decode builds hand
+ * the step to `attend_keys_transposed`.
  *
  * @tparam kChunkCount Chunks of 16 keys this warp attends in the step.
  * @tparam kUseWgmma Whether each warpgroup runs S and P V on `wgmma` over its keys (verify).
@@ -1213,93 +1214,169 @@ __device__ void accumulate_values_wgmma(float (&out)[32],
  * - Gotchas:
  *   - `logit_scale_log2` must be positive: the step's max is taken before scaling.
  */
+/**
+ * @brief `transpose_halves` transposes an 8 x 8 matrix of 16-bit elements held one row pair per
+ * thread in the `mma` fragment layout (`movmatrix`).
+ *
+ * @param[in] x This thread's two elements: row `lane / 4`, columns `2 (lane % 4)` and `+ 1`.
+ * @return This thread's two elements of the transposed matrix, in the same layout.
+ *
+ * @par Example
+ * @code
+ * const uint32_t p_fragment = transpose_halves(pack_halves(scores[0], scores[1]));
+ * @endcode
+ */
+__device__ uint32_t transpose_halves(uint32_t x) {
+  uint32_t y;
+  asm volatile("movmatrix.sync.aligned.m8n8.trans.b16 %0, %1;\n" : "=r"(y) : "r"(x));
+  return y;
+}
+
+/**
+ * @brief `attend_keys_transposed` folds this warp's 16 keys of a decode step into its online
+ * softmax over the 8 query heads: S^T = K Q^T with the keys as the 16 `mma` rows and the queries as
+ * the 8 columns, then O^T += V^T P^T with 16 head dimensions as the rows, so no row is padding.
+ *
+ * @param[in] p Kernel parameters.
+ * @param[in] tile Shared memory tile with the step's fp16 values and key positions.
+ * @param[in] keys The step's FP8 keys, one 64-byte row per key, swizzled by `swizzled_dim`.
+ * @param[in] q_fragments The query heads as `mma` B fragments: `[depth][0]` and `[depth][1]` hold
+ * query `lane / 4`, bytes `32 depth + 4 (lane % 4)` and `+ 16`.
+ * @param[in] first_key First of the warp's 16 keys, within the step.
+ * @param[in] seq_len Cached tokens of this request: the new token's position.
+ * @param[in] logit_scale_log2 Factor from Q K^T to base-2 logits.
+ * @param[in] is_masked Whether some key may be missing or outside the window.
+ * @param[in,out] state This thread's softmax state: `max_log2[e]` and `sum[e]` of query
+ * `2 (lane % 4) + e`; `out[d][2 h + e]` is dimension `16 d + lane / 4 + 8 h` of that query.
+ *
+ * @par Example
+ * @code
+ * attend_keys_transposed(p, tile, keys, q_fragments, 16 * warp, seq_len, scale, false, state);
+ * @endcode
+ */
+__device__ void attend_keys_transposed(const Params& p, const SharedTile& tile,
+                                       const uint8_t (*keys)[kHeadDim],
+                                       const uint32_t (&q_fragments)[kQkSteps][4], int first_key,
+                                       int seq_len, float logit_scale_log2, bool is_masked,
+                                       WarpState& state) {
+  const int lane = threadIdx.x % kWarpSize;
+  const int low_key = first_key + lane % 8;
+  const int high_key = low_key + kMmaCols;
+  uint32_t low_pieces[4];
+  uint32_t high_pieces[4];
+  load_matrices<false>(low_pieces,
+                       &keys[low_key][swizzled_dim(low_key, kBytesPerLoad * (lane / 8))]);
+  load_matrices<false>(high_pieces,
+                       &keys[high_key][swizzled_dim(high_key, kBytesPerLoad * (lane / 8))]);
+  float scores[4] = {};
+  for (int depth = 0; depth < kQkSteps; ++depth) {
+    const uint32_t k_fragment[4] = {low_pieces[2 * depth], high_pieces[2 * depth],
+                                    low_pieces[2 * depth + 1], high_pieces[2 * depth + 1]};
+    mma_16x8x32_fp8(scores, k_fragment, q_fragments[depth][0], q_fragments[depth][1]);
+  }
+  if (is_masked) {
+    for (int half = 0; half < 2; ++half) {
+      const int key_position = tile.key_position[first_key + lane / 4 + kMmaCols * half];
+      const bool is_visible = key_position >= 0 && key_position <= seq_len &&
+                              (p.window == 0 || key_position > seq_len - p.window);
+      scores[2 * half] = is_visible ? scores[2 * half] : -INFINITY;
+      scores[2 * half + 1] = is_visible ? scores[2 * half + 1] : -INFINITY;
+    }
+  }
+  for (int e = 0; e < 2; ++e) {
+    float step_max = fmaxf(scores[e], scores[2 + e]);
+    for (int offset = kWarpSize / 2; offset >= 4; offset /= 2) {
+      step_max = fmaxf(step_max, __shfl_xor_sync(kFullWarpMask, step_max, offset));
+    }
+    const float new_max = fmaxf(state.max_log2[e], step_max * logit_scale_log2);
+    const float safe_max = new_max == -INFINITY ? 0.0f : new_max;
+    const float rescale = fast_exp2(state.max_log2[e] - safe_max);
+    state.max_log2[e] = new_max;
+    state.sum[e] *= rescale;
+    for (int d = 0; d < kHeadDim / kMmaRows; ++d) {
+      state.out[d][e] *= rescale;
+      state.out[d][2 + e] *= rescale;
+    }
+    scores[e] = fast_exp2(fmaf(scores[e], logit_scale_log2, -safe_max));
+    scores[2 + e] = fast_exp2(fmaf(scores[2 + e], logit_scale_log2, -safe_max));
+    state.sum[e] += scores[e] + scores[2 + e];
+  }
+  const uint32_t low_p = transpose_halves(pack_halves(scores[0], scores[1]));
+  const uint32_t high_p = transpose_halves(pack_halves(scores[2], scores[3]));
+  const int value_key = first_key + lane % 8 + kMmaCols * (lane / 16);
+  for (int d = 0; d < kHeadDim / kMmaRows; ++d) {
+    uint32_t v_fragment[4];
+    load_matrices<true>(
+        v_fragment,
+        &tile.v[value_key][swizzled_value_dim(value_key, kMmaRows * d + 8 * ((lane / 8) % 2))]);
+    mma_16x8x16(state.out[d], v_fragment, low_p, high_p);
+  }
+}
+
 template <int kChunkCount, bool kUseWgmma>
 __device__ void attend_keys(const Params& p, const SharedTile& tile,
                             const uint8_t (*keys)[kHeadDim],
                             const uint32_t (&q_fragments)[kQkSteps][4], int first_key,
                             int first_row, int seq_len, float logit_scale_log2, bool is_masked,
                             WarpState& state) {
-  const int lane = threadIdx.x % kWarpSize;
-  // DANGEROUS DANGEROUS DANGEROUS IF YOU CHANGE THIS THEN THE 4-WARP BUILD WILL LOSE 2% (D40)
-  const int warpgroup_first_key = kChunkCount * kChunkKeys == kStepKeys ? 0 : first_key;
-  float scores[kChunkCount][2][4] = {};
-  if constexpr (kUseWgmma) {
+  if constexpr (!kUseWgmma) {
+    attend_keys_transposed(p, tile, keys, q_fragments, first_key, seq_len, logit_scale_log2,
+                           is_masked, state);
+  } else {
+    const int lane = threadIdx.x % kWarpSize;
+    // DANGEROUS DANGEROUS DANGEROUS IF YOU CHANGE THIS THEN THE 4-WARP BUILD WILL LOSE 2% (D40)
+    const int warpgroup_first_key = kChunkCount * kChunkKeys == kStepKeys ? 0 : first_key;
+    float scores[kChunkCount][2][4] = {};
     constexpr int kKeyCount = kChunkCount * kChunkKeys;
     float (&accumulators)[kKeyCount / 2] =
         *reinterpret_cast<float (*)[kKeyCount / 2]>(&scores[0][0][0]);
     score_keys_wgmma<kKeyCount>(accumulators, q_fragments, &keys[warpgroup_first_key]);
-  } else {
-    for (int chunk = 0; chunk < kChunkCount; ++chunk) {
-      for (int n = 0; n < 2; ++n) {
-        const int key = first_key + chunk * kChunkKeys + n * kMmaCols + lane % 8;
-        uint32_t b[4];
-        load_matrices<false>(b, &keys[key][swizzled_dim(key, kBytesPerLoad * (lane / 8))]);
-        mma_16x8x32_fp8(scores[chunk][n], q_fragments[0], b[0], b[1]);
-        mma_16x8x32_fp8(scores[chunk][n], q_fragments[1], b[2], b[3]);
-      }
-    }
-  }
-  if (is_masked) {
-    for (int half = 0; half < 2; ++half) {
-      const int query_position = seq_len + (first_row + lane / 4 + 8 * half) / kGroupSize;
-      for (int chunk = 0; chunk < kChunkCount; ++chunk) {
-        for (int n = 0; n < 2; ++n) {
-          for (int e = 2 * half; e < 2 * half + 2; ++e) {
-            const int key_position = tile.key_position[first_key + chunk * kChunkKeys +
-                                                       n * kMmaCols + 2 * (lane % 4) + e % 2];
-            const bool is_visible = key_position >= 0 && key_position <= query_position &&
-                                    (p.window == 0 || key_position > query_position - p.window);
-            scores[chunk][n][e] = is_visible ? scores[chunk][n][e] : -INFINITY;
+    if (is_masked) {
+      for (int half = 0; half < 2; ++half) {
+        const int query_position = seq_len + (first_row + lane / 4 + 8 * half) / kGroupSize;
+        for (int chunk = 0; chunk < kChunkCount; ++chunk) {
+          for (int n = 0; n < 2; ++n) {
+            for (int e = 2 * half; e < 2 * half + 2; ++e) {
+              const int key_position = tile.key_position[first_key + chunk * kChunkKeys +
+                                                         n * kMmaCols + 2 * (lane % 4) + e % 2];
+              const bool is_visible = key_position >= 0 && key_position <= query_position &&
+                                      (p.window == 0 || key_position > query_position - p.window);
+              scores[chunk][n][e] = is_visible ? scores[chunk][n][e] : -INFINITY;
+            }
           }
         }
       }
     }
-  }
-  for (int half = 0; half < 2; ++half) {
-    float step_max = -INFINITY;
-    for (int chunk = 0; chunk < kChunkCount; ++chunk) {
-      for (int n = 0; n < 2; ++n) {
-        step_max =
-            fmaxf(step_max, fmaxf(scores[chunk][n][2 * half], scores[chunk][n][2 * half + 1]));
+    for (int half = 0; half < 2; ++half) {
+      float step_max = -INFINITY;
+      for (int chunk = 0; chunk < kChunkCount; ++chunk) {
+        for (int n = 0; n < 2; ++n) {
+          step_max =
+              fmaxf(step_max, fmaxf(scores[chunk][n][2 * half], scores[chunk][n][2 * half + 1]));
+        }
       }
-    }
-    step_max = fmaxf(step_max, __shfl_xor_sync(kFullWarpMask, step_max, 1));
-    step_max = fmaxf(step_max, __shfl_xor_sync(kFullWarpMask, step_max, 2));
-    const float new_max = fmaxf(state.max_log2[half], step_max * logit_scale_log2);
-    const float safe_max = new_max == -INFINITY ? 0.0f : new_max;
-    const float rescale = fast_exp2(state.max_log2[half] - safe_max);
-    state.max_log2[half] = new_max;
-    state.sum[half] *= rescale;
-    for (int d = 0; d < kDimTiles; ++d) {
-      state.out[d][2 * half] *= rescale;
-      state.out[d][2 * half + 1] *= rescale;
-    }
-    for (int chunk = 0; chunk < kChunkCount; ++chunk) {
-      for (int n = 0; n < 2; ++n) {
-        for (int e = 2 * half; e < 2 * half + 2; ++e) {
-          scores[chunk][n][e] = fast_exp2(fmaf(scores[chunk][n][e], logit_scale_log2, -safe_max));
-          state.sum[half] += scores[chunk][n][e];
+      step_max = fmaxf(step_max, __shfl_xor_sync(kFullWarpMask, step_max, 1));
+      step_max = fmaxf(step_max, __shfl_xor_sync(kFullWarpMask, step_max, 2));
+      const float new_max = fmaxf(state.max_log2[half], step_max * logit_scale_log2);
+      const float safe_max = new_max == -INFINITY ? 0.0f : new_max;
+      const float rescale = fast_exp2(state.max_log2[half] - safe_max);
+      state.max_log2[half] = new_max;
+      state.sum[half] *= rescale;
+      for (int d = 0; d < kDimTiles; ++d) {
+        state.out[d][2 * half] *= rescale;
+        state.out[d][2 * half + 1] *= rescale;
+      }
+      for (int chunk = 0; chunk < kChunkCount; ++chunk) {
+        for (int n = 0; n < 2; ++n) {
+          for (int e = 2 * half; e < 2 * half + 2; ++e) {
+            scores[chunk][n][e] = fast_exp2(fmaf(scores[chunk][n][e], logit_scale_log2, -safe_max));
+            state.sum[half] += scores[chunk][n][e];
+          }
         }
       }
     }
-  }
-  if constexpr (kUseWgmma) {
     accumulate_values_wgmma<kChunkCount>(*reinterpret_cast<float (*)[32]>(&state.out[0][0]), scores,
                                          &tile.v[warpgroup_first_key]);
-    return;
-  }
-  for (int chunk = 0; chunk < kChunkCount; ++chunk) {
-    const uint32_t p_fragment[4] = {pack_halves(scores[chunk][0][0], scores[chunk][0][1]),
-                                    pack_halves(scores[chunk][0][2], scores[chunk][0][3]),
-                                    pack_halves(scores[chunk][1][0], scores[chunk][1][1]),
-                                    pack_halves(scores[chunk][1][2], scores[chunk][1][3])};
-    const int key = first_key + chunk * kChunkKeys + 8 * ((lane / 8) % 2) + lane % 8;
-    for (int pair = 0; pair < kDimTiles / 2; ++pair) {
-      uint32_t b[4];
-      load_matrices<true>(b, &tile.v[key][swizzled_value_dim(key, 16 * pair + 8 * (lane / 16))]);
-      mma_16x8x16(state.out[2 * pair], p_fragment, b[0], b[1]);
-      mma_16x8x16(state.out[2 * pair + 1], p_fragment, b[2], b[3]);
-    }
   }
 }
 
@@ -1913,6 +1990,7 @@ __device__ KeyAddresses start_block(const Params& p, SharedTile& tile, const Blo
  * load_query_fragments(tile, work, q_fragments);
  * @endcode
  */
+template <bool kIsTransposed>
 __device__ void load_query_fragments(SharedTile& tile, const BlockWork& work,
                                      uint32_t (&q_fragments)[kQkSteps][4]) {
   constexpr int kQueryRowsPerWarp = kWarpSize / kLanesPerOutputRow;
@@ -1923,6 +2001,15 @@ __device__ void load_query_fragments(SharedTile& tile, const BlockWork& work,
                         work.lane % kLanesPerOutputRow * kDimsPerOutputLane);
   }
   __syncthreads();
+  if constexpr (kIsTransposed) {
+    for (int depth = 0; depth < kQkSteps; ++depth) {
+      const uint8_t* query =
+          &tile.start.q[work.lane / 4][kFp8MmaDepth * depth + 4 * (work.lane % 4)];
+      q_fragments[depth][0] = *reinterpret_cast<const uint32_t*>(query);
+      q_fragments[depth][1] = *reinterpret_cast<const uint32_t*>(query + kBytesPerLoad);
+    }
+    return;
+  }
   for (int depth = 0; depth < kQkSteps; ++depth) {
     load_matrices<false>(
         q_fragments[depth],
@@ -2033,22 +2120,42 @@ __device__ void attend_new_tokens(const Params& p, SharedTile& tile, const Block
  * combine_block_state(tile, work, state);
  * @endcode
  */
+template <bool kIsTransposed>
 __device__ void combine_block_state(SharedTile& tile, const BlockWork& work, WarpState& state) {
   const int lane = work.lane;
   __syncthreads();
-  // DANGEROUS DANGEROUS DANGEROUS IF YOU CHANGE THIS THEN THE 4-WARP BUILD WILL LOSE 3% (D52)
-  for (int half = 0; half < 2 && work.is_active; ++half) {
-    state.sum[half] += __shfl_xor_sync(kFullWarpMask, state.sum[half], 1);
-    state.sum[half] += __shfl_xor_sync(kFullWarpMask, state.sum[half], 2);
-    const int row = lane / 4 + 8 * half;
-    if (lane % 4 == 0) {
-      tile.warp_max[work.warp][row] = state.max_log2[half];
-      tile.warp_sum[work.warp][row] = state.sum[half];
+  if constexpr (kIsTransposed) {
+    for (int e = 0; e < 2; ++e) {
+      for (int offset = 4; offset < kWarpSize; offset *= 2) {
+        state.sum[e] += __shfl_xor_sync(kFullWarpMask, state.sum[e], offset);
+      }
+      const int query = 2 * (lane % 4) + e;
+      if (lane < 4) {
+        tile.warp_max[work.warp][query] = state.max_log2[e];
+        tile.warp_sum[work.warp][query] = state.sum[e];
+      }
+      for (int d = 0; d < kHeadDim / kMmaRows; ++d) {
+        for (int h = 0; h < 2; ++h) {
+          warp_out_row(tile, work.warp, query)[kMmaRows * d + lane / 4 + kMmaCols * h] =
+              state.out[d][2 * h + e];
+        }
+      }
     }
-    for (int d = 0; d < kDimTiles; ++d) {
-      warp_out_row(tile, work.warp, row)[d * kMmaCols + 2 * (lane % 4)] = state.out[d][2 * half];
-      warp_out_row(tile, work.warp, row)[d * kMmaCols + 2 * (lane % 4) + 1] =
-          state.out[d][2 * half + 1];
+  } else {
+    // DANGEROUS DANGEROUS DANGEROUS IF YOU CHANGE THIS THEN THE 4-WARP BUILD WILL LOSE 3% (D52)
+    for (int half = 0; half < 2 && work.is_active; ++half) {
+      state.sum[half] += __shfl_xor_sync(kFullWarpMask, state.sum[half], 1);
+      state.sum[half] += __shfl_xor_sync(kFullWarpMask, state.sum[half], 2);
+      const int row = lane / 4 + 8 * half;
+      if (lane % 4 == 0) {
+        tile.warp_max[work.warp][row] = state.max_log2[half];
+        tile.warp_sum[work.warp][row] = state.sum[half];
+      }
+      for (int d = 0; d < kDimTiles; ++d) {
+        warp_out_row(tile, work.warp, row)[d * kMmaCols + 2 * (lane % 4)] = state.out[d][2 * half];
+        warp_out_row(tile, work.warp, row)[d * kMmaCols + 2 * (lane % 4) + 1] =
+            state.out[d][2 * half + 1];
+      }
     }
   }
   __syncthreads();
@@ -2157,7 +2264,7 @@ __global__ void __launch_bounds__(kWarpCount* kWarpSize, kMinBlocksPerSm)
   KeyAddresses addresses =
       start_block<kWarpCount * kWarpSize, kIsVerify ? kVerifyStages : kStages>(p, tile, work);
   uint32_t q_fragments[kQkSteps][4];
-  load_query_fragments(tile, work, q_fragments);
+  load_query_fragments<!kIsVerify>(tile, work, q_fragments);
   WarpState state = {};
   state.max_log2[0] = state.max_log2[1] = -INFINITY;
   const float logit_scale_log2 = p.sm_scale * p.qk_scale_factor * tile.k_scale * kLog2e;
@@ -2167,7 +2274,7 @@ __global__ void __launch_bounds__(kWarpCount* kWarpSize, kMinBlocksPerSm)
     attend_new_tokens<kChunksPerWarp, kIsVerify>(p, tile, work, q_fragments, logit_scale_log2,
                                                  state);
   }
-  combine_block_state(tile, work, state);
+  combine_block_state<!kIsVerify>(tile, work, state);
   start_rows_copy(p, tile.merge.gate, work.b, work.kv_head, work.row_count,
                   (p.q_head_count + 2 * p.kv_head_count) * kHeadDim);
   if constexpr (kIsVerify) {
@@ -2412,7 +2519,7 @@ def _get_extension() -> object:
     """
     if "module" not in _extension_cache:
         _extension_cache["module"] = load_inline(
-            name="muse_fused_attention_warp_local_decode",
+            name="muse_fused_attention_transposed_decode_v2",
             cpp_sources=CPP_SOURCE,
             cuda_sources=CUDA_SOURCE,
             functions=["run", "resident_blocks_per_sm"],
