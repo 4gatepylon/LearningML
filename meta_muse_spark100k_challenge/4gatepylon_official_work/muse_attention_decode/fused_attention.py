@@ -107,6 +107,7 @@ constexpr int kGroupSize = 8;
 constexpr int kLanesPerOutputRow = 8;
 constexpr int kDimsPerOutputLane = kHeadDim / kLanesPerOutputRow;
 constexpr float kLog2e = 1.4426950408889634f;
+constexpr float kValueShiftScale = 256.0f;
 constexpr unsigned kFullWarpMask = 0xffffffffu;
 
 /**
@@ -232,6 +233,7 @@ struct SharedTile {
   int64_t new_cache_loc[kMaxTokens];
   float k_scale;
   float v_scale;
+  float value_unit;
 };
 
 /**
@@ -381,7 +383,7 @@ __device__ void write_gated_output(const Params& p, const SharedTile& tile, int 
        warp_row += warp_count() * rows_per_warp) {
     const int row =
         first_row + min(warp_row + lane / kLanesPerOutputRow, my_row_count - 1) * row_step;
-    const float scale = __fdividef(tile.v_scale, tile.row_sum[row]);
+    const float scale = __fdividef(tile.v_scale / tile.value_unit, tile.row_sum[row]);
     float o[kDimsPerOutputLane];
     float square_sum = 0.0f;
     for (int i = 0; i < kDimsPerOutputLane; ++i) {
@@ -768,22 +770,47 @@ __device__ uint32_t pack_halves(float low, float high) {
 /**
  * @brief `store_fp8_as_halves` converts 16 FP8 E4M3 values to fp16 (exactly) and stores them.
  *
+ * On the integer pipes, each byte's sign moves to bit 15 and its exponent and mantissa to bits 7
+ * to 13, so the E4M3 exponent bias (7) reads as fp16's (15), subnormals included, and the values
+ * come out times 2^-8 (`SharedTile::value_unit`). That keeps the conversion pipe free, which the
+ * decode loop is bound by; verify is faster on the conversion pipe.
+ *
+ * @tparam kUseIntegerPipes Whether to convert on the integer pipes (values times 2^-8).
  * @param[in] bytes 16 FP8 values.
  * @param[out] low The first 8 fp16 values, in shared memory, 16-byte aligned.
  * @param[out] high The last 8 fp16 values, in shared memory, 16-byte aligned.
  *
  * @par Example
  * @code
- * store_fp8_as_halves(raw_bytes, &row[swizzled_value_dim(key, dim)],
+ * store_fp8_as_halves<true>(raw_bytes, &row[swizzled_value_dim(key, dim)],
  *                     &row[swizzled_value_dim(key, dim + 8)]);
  * @endcode
  */
+template <bool kUseIntegerPipes>
 __device__ void store_fp8_as_halves(const uint4& bytes, __half* low, __half* high) {
-  const __nv_fp8x2_storage_t* pairs = reinterpret_cast<const __nv_fp8x2_storage_t*>(&bytes);
+  if constexpr (!kUseIntegerPipes) {
+    const __nv_fp8x2_storage_t* pairs = reinterpret_cast<const __nv_fp8x2_storage_t*>(&bytes);
+    uint32_t halves[kHalvesPerLoad];
+    for (int i = 0; i < kHalvesPerLoad; ++i) {
+      const __half2_raw pair = __nv_cvt_fp8x2_to_halfraw2(pairs[i], __NV_E4M3);
+      halves[i] = static_cast<uint32_t>(pair.x) | (static_cast<uint32_t>(pair.y) << 16);
+    }
+    *reinterpret_cast<uint4*>(low) = make_uint4(halves[0], halves[1], halves[2], halves[3]);
+    *reinterpret_cast<uint4*>(high) = make_uint4(halves[4], halves[5], halves[6], halves[7]);
+    return;
+  }
+  constexpr uint32_t kSignBits = 0x80008000u;
+  constexpr uint32_t kMagnitudeBits = 0x3F803F80u;
+  constexpr uint32_t kLowPairSelector = 0x1404u;
+  constexpr uint32_t kHighPairSelector = 0x3424u;
+  const uint32_t words[kBytesPerLoad / 4] = {bytes.x, bytes.y, bytes.z, bytes.w};
   uint32_t halves[kHalvesPerLoad];
   for (int i = 0; i < kHalvesPerLoad; ++i) {
-    const __half2_raw pair = __nv_cvt_fp8x2_to_halfraw2(pairs[i], __NV_E4M3);
-    halves[i] = static_cast<uint32_t>(pair.x) | (static_cast<uint32_t>(pair.y) << 16);
+    uint32_t spread;
+    asm("prmt.b32 %0, %1, 0, %2;\n"
+        : "=r"(spread)
+        : "r"(words[i / 2]), "r"(i % 2 == 0 ? kLowPairSelector : kHighPairSelector));
+    halves[i] = (spread & kSignBits) | ((spread >> 1) & kMagnitudeBits);
   }
   *reinterpret_cast<uint4*>(low) = make_uint4(halves[0], halves[1], halves[2], halves[3]);
   *reinterpret_cast<uint4*>(high) = make_uint4(halves[4], halves[5], halves[6], halves[7]);
@@ -1017,19 +1044,20 @@ __device__ void start_step_copy(const Params& p, SharedTile& tile, int kv_head,
  *
  * @par Example
  * @code
- * convert_step<128>(tile, step % kStages);
+ * convert_step<128, true>(tile, step % kStages);
  * @endcode
  */
-template <int kThreadCount>
+template <int kThreadCount, bool kUseIntegerPipes>
 __device__ void convert_step(SharedTile& tile, int stage) {
   static_assert(kPiecesPerStep % kThreadCount == 0, "each thread copies whole pieces");
   for (int i = 0; i < kPiecesPerStep / kThreadCount; ++i) {
     const int piece = step_piece<kThreadCount>(i);
     const int key = piece / kLoadsPerRow;
     const int dim = (piece % kLoadsPerRow) * kBytesPerLoad;
-    store_fp8_as_halves(*reinterpret_cast<const uint4*>(&tile.ring.raw_v[stage][key][dim]),
-                        &tile.v[key][swizzled_value_dim(key, dim)],
-                        &tile.v[key][swizzled_value_dim(key, dim + kHalvesPerLoad)]);
+    store_fp8_as_halves<kUseIntegerPipes>(
+        *reinterpret_cast<const uint4*>(&tile.ring.raw_v[stage][key][dim]),
+        &tile.v[key][swizzled_value_dim(key, dim)],
+        &tile.v[key][swizzled_value_dim(key, dim + kHalvesPerLoad)]);
     if (piece % kLoadsPerRow == 0) {
       tile.key_position[key] = tile.ring.raw_position[stage][key];
     }
@@ -1132,7 +1160,8 @@ __device__ void store_new_keys(const Params& p, SharedTile& tile, int b, int kv_
     tile.ring.raw_k[0][key][swizzled_dim(key, 2 * lane)] = k_fp8[0].__x;
     tile.ring.raw_k[0][key][swizzled_dim(key, 2 * lane + 1)] = k_fp8[1].__x;
     *reinterpret_cast<__half2*>(&tile.v[key][swizzled_value_dim(key, 2 * lane)]) =
-        __floats2half2_rn(static_cast<float>(v_fp8[0]), static_cast<float>(v_fp8[1]));
+        __floats2half2_rn(static_cast<float>(v_fp8[0]) * tile.value_unit,
+                          static_cast<float>(v_fp8[1]) * tile.value_unit);
   }
 }
 
@@ -2052,7 +2081,7 @@ __device__ void attend_split(const Params& p, SharedTile& tile, const BlockWork&
     } else {
       __syncwarp();
     }
-    convert_step<kThreadCount>(tile, step % kStageCount);
+    convert_step<kThreadCount, !kIsVerify>(tile, step % kStageCount);
     const KeyAddresses next_addresses = locate_keys<kThreadCount>(
         p, work.b, work.kv_head, work.first_position_incl + (step + kStageCount) * kStepKeys,
         work.end_position_excl);
@@ -2260,6 +2289,9 @@ __global__ void __launch_bounds__(kWarpCount* kWarpSize, kMinBlocksPerSm)
   const BlockWork work = describe_block<kWarpCount, kIsVerify>(p);
   if (work.is_idle) {
     return;
+  }
+  if (threadIdx.x == 0) {
+    tile.value_unit = kIsVerify ? 1.0f : 1.0f / kValueShiftScale;
   }
   KeyAddresses addresses =
       start_block<kWarpCount * kWarpSize, kIsVerify ? kVerifyStages : kStages>(p, tile, work);
@@ -2519,7 +2551,7 @@ def _get_extension() -> object:
     """
     if "module" not in _extension_cache:
         _extension_cache["module"] = load_inline(
-            name="muse_fused_attention_transposed_decode_v2",
+            name="muse_fused_attention_alu_values_decode",
             cpp_sources=CPP_SOURCE,
             cuda_sources=CUDA_SOURCE,
             functions=["run", "resident_blocks_per_sm"],
