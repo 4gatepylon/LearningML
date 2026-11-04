@@ -729,13 +729,16 @@ __device__ KeyAddresses locate_keys(const Params& p, int b, int kv_head, int fir
  * @par Example
  * @code
  * copy_async_16(&tile.ring.raw_k[stage][key][dim], p.k_cache_device + offset, is_present);
- * @endcode
+ * @endcode *
+ * @par Must know
+ * - Performance:
+ *   - The `L2::128B` hint fetches whole 128-byte lines: the other KV head's block reads the rest.
  */
 __device__ void copy_async_16(void* destination, const void* source, bool is_present) {
   const uint32_t address = static_cast<uint32_t>(__cvta_generic_to_shared(destination));
   const int source_bytes = is_present ? kBytesPerLoad : 0;
-  asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n" ::"r"(address), "l"(source),
-               "r"(source_bytes));
+  asm volatile("cp.async.cg.shared.global.L2::128B [%0], [%1], 16, %2;\n" ::"r"(address),
+               "l"(source), "r"(source_bytes));
 }
 
 /**
@@ -1664,7 +1667,7 @@ def _get_extension() -> object:
     """
     if "module" not in _extension_cache:
         _extension_cache["module"] = load_inline(
-            name="muse_fused_attention_mask_pass",
+            name="muse_fused_attention_l2_lines",
             cpp_sources=CPP_SOURCE,
             cuda_sources=CUDA_SOURCE,
             functions=["run", "resident_blocks_per_sm"],
