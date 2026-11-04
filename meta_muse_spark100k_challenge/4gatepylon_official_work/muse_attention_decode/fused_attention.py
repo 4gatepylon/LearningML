@@ -11,8 +11,10 @@ has 4 warps, or 8 for verify on sliding layers or with few requests. It:
 2. Streams its chunk of cached FP8 keys and values 64 at a time through a 3-stage `cp.async`
    ring in shared memory, whose space the merge reuses afterwards. Each warp attends its 16
    query rows over its share of the step's keys: S = Q K^T runs on FP8 tensor cores straight
-   from the ring, the values are converted to fp16 for O += P V, and the online softmax updates
-   once per step. Only steps at the edge of the window or chunk apply the mask.
+   from the ring (in full verify, the 4 warps run it together as one warpgroup `wgmma`, so the
+   ring keeps the keys in `wgmma`'s 64-byte swizzle), the values are converted to fp16 for
+   O += P V, and the online softmax updates once per step. Only steps at the edge of the window
+   or chunk apply the mask.
 3. In the first chunk's block only: normalizes the block's new keys (staged in shared memory at
    the start), applies RoPE, writes the new keys and values to the FP8 cache, and attends to them
    as one last, causal step.
@@ -28,14 +30,16 @@ Example:
     >>> out = kernel_fn(reference.generate_input(1, 2048, "tp8", "sliding", seed=1))
 
 Must know:
+    Limitations:
+        - The full-verify build uses `wgmma`, so the kernel builds for and runs on Hopper (sm_90a).
     Gotchas:
         - The arrival counters live across calls; each merging block resets its counter to 0.
     Performance:
         - The page-table reads for a step are issued one step before its keys and values.
         - The split count fills exactly one wave of resident blocks, from the occupancy calculator.
         - Each build compiles one path: decode (4 warps, 1 chunk per warp per step, 3 blocks per
-          SM), full verify (4 warps, 4 chunks, 4 blocks per SM) or verify on sliding layers or
-          with at most 8 request x KV-head groups (8 warps, 2 chunks, 2 blocks per SM).
+          SM), full verify (4 warps, 4 chunks, 4 blocks per SM) or verify on sliding layers, with 3
+          row tiles or with at most 8 request x KV-head groups (8 warps, 2 chunks, 2 blocks per SM).
 """
 
 import torch
@@ -65,6 +69,9 @@ constexpr int kRawStride = kHeadDim + 16;
 constexpr int kFp8MmaDepth = 32;
 constexpr int kQkSteps = kHeadDim / kFp8MmaDepth;
 constexpr int kBytesPerLoad = 16;
+constexpr int kSwizzleRows = 8;
+constexpr int kSwizzleAtomBytes = kSwizzleRows * kHeadDim;
+constexpr uint64_t kSwizzle64BytesMode = 2;
 constexpr int kLoadsPerRow = kHeadDim / kBytesPerLoad;
 constexpr int kPiecesPerStep = kStepKeys * kLoadsPerRow;
 constexpr int kLoadsPerThread = kPiecesPerStep / kMinThreads;
@@ -112,7 +119,8 @@ struct StartTile {
 };
 
 struct RingTile {
-  uint8_t raw_k[kStages][kStepKeys][kRawStride];
+  // DANGEROUS DANGEROUS DANGEROUS IF YOU CHANGE THIS THEN WGMMA WILL READ WRONGLY SWIZZLED KEYS
+  alignas(kSwizzleAtomBytes) uint8_t raw_k[kStages][kStepKeys][kHeadDim];
   uint8_t raw_v[kStages][kStepKeys][kHeadDim];
   int raw_position[kStages][kStepKeys];
 };
@@ -316,6 +324,119 @@ __device__ void mma_16x8x32_fp8(float (&d)[4], const uint32_t (&a)[4], uint32_t 
       "{%8, %9}, {%0, %1, %2, %3};\n"
       : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
       : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
+}
+
+/**
+ * @brief `swizzled_dim` returns where byte `dim` of key `key` sits in the key's 64-byte row, in
+ * `wgmma`'s 64-byte swizzle: the row's 16-byte pieces are permuted by `piece ^ (key / 2 % 4)`.
+ *
+ * @param[in] key Key within the step.
+ * @param[in] dim Byte (head dimension) within the key.
+ * @return The byte within the key's row.
+ *
+ * @par Example
+ * @code
+ * copy_async_16(&tile.ring.raw_k[stage][key][swizzled_dim(key, dim)], source, is_present);
+ * @endcode
+ *
+ * @par Must know
+ * - Performance:
+ *   - Each key keeps its own 64-byte row, so `cp.async` and `ldmatrix` stay at full speed.
+ */
+__device__ int swizzled_dim(int key, int dim) {
+  const int piece = (dim / kBytesPerLoad) ^ (key / 2 % kLoadsPerRow);
+  return piece * kBytesPerLoad + dim % kBytesPerLoad;
+}
+
+/**
+ * @brief `make_key_descriptor` builds the `wgmma` shared-memory descriptor of 64 FP8 keys x 32 head
+ * dimensions in the 64-byte swizzle of `swizzled_dim`.
+ *
+ * @param[in] first_byte The 32 dimensions' first byte in key 0's row.
+ * @return The 64-bit descriptor.
+ *
+ * @par Example
+ * @code
+ * const uint64_t descriptor = make_key_descriptor(&keys[0][kFp8MmaDepth * depth]);
+ * @endcode
+ *
+ * @par Must know
+ * - Gotchas:
+ *   - The step's keys must start at a multiple of `kSwizzleAtomBytes`, where the swizzle repeats.
+ */
+__device__ uint64_t make_key_descriptor(const uint8_t* first_byte) {
+  const uint64_t address = static_cast<uint32_t>(__cvta_generic_to_shared(first_byte));
+  const uint64_t unused_leading_bytes = 16;
+  return ((address & 0x3FFFF) >> 4) | ((unused_leading_bytes >> 4) << 16) |
+         (static_cast<uint64_t>(kSwizzleAtomBytes >> 4) << 32) | (kSwizzle64BytesMode << 62);
+}
+
+/**
+ * @brief `wgmma_64x64x32_fp8` starts D (+)= A B for one warpgroup: A is 64 x 32 FP8 query rows in
+ * registers (each warp its 16 rows, in the `mma.sync` A layout), B is 32 x 64 FP8 keys in shared
+ * memory, D is 64 x 64 fp32 (each thread 32 values in the `mma.sync` C layout of 8 n-tiles).
+ *
+ * @param[in,out] d This thread's 32 accumulators.
+ * @param[in] a This thread's A fragment.
+ * @param[in] key_descriptor `make_key_descriptor` of the 32 dimensions.
+ * @param[in] should_accumulate Whether to add to D (otherwise D = A B).
+ *
+ * @par Example
+ * @code
+ * wgmma_64x64x32_fp8(scores, q_fragments[0], descriptor, false);
+ * @endcode
+ */
+__device__ void wgmma_64x64x32_fp8(float (&d)[32], const uint32_t (&a)[4], uint64_t key_descriptor,
+                                   bool should_accumulate) {
+#if defined(__CUDA_ARCH_FEAT_SM90_ALL)
+  asm volatile(
+      "{\n.reg .pred accumulate;\nsetp.ne.b32 accumulate, %37, 0;\n"
+      "wgmma.mma_async.sync.aligned.m64n64k32.f32.e4m3.e4m3 {%0, %1, %2, %3, %4, %5, %6, %7, %8, "
+      "%9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, "
+      "%27, %28, %29, %30, %31}, {%32, %33, %34, %35}, %36, "
+      "accumulate, 1, 1;\n}\n"
+      : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3]), "+f"(d[4]), "+f"(d[5]), "+f"(d[6]),
+        "+f"(d[7]), "+f"(d[8]), "+f"(d[9]), "+f"(d[10]), "+f"(d[11]), "+f"(d[12]), "+f"(d[13]),
+        "+f"(d[14]), "+f"(d[15]), "+f"(d[16]), "+f"(d[17]), "+f"(d[18]), "+f"(d[19]), "+f"(d[20]),
+        "+f"(d[21]), "+f"(d[22]), "+f"(d[23]), "+f"(d[24]), "+f"(d[25]), "+f"(d[26]), "+f"(d[27]),
+        "+f"(d[28]), "+f"(d[29]), "+f"(d[30]), "+f"(d[31])
+      : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "l"(key_descriptor),
+        "r"(static_cast<int>(should_accumulate)));
+#else
+  __trap();
+#endif
+}
+
+/**
+ * @brief `score_keys_wgmma` computes S = Q K^T for the warpgroup's 64 query rows and the step's 64
+ * keys on `wgmma`, and waits for the result.
+ *
+ * @param[out] scores This thread's 32 scores, in the `mma.sync` C layout of 8 n-tiles of 8 keys.
+ * @param[in] q_fragments This thread's FP8 query fragments, one per 32 head dimensions.
+ * @param[in] keys The step's FP8 keys, one 64-byte row per key, swizzled by `swizzled_dim`.
+ *
+ * @par Example
+ * @code
+ * score_keys_wgmma(accumulators, q_fragments, keys);
+ * @endcode
+ *
+ * @par Must know
+ * - Gotchas:
+ *   - All 128 threads of the warpgroup must call `score_keys_wgmma` together.
+ */
+__device__ void score_keys_wgmma(float (&scores)[32], const uint32_t (&q_fragments)[kQkSteps][4],
+                                 const uint8_t (*keys)[kHeadDim]) {
+#if defined(__CUDA_ARCH_FEAT_SM90_ALL)
+  asm volatile("wgmma.fence.sync.aligned;\n" ::: "memory");
+  for (int depth = 0; depth < kQkSteps; ++depth) {
+    wgmma_64x64x32_fp8(scores, q_fragments[depth],
+                       make_key_descriptor(&keys[0][kFp8MmaDepth * depth]), depth > 0);
+  }
+  asm volatile("wgmma.commit_group.sync.aligned;\n" ::: "memory");
+  asm volatile("wgmma.wait_group.sync.aligned 0;\n" ::: "memory");
+#else
+  __trap();
+#endif
 }
 
 /**
@@ -567,7 +688,8 @@ __device__ void start_step_copy(const Params& p, SharedTile& tile, int kv_head,
     const int64_t row = static_cast<int64_t>(addresses.page[i]) * p.page_size +
                         (position >= 0 ? position % p.page_size : 0);
     const int64_t offset = (row * p.kv_head_count + kv_head) * kHeadDim + dim;
-    copy_async_16(&tile.ring.raw_k[stage][key][dim], p.k_cache_device + offset, position >= 0);
+    copy_async_16(&tile.ring.raw_k[stage][key][swizzled_dim(key, dim)], p.k_cache_device + offset,
+                  position >= 0);
     copy_async_16(&tile.ring.raw_v[stage][key][dim], p.v_cache_device + offset, position >= 0);
     if (piece % kLoadsPerRow == 0) {
       tile.ring.raw_position[stage][key] = addresses.position[i];
@@ -647,8 +769,8 @@ __device__ void store_new_keys(const Params& p, SharedTile& tile, int b, int kv_
       k_stored[1] = k_fp8[1];
       v_stored = __floats2half2_rn(static_cast<float>(v_fp8[0]), static_cast<float>(v_fp8[1]));
     }
-    tile.ring.raw_k[0][key][2 * lane] = k_stored[0].__x;
-    tile.ring.raw_k[0][key][2 * lane + 1] = k_stored[1].__x;
+    tile.ring.raw_k[0][key][swizzled_dim(key, 2 * lane)] = k_stored[0].__x;
+    tile.ring.raw_k[0][key][swizzled_dim(key, 2 * lane + 1)] = k_stored[1].__x;
     reinterpret_cast<__half2*>(&tile.v[key][0])[lane] = v_stored;
     if (lane == 0) {
       tile.key_position[key] = key < p.L ? seq_len + key : -1;
@@ -664,7 +786,8 @@ __device__ void store_new_keys(const Params& p, SharedTile& tile, int b, int kv_
  * @tparam kChunkCount Chunks of 16 keys this warp attends in the step.
  * @param[in] p Kernel parameters.
  * @param[in] tile Shared memory tile with the step's fp16 values and key positions.
- * @param[in] keys The step's FP8 keys, one padded row per key.
+ * @tparam kUseWgmma Whether the 4 warps run S together on `wgmma` (full verify), not `mma.sync`.
+ * @param[in] keys The step's FP8 keys, one 64-byte row per key, swizzled by `swizzled_dim`.
  * @param[in] q_fragments This warp's FP8 query rows as A fragments, one per 32 head dimensions.
  * @param[in] first_key First of the warp's keys, within the step.
  * @param[in] first_row First of the warp's 16 query rows.
@@ -679,22 +802,28 @@ __device__ void store_new_keys(const Params& p, SharedTile& tile, int b, int kv_
  * attend_keys<4>(p, tile, keys, q_fragments, 0, first_row, seq_len, scale, is_masked, state);
  * @endcode
  */
-template <int kChunkCount>
+template <int kChunkCount, bool kUseWgmma>
 __device__ void attend_keys(const Params& p, const SharedTile& tile,
-                            const uint8_t (*keys)[kRawStride],
+                            const uint8_t (*keys)[kHeadDim],
                             const uint32_t (&q_fragments)[kQkSteps][4], int first_key,
                             int first_row, int seq_len, float logit_scale_log2, bool is_masked,
                             WarpState& state) {
   const int lane = threadIdx.x % kWarpSize;
   const int group_size = p.q_head_count / p.kv_head_count;
   float scores[kChunkCount][2][4] = {};
-  for (int chunk = 0; chunk < kChunkCount; ++chunk) {
-    for (int n = 0; n < 2; ++n) {
-      uint32_t b[4];
-      load_matrices<false>(b, &keys[first_key + chunk * kChunkKeys + n * kMmaCols + lane % 8]
-                                   [kBytesPerLoad * (lane / 8)]);
-      mma_16x8x32_fp8(scores[chunk][n], q_fragments[0], b[0], b[1]);
-      mma_16x8x32_fp8(scores[chunk][n], q_fragments[1], b[2], b[3]);
+  if constexpr (kUseWgmma) {
+    static_assert(kChunkCount * kChunkKeys == kStepKeys, "wgmma covers all 64 keys of the step");
+    float (&accumulators)[32] = *reinterpret_cast<float (*)[32]>(&scores[0][0][0]);
+    score_keys_wgmma(accumulators, q_fragments, keys);
+  } else {
+    for (int chunk = 0; chunk < kChunkCount; ++chunk) {
+      for (int n = 0; n < 2; ++n) {
+        const int key = first_key + chunk * kChunkKeys + n * kMmaCols + lane % 8;
+        uint32_t b[4];
+        load_matrices<false>(b, &keys[key][swizzled_dim(key, kBytesPerLoad * (lane / 8))]);
+        mma_16x8x32_fp8(scores[chunk][n], q_fragments[0], b[0], b[1]);
+        mma_16x8x32_fp8(scores[chunk][n], q_fragments[1], b[2], b[3]);
+      }
     }
   }
   for (int half = 0; half < 2; ++half) {
@@ -1034,8 +1163,10 @@ __global__ void __launch_bounds__(kWarpCount* kWarpSize, kMinBlocksPerSm)
   state.max_log2[0] = state.max_log2[1] = -INFINITY;
   const float logit_scale_log2 = p.sm_scale * p.qk_scale_factor * *p.k_scale_device * kLog2e;
   const int first_row = m_tile * kMmaRows;
+  constexpr bool kUseWgmma = kWarpCount == 4 && kChunksPerWarp == 4;
   for (int step = 0; first_position_incl + step * kStepKeys < end_position_excl; ++step) {
     wait_for_copies<kStages - 2>();
+    if constexpr (kUseWgmma) asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
     __syncthreads();
     convert_step<kWarpCount * kWarpSize>(tile, step % kStages);
     const KeyAddresses next_addresses = locate_keys<kWarpCount * kWarpSize>(
@@ -1048,20 +1179,21 @@ __global__ void __launch_bounds__(kWarpCount* kWarpSize, kMinBlocksPerSm)
     const bool is_masked = start + kStepKeys > end_position_excl ||
                            (p.window != 0 && start < window_start_incl + p.L - 1);
     if (is_active) {
-      attend_keys<kChunksPerWarp>(p, tile, tile.ring.raw_k[step % kStages], q_fragments,
-                                  key_group * kChunksPerWarp * kChunkKeys, first_row, seq_len,
-                                  logit_scale_log2, is_masked, state);
+      attend_keys<kChunksPerWarp, kUseWgmma>(p, tile, tile.ring.raw_k[step % kStages], q_fragments,
+                                             key_group * kChunksPerWarp * kChunkKeys, first_row,
+                                             seq_len, logit_scale_log2, is_masked, state);
     }
   }
   wait_for_copies<0>();
   __syncthreads();
   if (split == 0) {
     store_new_keys(p, tile, b, kv_head, seq_len);
+    if constexpr (kUseWgmma) asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
     __syncthreads();
     if (is_active) {
-      attend_keys<kChunksPerWarp>(p, tile, tile.ring.raw_k[0], q_fragments,
-                                  key_group * kChunksPerWarp * kChunkKeys, first_row, seq_len,
-                                  logit_scale_log2, true, state);
+      attend_keys<kChunksPerWarp, kUseWgmma>(p, tile, tile.ring.raw_k[0], q_fragments,
+                                             key_group * kChunksPerWarp * kChunkKeys, first_row,
+                                             seq_len, logit_scale_log2, true, state);
     }
   }
   __syncthreads();
@@ -1127,7 +1259,7 @@ KernelBuild select_kernel(int64_t row_count, int64_t window, int64_t group_count
   if (m_tile_count == 2) {
     return {attention_kernel<4, 2, kVerifyBlocksPerSm>, kMinThreads};
   }
-  if (window != 0 || group_count <= kMaxWideFullGroups) {
+  if (m_tile_count == 3 || window != 0 || group_count <= kMaxWideFullGroups) {
     return {attention_kernel<8, 2, kWideVerifyBlocksPerSm>, 2 * kMinThreads};
   }
   return {attention_kernel<4, 4, kVerifyBlocksPerSm>, kMinThreads};
@@ -1271,11 +1403,11 @@ def _get_extension() -> object:
     """
     if "module" not in _extension_cache:
         _extension_cache["module"] = load_inline(
-            name="muse_fused_attention_wide_small_verify",
+            name="muse_fused_attention_wgmma_scores",
             cpp_sources=CPP_SOURCE,
             cuda_sources=CUDA_SOURCE,
             functions=["run", "resident_blocks_per_sm"],
-            extra_cuda_cflags=["-O3"],
+            extra_cuda_cflags=["-O3", "-gencode=arch=compute_90a,code=sm_90a"],
         )
     return _extension_cache["module"]
 
