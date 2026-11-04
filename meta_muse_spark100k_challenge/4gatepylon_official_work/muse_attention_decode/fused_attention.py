@@ -1,26 +1,26 @@
 # okc: problem=muse_attention_decode
 """`fused_attention.py` computes muse_attention_decode in one readable CUDA kernel.
 
-Each request's keys are split into chunks, and one thread block handles one chunk of one request
+Each request's keys are divided into splits, and one thread block handles one split of one request
 and one key/value head, for every query head of that group and every token of the block. A block
 has 4 warps, or 8 for verify on sliding layers or with few requests. It:
 
 1. Copies its query rows to shared memory with `cp.async`, RMS-normalizes them, applies RoPE from
    a per-token cos/sin table and rounds them to FP8 E4M3, as FA3 does (`qk_scale_factor` joins
    the softmax scale).
-2. Streams its chunk of cached FP8 keys and values 64 at a time through a 3-stage `cp.async`
+2. Streams its split of cached FP8 keys and values 64 at a time through a 3-stage `cp.async`
    ring in shared memory, whose space the merge reuses afterwards. Each warp attends its 16
    query rows over its share of the step's keys: S = Q K^T runs on FP8 tensor cores straight
    from the ring, the values are converted to fp16 for O += P V, and the online softmax updates
-   once per step. Only steps at the edge of the window or chunk apply the mask. In verify, each
+   once per step. Only steps at the edge of the window or split apply the mask. In verify, each
    warpgroup of 4 warps runs both products on `wgmma` over its keys (all 64, or 32 of them with
    8 warps), so the keys and the fp16 values sit in `wgmma`'s 64- and 128-byte swizzles.
-3. In the first chunk's block only: normalizes the block's new keys (staged in shared memory at
+3. In the first split's block only: normalizes the block's new keys (staged in shared memory at
    the start), applies RoPE, writes the new keys and values to the FP8 cache, and attends to them
    as one last, causal step.
 4. Combines its warps' softmax states, starts copying its gate rows, and publishes the block's
-   state. In decode, a two-level tree merges the chunks: the last block of each group of up to 16
-   chunks merges that group, then the last group merger merges the groups, divides by the
+   state. In decode, a two-level tree merges the splits: the last block of each group of up to 16
+   splits merges that group, then the last group merger merges the groups, divides by the
    softmax sum, and applies the per-head RMSNorm and the sigmoid gate. In verify, the last blocks
    to arrive (up to 16) wait for the rest, then each merges and writes its own slice of the rows.
 
@@ -116,7 +116,7 @@ constexpr float kLog2e = 1.4426950408889634f;
  *
  * @par Must know
  * - Gotchas:
- *   - Pointers ending in `_device` point to device memory; `run` checks their dtypes and shapes.
+ *   - Pointers ending in `_device` point to device memory; `run` fills them from its tensors.
  */
 struct Params {
   const __nv_bfloat16* qkv_device;
@@ -172,8 +172,8 @@ struct RingTile {
 
 /**
  * @brief `MergeTile` holds what the merge and the output need after the loop: each merged slot's
- * weight and softmax sum per row (`split_*` for the decode tree, `row_*` for the verify mergers'
- * rows), the verify mergers' partial sums, and the block's gate rows.
+ * row maximum (then its weight) and softmax sum per row (`split_*` for the decode tree, `row_*`
+ * for the verify mergers' rows), the verify mergers' partial sums, and the block's gate rows.
  *
  * @par Example
  * @code
@@ -353,7 +353,7 @@ __device__ float warp_sum(float x) {
  *
  * @par Example
  * @code
- * float2 q = normalize_and_rotate(x, p.qk_scale_factor, tile.rotation[token][lane]);
+ * const float2 k = normalize_and_rotate(k_in, 1.0f, tile.rotation[key][lane]);
  * @endcode
  */
 __device__ float2 normalize_and_rotate(float2 x, float gain, float2 rotation) {
@@ -429,7 +429,7 @@ __device__ void write_gated_output(const Params& p, const SharedTile& tile, int 
  *
  * @par Example
  * @code
- * mma_16x8x16(scores[n], q_fragments[s], b[0], b[1]);
+ * mma_16x8x16(state.out[2 * pair], p_fragment, b[0], b[1]);
  * @endcode
  */
 __device__ void mma_16x8x16(float (&d)[4], const uint32_t (&a)[4], uint32_t b0, uint32_t b1) {
@@ -689,8 +689,9 @@ __device__ void wgmma_64x64x16_f16(float (&d)[32], const uint32_t (&a)[4],
 }
 
 /**
- * @brief `load_matrices` loads four 8 x 8 fp16 matrices from shared memory into one register each
- * per thread (`ldmatrix.x4`), optionally transposed.
+ * @brief `load_matrices` loads four 8 x 8 matrices of 16-bit elements (fp16 values, or pairs of
+ * FP8 bytes) from shared memory into one register each per thread (`ldmatrix.x4`), optionally
+ * transposed.
  *
  * @tparam kIsTransposed Whether each matrix is transposed on the way.
  * @param[out] r This thread's 4 registers.
@@ -784,8 +785,9 @@ __device__ void store_fp8_as_halves(const uint4& bytes, __half* low, __half* hig
  * @param[in] kv_head Key/value head index.
  * @param[in] first_position_incl First key position of the step.
  * @param[in] end_position_excl Keys at or after this position are missing.
- * @return The pages of this thread's pieces (thread t's piece i is 16 bytes of key (128 i + t) /
- * 4), still in flight: nothing here uses them, so the thread does not wait for the reads.
+ * @return The pages and positions of this thread's pieces (thread t's piece i is 16 bytes of key
+ * (kThreadCount i + t) / 4); the pages are still in flight: nothing here uses them, so the thread
+ * does not wait for the reads.
  *
  * @par Example
  * @code
@@ -821,7 +823,8 @@ __device__ KeyAddresses locate_keys(const Params& p, int b, int kv_head, int fir
  * @par Example
  * @code
  * copy_async_16(&tile.ring.raw_k[stage][key][dim], p.k_cache_device + offset, is_present);
- * @endcode *
+ * @endcode
+ *
  * @par Must know
  * - Performance:
  *   - The `L2::128B` hint fetches whole 128-byte lines: the other KV head's block reads the rest.
@@ -981,7 +984,7 @@ __device__ void start_step_copy(const Params& p, SharedTile& tile, int kv_head,
  *
  * @par Example
  * @code
- * convert_step(tile, step % kStages);
+ * convert_step<128>(tile, step % kStages);
  * @endcode
  */
 template <int kThreadCount>
@@ -1107,8 +1110,8 @@ __device__ void store_new_keys(const Params& p, SharedTile& tile, int b, int kv_
  * @tparam kChunkCount Chunks of 16 keys: 4 (the whole step) or 2.
  *
  * @param[in,out] out This thread's 32 output accumulators, in the `mma.sync` C layout.
- * @param[in] probabilities This thread's 32 probabilities, in the `mma.sync` C layout of 4 chunks
- * of 16 keys.
+ * @param[in] probabilities This thread's 8 probabilities per chunk, in the `mma.sync` C layout of
+ * `kChunkCount` chunks of 16 keys.
  * @param[in] values The first key's row of the step's fp16 values, in the 128-byte swizzle of
  * `swizzled_value_dim`.
  *
@@ -1154,9 +1157,9 @@ __device__ void accumulate_values_wgmma(float (&out)[32],
  * all of them, then O += P V on tensor cores. S uses FP8 keys and queries, P V uses fp16.
  *
  * @tparam kChunkCount Chunks of 16 keys this warp attends in the step.
+ * @tparam kUseWgmma Whether each warpgroup runs S and P V on `wgmma` over its keys (verify).
  * @param[in] p Kernel parameters.
  * @param[in] tile Shared memory tile with the step's fp16 values and key positions.
- * @tparam kUseWgmma Whether each warpgroup runs S and P V on `wgmma` over its keys (verify).
  * @param[in] keys The step's FP8 keys, one 64-byte row per key, swizzled by `swizzled_dim`.
  * @param[in] q_fragments This warp's FP8 query rows as A fragments, one per 32 head dimensions.
  * @param[in] first_key First of the warp's keys, within the step.
@@ -1185,6 +1188,7 @@ __device__ void attend_keys(const Params& p, const SharedTile& tile,
                             WarpState& state) {
   const int lane = threadIdx.x % kWarpSize;
   const int group_size = p.q_head_count / p.kv_head_count;
+  // DANGEROUS DANGEROUS DANGEROUS IF YOU CHANGE THIS THEN THE 4-WARP BUILD WILL LOSE 2% (D40)
   const int warpgroup_first_key = kChunkCount * kChunkKeys == kStepKeys ? 0 : first_key;
   float scores[kChunkCount][2][4] = {};
   if constexpr (kUseWgmma) {
@@ -1383,8 +1387,8 @@ __device__ bool arrive(const Params& p, SharedTile& tile, int counter, int expec
  *
  * @param[in] p Kernel parameters.
  * @param[in,out] tile Shared memory tile: gets the merged outputs, row maxima and row sums; uses
- * `split_weight` for each slot's weight per row, and `split_sum` for its softmax sums, which one
- * round trip loads with the maxima.
+ * `split_weight` for each slot's row maxima and then its weights, and `split_sum` for its softmax
+ * sums, which the same pass loads with the maxima.
  * @param[in] first_slot First workspace slot to merge.
  * @param[in] slot_stride Distance between merged slots.
  * @param[in] slot_count Slots to merge, at most `kMergeFanIn`.
@@ -1676,19 +1680,21 @@ __device__ bool merge_splits(const Params& p, SharedTile& tile, int b, int kv_he
 
 /**
  * @brief `attention_kernel` attends one split of one request's keys for one KV head group; the
- * first split also writes the block's new keys and values, and the last to finish writes the
+ * first split also writes the block's new keys and values, and the merging blocks write the
  * output.
  *
- * @tparam kWarpCount Warps per block: 4, or 8 for sliding verify.
- * @tparam kChunksPerWarp Chunks of 16 keys each warp attends per step: 1 for decode (4 warps share
- * 16 query rows), 4 for verify (each warp owns 16 rows).
+ * @tparam kWarpCount Warps per block: 4, or 8 for verify on sliding layers or with at most 8
+ * request x KV-head groups.
+ * @tparam kChunksPerWarp Chunks of 16 keys each warp attends per step, so that the warps cover the
+ * step's 64 keys: 1 for decode (4 warps share 16 query rows), 2 for 32 rows (2 warps per row
+ * tile) and for 8-warp verify, 4 for 4-warp verify (each warp owns 16 rows).
  * @tparam kMinBlocksPerSm Blocks that must fit on one SM: the compiler caps registers to match.
  * @param[in] p Kernel parameters; the grid is (splits, KV heads, requests).
  *
  * @par Example
  * @code
- * attention_kernel<4, 1, 3><<<dim3(split_count, kv_head_count, B), kThreads, sizeof(SharedTile),
- * stream>>>(p);
+ * attention_kernel<4, 1, 3><<<dim3(split_count, kv_head_count, B), kMinThreads,
+ * sizeof(SharedTile), stream>>>(p);
  * @endcode
  */
 template <int kWarpCount, int kChunksPerWarp, int kMinBlocksPerSm>
@@ -1865,8 +1871,9 @@ struct KernelBuild {
  * @param[in] row_count Query rows per block (L x query heads per KV head).
  * @param[in] window Sliding window in tokens, or 0 for full attention.
  * @param[in] group_count Requests x KV heads: full verify with few groups also gets 8 warps.
- * @return The kernel to launch and its threads per block.
- * @throws c10::Error When a verify block has other than 64 query rows (33 to 48 rows).
+ * @return The kernel to launch, its threads per block, its blocks per SM, and whether it launches
+ * cooperatively.
+ * @throws c10::Error When a block has 33 to 48 query rows (3 row tiles).
  *
  * @par Example
  * @code
@@ -2044,7 +2051,7 @@ def _get_extension() -> object:
     """
     if "module" not in _extension_cache:
         _extension_cache["module"] = load_inline(
-            name="muse_fused_attention_verify_splits",
+            name="muse_fused_attention_docs_review",
             cpp_sources=CPP_SOURCE,
             cuda_sources=CUDA_SOURCE,
             functions=["run", "resident_blocks_per_sm"],
