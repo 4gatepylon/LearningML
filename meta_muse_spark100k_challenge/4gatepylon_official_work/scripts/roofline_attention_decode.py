@@ -122,6 +122,7 @@ WORKLOADS: tuple[Workload, ...] = tuple(
 )
 GPUS: dict[str, Gpu] = {
     "h200-sxm": Gpu("H200 SXM", 1979 / SPARSE_TFLOPS_PER_DENSE_TFLOPS, 4.8, 3.87),
+    "h100-pcie": Gpu("H100 PCIe", 1513 / SPARSE_TFLOPS_PER_DENSE_TFLOPS, 2.0, None),
 }
 SOURCES: dict[str, str] = {
     "Q_HEAD_COUNT, KV_HEAD_COUNT, HEAD_DIM, SLIDING_WINDOW_TOKEN_COUNT": (
@@ -131,6 +132,7 @@ SOURCES: dict[str, str] = {
     "WORKLOADS, CONTEXT_TOKEN_COUNT": "4gatepylon_official_work/muse_attention_decode/TASK.md",
     "BYTES_PER_*": "reference.py: FP8 E4M3 K/V cache, int32 page_table, bf16 qkv and output",
     "h200-sxm": "https://www.nvidia.com/en-us/data-center/h200/: BF16 1,979 TFLOPS sparse; 4.8TB/s",
+    "h100-pcie": "BF16 1,513 TFLOPS sparse; 2TB/s: https://www.pny.com/file%20library/company/support/product%20brochures/nvidia%20data%20center%20gpus/nvidia-h100-datasheet.pdf",
     "h200-sxm gather ceiling": (
         "lee_101_openkernels_example/openkernels/docs/attention_gap_analysis.md, section 1: "
         "measured by lee_101's v49diag"
