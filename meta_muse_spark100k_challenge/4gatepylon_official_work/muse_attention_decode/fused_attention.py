@@ -1,9 +1,9 @@
 # okc: problem=muse_attention_decode
 """`fused_attention.py` computes muse_attention_decode in one readable CUDA kernel.
 
-Each request's keys are split into chunks, and one thread block of 4 warps (8 for verify on sliding
-layers or with few requests) handles one chunk of one request and one key/value head, for every query head of that
-group and every token of the block. It:
+Each request's keys are split into chunks, and one thread block handles one chunk of one request
+and one key/value head, for every query head of that group and every token of the block. A block
+has 4 warps, or 8 for verify on sliding layers or with few requests. It:
 
 1. Copies its query and gate rows to shared memory in one `cp.async` batch, RMS-normalizes the
    queries, applies RoPE from a per-token cos/sin table and rounds them to FP8 E4M3, as FA3 does
