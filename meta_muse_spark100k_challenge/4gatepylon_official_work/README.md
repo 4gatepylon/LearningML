@@ -39,7 +39,10 @@ refuses when 2 or fewer runs of that mode are left today (`--min-left`). Run it 
 
 `scripts/roofline_attention_decode.py` computes the roofline of each scored `muse_attention_decode`
 shape: the attention matmuls' FLOP, the bytes a kernel must move, the time each takes at the GPU's
-spec peaks, which one bounds the shape, and the attainable TFLOP/s. The script lists the source of
-every input in `SOURCES` and writes each run to
-`../.artifacts/roofline_attention_decode/<run_id>/` (`command.txt`, `rows.json`). Run it with
+spec peaks, which one bounds the shape, and the attainable TFLOP/s. It also places measured kernels
+on that roofline: each file in `muse_attention_decode/measurements/` names a GPU, a source and
+each implementation's time per shape, and every GPU with times gets a plot with one x position per
+shape. The script lists the source of every input in `SOURCES` and writes each run to
+`../.artifacts/roofline_attention_decode/<run_id>/` (`command.txt`, `rows.json`, one
+`roofline_<gpu>.png` per measured GPU). Run it with
 `uv run --script scripts/roofline_attention_decode.py`.
