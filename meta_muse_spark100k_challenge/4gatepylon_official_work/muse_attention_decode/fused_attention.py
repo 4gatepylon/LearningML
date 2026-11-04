@@ -1052,23 +1052,28 @@ __device__ void attend_keys(const Params& p, const SharedTile& tile,
       }
     }
   }
-  for (int half = 0; half < 2; ++half) {
-    const int query_position = seq_len + (first_row + lane / 4 + 8 * half) / group_size;
-    float step_max = -INFINITY;
-    for (int chunk = 0; chunk < kChunkCount; ++chunk) {
-      for (int n = 0; n < 2; ++n) {
-        for (int e = 2 * half; e < 2 * half + 2; ++e) {
-          float score = scores[chunk][n][e];
-          if (is_masked) {
+  if (is_masked) {
+    for (int half = 0; half < 2; ++half) {
+      const int query_position = seq_len + (first_row + lane / 4 + 8 * half) / group_size;
+      for (int chunk = 0; chunk < kChunkCount; ++chunk) {
+        for (int n = 0; n < 2; ++n) {
+          for (int e = 2 * half; e < 2 * half + 2; ++e) {
             const int key_position = tile.key_position[first_key + chunk * kChunkKeys +
                                                        n * kMmaCols + 2 * (lane % 4) + e % 2];
             const bool is_visible = key_position >= 0 && key_position <= query_position &&
                                     (p.window == 0 || key_position > query_position - p.window);
-            score = is_visible ? score : -INFINITY;
+            scores[chunk][n][e] = is_visible ? scores[chunk][n][e] : -INFINITY;
           }
-          scores[chunk][n][e] = score;
-          step_max = fmaxf(step_max, score);
         }
+      }
+    }
+  }
+  for (int half = 0; half < 2; ++half) {
+    float step_max = -INFINITY;
+    for (int chunk = 0; chunk < kChunkCount; ++chunk) {
+      for (int n = 0; n < 2; ++n) {
+        step_max =
+            fmaxf(step_max, fmaxf(scores[chunk][n][2 * half], scores[chunk][n][2 * half + 1]));
       }
     }
     step_max = fmaxf(step_max, __shfl_xor_sync(0xffffffffu, step_max, 1));
@@ -1659,7 +1664,7 @@ def _get_extension() -> object:
     """
     if "module" not in _extension_cache:
         _extension_cache["module"] = load_inline(
-            name="muse_fused_attention_page_shift",
+            name="muse_fused_attention_mask_pass",
             cpp_sources=CPP_SOURCE,
             cuda_sources=CUDA_SOURCE,
             functions=["run", "resident_blocks_per_sm"],
