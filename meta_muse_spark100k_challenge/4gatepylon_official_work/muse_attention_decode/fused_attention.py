@@ -111,7 +111,7 @@ struct Params {
   float qk_scale_factor;
   const int* page_table_device;
   __nv_bfloat16* out_device;
-  int page_size, page_table_stride, window;
+  int page_size_log2, page_table_stride, window;
   float sm_scale;
   float* partial_out_device;
   float* partial_max_device;
@@ -711,7 +711,8 @@ __device__ KeyAddresses locate_keys(const Params& p, int b, int kv_head, int fir
     addresses.position[i] = position < end_position_excl ? position : -1;
     addresses.page[i] = 0;
     if (position < end_position_excl) {
-      addresses.page[i] = p.page_table_device[b * p.page_table_stride + position / p.page_size];
+      addresses.page[i] =
+          p.page_table_device[b * p.page_table_stride + (position >> p.page_size_log2)];
     }
   }
   return addresses;
@@ -862,8 +863,8 @@ __device__ void start_step_copy(const Params& p, SharedTile& tile, int kv_head,
     const int key = piece / kLoadsPerRow;
     const int dim = (piece % kLoadsPerRow) * kBytesPerLoad;
     const int position = addresses.position[i];
-    const int64_t row = static_cast<int64_t>(addresses.page[i]) * p.page_size +
-                        (position >= 0 ? position % p.page_size : 0);
+    const int64_t row = (static_cast<int64_t>(addresses.page[i]) << p.page_size_log2) +
+                        (position >= 0 ? position & ((1 << p.page_size_log2) - 1) : 0);
     const int64_t offset = (row * p.kv_head_count + kv_head) * kHeadDim + dim;
     copy_async_16(&tile.ring.raw_k[stage][key][swizzled_dim(key, dim)], p.k_cache_device + offset,
                   position >= 0);
@@ -1479,6 +1480,7 @@ using attention_kernel_t = void (*)(Params);
 struct KernelBuild {
   attention_kernel_t kernel;
   int thread_count;
+  int blocks_per_sm;
 };
 
 /**
@@ -1499,17 +1501,18 @@ struct KernelBuild {
 KernelBuild select_kernel(int64_t row_count, int64_t window, int64_t group_count) {
   const int64_t m_tile_count = (row_count + kMmaRows - 1) / kMmaRows;
   if (m_tile_count == 1) {
-    return {attention_kernel<4, 1, kDecodeBlocksPerSm>, kMinThreads};
+    return {attention_kernel<4, 1, kDecodeBlocksPerSm>, kMinThreads, kDecodeBlocksPerSm};
   }
   if (m_tile_count == 2) {
-    return {attention_kernel<4, 2, kVerifyBlocksPerSm>, kMinThreads};
+    return {attention_kernel<4, 2, kVerifyBlocksPerSm>, kMinThreads, kVerifyBlocksPerSm};
   }
   TORCH_CHECK(m_tile_count == 4, "verify needs 64 query rows per KV head (4 row tiles), got ",
               row_count, " rows");
   if (window != 0 || group_count <= kMaxWideFullGroups) {
-    return {attention_kernel<8, 2, kWideVerifyBlocksPerSm>, 2 * kMinThreads};
+    return {attention_kernel<8, 2, kWideVerifyBlocksPerSm>, 2 * kMinThreads,
+            kWideVerifyBlocksPerSm};
   }
-  return {attention_kernel<4, 4, kVerifyBlocksPerSm>, kMinThreads};
+  return {attention_kernel<4, 4, kVerifyBlocksPerSm>, kMinThreads, kVerifyBlocksPerSm};
 }
 
 }  // namespace
@@ -1518,7 +1521,8 @@ KernelBuild select_kernel(int64_t row_count, int64_t window, int64_t group_count
  * @brief `run` checks the tensors and launches `attention_kernel` on the current stream.
  *
  * @param[in] qkv Fused projection output, bf16 [B, L, (2 Hq + 2 Hkv) * 64].
- * @param[in,out] k_cache FP8 key cache [pages, page_size, Hkv, 64]; the new keys are written.
+ * @param[in,out] k_cache FP8 key cache [pages, page_size, Hkv, 64], page_size a power of 2; the
+ * new keys are written.
  * @param[in,out] v_cache FP8 value cache, same shape; the new values are written.
  * @param[in] page_table int32 [B, max_pages].
  * @param[in] seq_lens int32 [B].
@@ -1535,7 +1539,8 @@ KernelBuild select_kernel(int64_t row_count, int64_t window, int64_t group_count
  * @param[out] partial_sum float32 [B, Hkv, splits, 64] workspace: each split's row sums.
  * @param[in,out] arrival_count int32 [B, Hkv, 17], zero before and after each call.
  * @param[in] keys_per_split Cached keys per split, a multiple of 64.
- * @throws c10::Error A tensor has the wrong dtype, shape or layout.
+ * @throws c10::Error A tensor has the wrong dtype, shape or layout, or the page size is not a power
+ * of 2.
  *
  * @par Example
  * @code
@@ -1576,7 +1581,10 @@ void run(torch::Tensor qkv, torch::Tensor k_cache, torch::Tensor v_cache, torch:
   p.L = static_cast<int>(qkv.size(1));
   p.q_head_count = static_cast<int>(q_head_count);
   p.kv_head_count = static_cast<int>(k_cache.size(2));
-  p.page_size = static_cast<int>(k_cache.size(1));
+  const int page_size = static_cast<int>(k_cache.size(1));
+  TORCH_CHECK(page_size > 0 && (page_size & (page_size - 1)) == 0,
+              "page size must be a power of 2, got ", page_size);
+  p.page_size_log2 = __builtin_ctz(page_size);
   p.page_table_stride = static_cast<int>(page_table.size(1));
   p.window = static_cast<int>(window);
   p.qk_scale_factor = static_cast<float>(qk_scale_factor);
@@ -1601,7 +1609,8 @@ void run(torch::Tensor qkv, torch::Tensor k_cache, torch::Tensor v_cache, torch:
  * @param[in] row_count Query rows per block (L x query heads per KV head), which picks the build.
  * @param[in] window Sliding window in tokens, or 0 for full attention, which also picks it.
  * @param[in] group_count Requests x KV heads, which also picks it.
- * @return The occupancy calculator's count, for the kernel's threads and shared memory.
+ * @return The occupancy calculator's count, for the kernel's threads and shared memory, capped at
+ * the build's intended blocks per SM.
  *
  * @par Example
  * @code
@@ -1615,7 +1624,7 @@ int64_t resident_blocks_per_sm(int64_t row_count, int64_t window, int64_t group_
   int block_count = 0;
   C10_CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
       &block_count, build.kernel, build.thread_count, sizeof(SharedTile)));
-  return block_count;
+  return std::min(block_count, build.blocks_per_sm);
 }
 """
 CPP_SOURCE: str = (
@@ -1650,7 +1659,7 @@ def _get_extension() -> object:
     """
     if "module" not in _extension_cache:
         _extension_cache["module"] = load_inline(
-            name="muse_fused_attention_wide_wgmma",
+            name="muse_fused_attention_page_shift",
             cpp_sources=CPP_SOURCE,
             cuda_sources=CUDA_SOURCE,
             functions=["run", "resident_blocks_per_sm"],
