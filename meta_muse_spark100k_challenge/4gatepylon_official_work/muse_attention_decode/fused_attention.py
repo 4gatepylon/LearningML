@@ -87,7 +87,9 @@ constexpr int kPiecesPerStep = kStepKeys * kLoadsPerRow;
 constexpr int kLoadsPerThread = kPiecesPerStep / kMinThreads;
 constexpr int kMaxSplits = 256;
 constexpr int kStages = 3;
+constexpr int kVerifyStages = 2;
 constexpr int kDecodeBlocksPerSm = 3;
+constexpr int kFullDecodeBlocksPerSm = 4;
 constexpr int kVerifyBlocksPerSm = 4;
 constexpr int kWideVerifyBlocksPerSm = 2;
 constexpr int kMaxWideFullGroups = 8;
@@ -1834,10 +1836,12 @@ __device__ BlockWork describe_block(const Params& p) {
 
 /**
  * @brief `start_block` starts copying the block's query rows, its new tokens (first split only)
- * and its first `kStages - 1` steps of keys and values, reads the scales and the new tokens'
+ * and its first `kStageCount - 1` steps of keys and values, reads the scales and the new tokens'
  * cache rows, fills the RoPE table, and waits for the query rows.
  *
  * @tparam kThreadCount Threads per block.
+ * @tparam kStageCount Ring stages the build uses: `kStages` for decode, `kVerifyStages` for
+ * verify.
  * @param[in] p Kernel parameters.
  * @param[in,out] tile Shared memory tile.
  * @param[in] work The block's work.
@@ -1845,10 +1849,10 @@ __device__ BlockWork describe_block(const Params& p) {
  *
  * @par Example
  * @code
- * KeyAddresses addresses = start_block<128>(p, tile, work);
+ * KeyAddresses addresses = start_block<128, kStages>(p, tile, work);
  * @endcode
  */
-template <int kThreadCount>
+template <int kThreadCount, int kStageCount>
 __device__ KeyAddresses start_block(const Params& p, SharedTile& tile, const BlockWork& work) {
   if (work.split == 0) {
     start_new_token_copy(p, tile, work.b, work.kv_head);
@@ -1856,7 +1860,7 @@ __device__ KeyAddresses start_block(const Params& p, SharedTile& tile, const Blo
   start_rows_copy(p, tile.start.q_in, work.b, work.kv_head, work.row_count, 0);
   KeyAddresses addresses = locate_keys<kThreadCount>(
       p, work.b, work.kv_head, work.first_position_incl, work.end_position_excl);
-  for (int stage = 0; stage < kStages - 1; ++stage) {
+  for (int stage = 0; stage < kStageCount - 1; ++stage) {
     const KeyAddresses next_addresses = locate_keys<kThreadCount>(
         p, work.b, work.kv_head, work.first_position_incl + (stage + 1) * kStepKeys,
         work.end_position_excl);
@@ -1871,7 +1875,7 @@ __device__ KeyAddresses start_block(const Params& p, SharedTile& tile, const Blo
     tile.v_scale = *p.v_scale_device;
   }
   fill_rotation_table(p, tile, work.seq_len);
-  wait_for_copies<kStages - 1>();
+  wait_for_copies<kStageCount - 1>();
   __syncthreads();
   return addresses;
 }
@@ -1932,25 +1936,27 @@ __device__ void attend_split(const Params& p, SharedTile& tile, const BlockWork&
                              KeyAddresses& addresses, const uint32_t (&q_fragments)[kQkSteps][4],
                              float logit_scale_log2, WarpState& state) {
   constexpr int kThreadCount = kWarpCount * kWarpSize;
+  constexpr int kStageCount = kIsVerify ? kVerifyStages : kStages;
   for (int step = 0; work.first_position_incl + step * kStepKeys < work.end_position_excl; ++step) {
-    wait_for_copies<kStages - 2>();
+    wait_for_copies<kStageCount - 2>();
     if constexpr (kIsVerify) asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
     __syncthreads();
-    convert_step<kThreadCount>(tile, step % kStages);
+    convert_step<kThreadCount>(tile, step % kStageCount);
     const KeyAddresses next_addresses = locate_keys<kThreadCount>(
-        p, work.b, work.kv_head, work.first_position_incl + (step + kStages) * kStepKeys,
+        p, work.b, work.kv_head, work.first_position_incl + (step + kStageCount) * kStepKeys,
         work.end_position_excl);
-    start_step_copy<kThreadCount>(p, tile, work.kv_head, addresses, (step + kStages - 1) % kStages);
+    start_step_copy<kThreadCount>(p, tile, work.kv_head, addresses,
+                                  (step + kStageCount - 1) % kStageCount);
     addresses = next_addresses;
     if constexpr (kIsVerify) asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
     __syncthreads();
     const int start_incl = work.first_position_incl + step * kStepKeys;
     const bool is_masked = start_incl + kStepKeys > work.end_position_excl ||
                            (p.window != 0 && start_incl < work.window_start_incl + p.L - 1);
-    attend_keys<kChunksPerWarp, kIsVerify>(p, tile, tile.ring.raw_k[step % kStages], q_fragments,
-                                           work.key_group * kChunksPerWarp * kChunkKeys,
-                                           work.m_tile * kMmaRows, work.seq_len, logit_scale_log2,
-                                           is_masked, state);
+    attend_keys<kChunksPerWarp, kIsVerify>(
+        p, tile, tile.ring.raw_k[step % kStageCount], q_fragments,
+        work.key_group * kChunksPerWarp * kChunkKeys, work.m_tile * kMmaRows, work.seq_len,
+        logit_scale_log2, is_masked, state);
   }
   wait_for_copies<0>();
   __syncthreads();
@@ -2120,7 +2126,8 @@ __global__ void __launch_bounds__(kWarpCount* kWarpSize, kMinBlocksPerSm)
   if (work.is_idle) {
     return;
   }
-  KeyAddresses addresses = start_block<kWarpCount * kWarpSize>(p, tile, work);
+  KeyAddresses addresses =
+      start_block<kWarpCount * kWarpSize, kIsVerify ? kVerifyStages : kStages>(p, tile, work);
   uint32_t q_fragments[kQkSteps][4];
   load_query_fragments(tile, work, q_fragments);
   WarpState state = {};
@@ -2180,6 +2187,10 @@ struct KernelBuild {
 KernelBuild select_kernel(int64_t row_count, int64_t window, int64_t group_count) {
   const int64_t m_tile_count = (row_count + kMmaRows - 1) / kMmaRows;
   if (m_tile_count == 1) {
+    if (window == 0) {
+      return {attention_kernel<4, 1, kFullDecodeBlocksPerSm>, kMinThreads, kFullDecodeBlocksPerSm,
+              false};
+    }
     return {attention_kernel<4, 1, kDecodeBlocksPerSm>, kMinThreads, kDecodeBlocksPerSm, false};
   }
   TORCH_CHECK(m_tile_count == kMaxRows / kMmaRows,
@@ -2373,7 +2384,7 @@ def _get_extension() -> object:
     """
     if "module" not in _extension_cache:
         _extension_cache["module"] = load_inline(
-            name="muse_fused_attention_short_first_split",
+            name="muse_fused_attention_stages_per_build_d4_v2",
             cpp_sources=CPP_SOURCE,
             cuda_sources=CUDA_SOURCE,
             functions=["run", "resident_blocks_per_sm"],
