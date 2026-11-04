@@ -1,16 +1,17 @@
 # okc: problem=muse_attention_decode
 """`fused_attention.py` computes muse_attention_decode in one readable CUDA kernel.
 
-One thread block handles one request and one key/value head, for every query head of that group
-and every token of the block. In order, it:
+Each request's keys are split into chunks, and one thread block handles one chunk of one request
+and one key/value head, for every query head of that group and every token of the block. It:
 
 1. RMS-normalizes the queries, scales them by `qk_scale_factor`, applies RoPE on sliding layers and
    rounds them to bf16, as `reference.py` does.
-2. Streams the request's cached keys and values through shared memory, 32 keys at a time, and folds
+2. Streams its chunk of cached keys and values through shared memory, 32 keys at a time, and folds
    each tile into an online softmax on CUDA cores.
-3. Normalizes the block's new keys, applies RoPE, writes the new keys and values to the FP8 cache,
-   and attends to them as one last, causal tile.
-4. Divides by the softmax sum and applies the per-head RMSNorm and the sigmoid gate.
+3. In the first chunk's block only: normalizes the block's new keys, applies RoPE, writes the new
+   keys and values to the FP8 cache, and attends to them as one last, causal tile.
+4. Publishes its softmax state. The last block of the request and KV head to finish merges every
+   chunk's state, divides by the softmax sum, and applies the per-head RMSNorm and sigmoid gate.
 
 Interface:
     kernel_fn(data): `TASK.md`'s timed call; returns bfloat16 [B, L, Hq * 64].
@@ -19,8 +20,8 @@ Example:
     >>> out = kernel_fn(reference.generate_input(1, 2048, "tp8", "sliding", seed=1))
 
 Must know:
-    Performance:
-        - With one block per request and KV head, small batches use only a few of the GPU's SMs.
+    Gotchas:
+        - The arrival counters live across calls; the merging block resets its counter to 0.
 """
 
 import torch
@@ -61,6 +62,11 @@ struct Params {
   __nv_bfloat16* out_device;
   int page_size, page_table_stride, window;
   float sm_scale;
+  float* partial_out_device;
+  float* partial_max_device;
+  float* partial_sum_device;
+  int* arrival_count_device;
+  int split_count, keys_per_split;
 };
 
 struct SharedTile {
@@ -72,6 +78,7 @@ struct SharedTile {
   float row_max[kMaxRows];
   float row_sum[kMaxRows];
   float row_rescale[kMaxRows];
+  bool is_last_split;
 };
 
 /**
@@ -349,20 +356,103 @@ __device__ void load_new_tile(const Params& p, SharedTile& tile, int b, int kv_h
 }
 
 /**
- * @brief `attention_kernel` computes the gated attention output of one request and one KV head
- * group, and writes the block's new keys and values to the cache.
+ * @brief `merge_splits` publishes this block's softmax state and, in the last block of its
+ * request and KV head to arrive, merges every split's state.
  *
- * @param[in] p Kernel parameters; the grid is (KV heads, requests).
+ * @param[in] p Kernel parameters.
+ * @param[in,out] tile Shared memory tile; the merging block gets the merged row sums.
+ * @param[in,out] accumulators This thread's unnormalized outputs (see `attend_tile`); the merging
+ * block gets the merged outputs.
+ * @param[in] b Request index.
+ * @param[in] kv_head Key/value head index.
+ * @param[in] split This block's split.
+ * @param[in] row_count Query rows (L x query heads per KV head).
+ * @return Whether this block merged and must write the output.
  *
  * @par Example
  * @code
- * attention_kernel<<<dim3(kv_head_count, B), kThreads, 0, stream>>>(p);
+ * if (merge_splits(p, tile, accumulators, b, kv_head, split, row_count)) { ... }
+ * @endcode
+ */
+__device__ bool merge_splits(const Params& p, SharedTile& tile, float* accumulators, int b,
+                             int kv_head, int split, int row_count) {
+  const int group = b * p.kv_head_count + kv_head;
+  const int64_t first_slot = static_cast<int64_t>(group) * p.split_count * kMaxRows;
+  const int64_t own_slot = first_slot + static_cast<int64_t>(split) * kMaxRows;
+  const int d = threadIdx.x % kHeadDim;
+#pragma unroll
+  for (int i = 0; i < kAccumulatorCount; ++i) {
+    const int row = threadIdx.x / kHeadDim + kRowsPerPass * i;
+    if (row < row_count) {
+      p.partial_out_device[(own_slot + row) * kHeadDim + d] = accumulators[i];
+    }
+  }
+  for (int row = threadIdx.x; row < row_count; row += kThreads) {
+    p.partial_max_device[own_slot + row] = tile.row_max[row];
+    p.partial_sum_device[own_slot + row] = tile.row_sum[row];
+  }
+  __threadfence();
+  __syncthreads();
+  if (threadIdx.x == 0) {
+    tile.is_last_split = atomicAdd(&p.arrival_count_device[group], 1) == p.split_count - 1;
+  }
+  __syncthreads();
+  if (!tile.is_last_split) {
+    return false;
+  }
+  __threadfence();
+  for (int row = threadIdx.x; row < row_count; row += kThreads) {
+    float merged_max = -INFINITY;
+    for (int s = 0; s < p.split_count; ++s) {
+      merged_max =
+          fmaxf(merged_max, __ldcg(&p.partial_max_device[first_slot + s * kMaxRows + row]));
+    }
+    float merged_sum = 0.0f;
+    for (int s = 0; s < p.split_count; ++s) {
+      const int64_t slot = first_slot + s * kMaxRows + row;
+      merged_sum += __ldcg(&p.partial_sum_device[slot]) *
+                    expf(__ldcg(&p.partial_max_device[slot]) - merged_max);
+    }
+    tile.row_max[row] = merged_max;
+    tile.row_sum[row] = merged_sum;
+  }
+  __syncthreads();
+#pragma unroll
+  for (int i = 0; i < kAccumulatorCount; ++i) {
+    const int row = threadIdx.x / kHeadDim + kRowsPerPass * i;
+    if (row < row_count) {
+      float merged_out = 0.0f;
+      for (int s = 0; s < p.split_count; ++s) {
+        const int64_t slot = first_slot + s * kMaxRows + row;
+        merged_out += __ldcg(&p.partial_out_device[slot * kHeadDim + d]) *
+                      expf(__ldcg(&p.partial_max_device[slot]) - tile.row_max[row]);
+      }
+      accumulators[i] = merged_out;
+    }
+  }
+  if (threadIdx.x == 0) {
+    p.arrival_count_device[group] = 0;
+  }
+  return true;
+}
+
+/**
+ * @brief `attention_kernel` attends one split of one request's keys for one KV head group; the
+ * first split also writes the block's new keys and values, and the last to finish writes the
+ * output.
+ *
+ * @param[in] p Kernel parameters; the grid is (splits, KV heads, requests).
+ *
+ * @par Example
+ * @code
+ * attention_kernel<<<dim3(split_count, kv_head_count, B), kThreads, 0, stream>>>(p);
  * @endcode
  */
 __global__ void __launch_bounds__(kThreads) attention_kernel(const Params p) {
   __shared__ SharedTile tile;
-  const int kv_head = blockIdx.x;
-  const int b = blockIdx.y;
+  const int split = blockIdx.x;
+  const int kv_head = blockIdx.y;
+  const int b = blockIdx.z;
   const int group_size = p.q_head_count / p.kv_head_count;
   const int row_count = p.L * group_size;
   const int seq_len = p.seq_lens_device[b];
@@ -383,16 +473,22 @@ __global__ void __launch_bounds__(kThreads) attention_kernel(const Params p) {
     }
   }
   float accumulators[kAccumulatorCount] = {};
-  const int first_position_incl = p.window == 0 ? 0 : max(0, seq_len - p.window + 1);
-  for (int start = first_position_incl; start < seq_len; start += kTileKeys) {
-    load_cached_tile(p, tile, b, kv_head, start, seq_len);
+  const int window_start_incl = p.window == 0 ? 0 : max(0, seq_len - p.window + 1);
+  const int first_position_incl = window_start_incl + split * p.keys_per_split;
+  const int end_position_excl = min(first_position_incl + p.keys_per_split, seq_len);
+  for (int start = first_position_incl; start < end_position_excl; start += kTileKeys) {
+    load_cached_tile(p, tile, b, kv_head, start, end_position_excl);
     __syncthreads();
     attend_tile(p, tile, accumulators, row_count, seq_len);
   }
-  load_new_tile(p, tile, b, kv_head, seq_len);
-  __syncthreads();
-  attend_tile(p, tile, accumulators, row_count, seq_len);
-  write_gated_output(p, tile, accumulators, b, kv_head, row_count);
+  if (split == 0) {
+    load_new_tile(p, tile, b, kv_head, seq_len);
+    __syncthreads();
+    attend_tile(p, tile, accumulators, row_count, seq_len);
+  }
+  if (merge_splits(p, tile, accumulators, b, kv_head, split, row_count)) {
+    write_gated_output(p, tile, accumulators, b, kv_head, row_count);
+  }
 }
 
 }  // namespace
@@ -413,18 +509,25 @@ __global__ void __launch_bounds__(kThreads) attention_kernel(const Params p) {
  * @param[in] window Sliding window in tokens, or 0 for full attention.
  * @param[in] qk_scale_factor Query gain after the RMSNorm.
  * @param[in] sm_scale Softmax scale.
+ * @param[out] partial_out float32 [B, Hkv, splits, 64, 64] workspace: each split's outputs.
+ * @param[out] partial_max float32 [B, Hkv, splits, 64] workspace: each split's row maxima.
+ * @param[out] partial_sum float32 [B, Hkv, splits, 64] workspace: each split's row sums.
+ * @param[in,out] arrival_count int32 [B, Hkv], zero before and after each call.
+ * @param[in] keys_per_split Cached keys per split, a multiple of 32.
  * @throws c10::Error A tensor has the wrong dtype, shape or layout.
  *
  * @par Example
  * @code
  * run(qkv, k_cache, v_cache, page_table, seq_lens, cache_loc, k_scale, v_scale, inv_freq, out,
- *     2048, 5.473, 0.125);
+ *     2048, 5.473, 0.125, partial_out, partial_max, partial_sum, arrival_count, 64);
  * @endcode
  */
 void run(torch::Tensor qkv, torch::Tensor k_cache, torch::Tensor v_cache, torch::Tensor page_table,
          torch::Tensor seq_lens, torch::Tensor cache_loc, torch::Tensor k_scale,
          torch::Tensor v_scale, torch::Tensor inv_freq, torch::Tensor out, int64_t window,
-         double qk_scale_factor, double sm_scale) {
+         double qk_scale_factor, double sm_scale, torch::Tensor partial_out,
+         torch::Tensor partial_max, torch::Tensor partial_sum, torch::Tensor arrival_count,
+         int64_t keys_per_split) {
   const int64_t q_head_count = out.size(2) / kHeadDim;
   TORCH_CHECK(qkv.is_contiguous() && k_cache.is_contiguous() && v_cache.is_contiguous() &&
                   page_table.is_contiguous() && out.is_contiguous(),
@@ -455,7 +558,13 @@ void run(torch::Tensor qkv, torch::Tensor k_cache, torch::Tensor v_cache, torch:
   p.window = static_cast<int>(window);
   p.qk_scale_factor = static_cast<float>(qk_scale_factor);
   p.sm_scale = static_cast<float>(sm_scale);
-  attention_kernel<<<dim3(k_cache.size(2), qkv.size(0)), kThreads, 0,
+  p.partial_out_device = partial_out.data_ptr<float>();
+  p.partial_max_device = partial_max.data_ptr<float>();
+  p.partial_sum_device = partial_sum.data_ptr<float>();
+  p.arrival_count_device = arrival_count.data_ptr<int>();
+  p.split_count = static_cast<int>(partial_max.size(2));
+  p.keys_per_split = static_cast<int>(keys_per_split);
+  attention_kernel<<<dim3(p.split_count, k_cache.size(2), qkv.size(0)), kThreads, 0,
                      at::cuda::getCurrentCUDAStream()>>>(p);
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
@@ -464,12 +573,18 @@ CPP_SOURCE: str = (
     "void run(torch::Tensor qkv, torch::Tensor k_cache, torch::Tensor v_cache, "
     "torch::Tensor page_table, torch::Tensor seq_lens, torch::Tensor cache_loc, "
     "torch::Tensor k_scale, torch::Tensor v_scale, torch::Tensor inv_freq, torch::Tensor out, "
-    "int64_t window, double qk_scale_factor, double sm_scale);"
+    "int64_t window, double qk_scale_factor, double sm_scale, torch::Tensor partial_out, "
+    "torch::Tensor partial_max, torch::Tensor partial_sum, torch::Tensor arrival_count, "
+    "int64_t keys_per_split);"
 )
 HEAD_DIM: int = 64
 ROPE_PAIR_STRIDE: int = 2
+MAX_ROWS: int = 64
+TILE_KEYS: int = 32
+TARGET_BLOCKS_PER_SM: int = 4
 _extension_cache: dict[str, object] = {}
 _inv_freq_cache: dict[tuple[float, torch.device], torch.Tensor] = {}
+_workspace_cache: dict[tuple[int, int, int, torch.device], tuple[torch.Tensor, ...]] = {}
 
 
 def _get_extension() -> object:
@@ -483,7 +598,7 @@ def _get_extension() -> object:
     """
     if "module" not in _extension_cache:
         _extension_cache["module"] = load_inline(
-            name="muse_fused_attention_one_kernel",
+            name="muse_fused_attention_split_kv",
             cpp_sources=CPP_SOURCE,
             cuda_sources=CUDA_SOURCE,
             functions=["run"],
@@ -514,6 +629,57 @@ def _get_inv_freq(theta: float, device: torch.device) -> torch.Tensor:
     return _inv_freq_cache[key]
 
 
+def _plan_splits(data: dict) -> tuple[int, int]:
+    """`_plan_splits` picks how many blocks share each request's keys, from shapes only.
+
+    Args:
+        data: The inputs; only `config` and the page table's shape are read.
+
+    Returns:
+        The split count and the cached keys per split (a multiple of 32), so that every key a
+        request can hold falls in a split and the grid has about `TARGET_BLOCKS_PER_SM` per SM.
+
+    Example:
+        >>> split_count, keys_per_split = _plan_splits(data)
+    """
+    config: dict = data["config"]
+    span_keys: int = config["window"] or data["page_table"].shape[1] * config["page_size"]
+    tile_count: int = -(-span_keys // TILE_KEYS)
+    sm_count: int = torch.cuda.get_device_properties(data["qkv"].device).multi_processor_count
+    group_count: int = config["batch"] * config["num_kv_heads"]
+    wanted_split_count: int = max(1, -(-TARGET_BLOCKS_PER_SM * sm_count // group_count))
+    keys_per_split: int = -(-tile_count // min(tile_count, wanted_split_count)) * TILE_KEYS
+    return -(-span_keys // keys_per_split), keys_per_split
+
+
+def _get_workspace(data: dict, split_count: int) -> tuple[torch.Tensor, ...]:
+    """`_get_workspace` returns the per-split state buffers and zeroed arrival counters.
+
+    Args:
+        data: The inputs; only `config` and the device are read.
+        split_count: Splits per request and KV head.
+
+    Returns:
+        partial_out [B, Hkv, splits, 64, 64], partial_max and partial_sum [B, Hkv, splits, 64]
+        (float32), and arrival_count [B, Hkv] (int32, zero), allocated once per shape.
+
+    Example:
+        >>> partial_out, partial_max, partial_sum, arrival_count = _get_workspace(data, 8)
+    """
+    config: dict = data["config"]
+    device: torch.device = data["qkv"].device
+    shape: tuple[int, int, int] = (config["batch"], config["num_kv_heads"], split_count)
+    key: tuple[int, int, int, torch.device] = (*shape, device)
+    if key not in _workspace_cache:
+        _workspace_cache[key] = (
+            torch.empty((*shape, MAX_ROWS, HEAD_DIM), device=device),
+            torch.empty((*shape, MAX_ROWS), device=device),
+            torch.empty((*shape, MAX_ROWS), device=device),
+            torch.zeros(shape[:2], dtype=torch.int32, device=device),
+        )
+    return _workspace_cache[key]
+
+
 def kernel_fn(data: dict) -> torch.Tensor:
     """`kernel_fn` runs one decode or verify step of gated attention (see `TASK.md`).
 
@@ -527,6 +693,7 @@ def kernel_fn(data: dict) -> torch.Tensor:
         >>> out = kernel_fn(data)
     """
     config: dict = data["config"]
+    split_count, keys_per_split = _plan_splits(data)
     out: torch.Tensor = torch.empty(
         (config["batch"], config["q_len"], config["num_q_heads"] * HEAD_DIM),
         dtype=torch.bfloat16,
@@ -546,5 +713,7 @@ def kernel_fn(data: dict) -> torch.Tensor:
         config["window"],
         config["qk_scale_factor"],
         config["sm_scale"],
+        *_get_workspace(data, split_count),
+        keys_per_split,
     )
     return out
