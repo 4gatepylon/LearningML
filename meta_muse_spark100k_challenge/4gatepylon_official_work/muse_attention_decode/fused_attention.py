@@ -912,6 +912,53 @@ __device__ void convert_step(SharedTile& tile, int stage) {
 }
 
 /**
+ * @brief `normalize_query_row` RMS-normalizes this lane's 8 dimensions of one 64-wide query row
+ * (8 lanes per row), applies interleaved RoPE, and stores them as FP8.
+ *
+ * @param[in] tile Shared memory tile with the bf16 query rows and the rotation table.
+ * @param[out] q_row The row's FP8 bytes.
+ * @param[in] row Query row; rows past `row_count` become zeros.
+ * @param[in] row_count Query rows (L x query heads per KV head).
+ * @param[in] group_size Query heads per KV head.
+ * @param[in] first_dim This lane's first dimension, a multiple of 8.
+ *
+ * @par Example
+ * @code
+ * normalize_query_row(tile, tile.start.q[row], row, row_count, group_size, lane % 8 * 8);
+ * @endcode
+ *
+ * @par Must know
+ * - Gotchas:
+ *   - All 32 lanes must call `normalize_query_row` together (it sums over groups of 8 lanes).
+ */
+__device__ void normalize_query_row(const SharedTile& tile, uint8_t* q_row, int row, int row_count,
+                                    int group_size, int first_dim) {
+  float q[kDimsPerOutputLane] = {};
+  float square_sum = 0.0f;
+  if (row < row_count) {
+    const uint4 bits = *reinterpret_cast<const uint4*>(&tile.start.q_in[row][first_dim]);
+    const __nv_bfloat162* pairs = reinterpret_cast<const __nv_bfloat162*>(&bits);
+    for (int i = 0; i < kDimsPerOutputLane / 2; ++i) {
+      const float2 pair = __bfloat1622float2(pairs[i]);
+      q[2 * i] = pair.x;
+      q[2 * i + 1] = pair.y;
+      square_sum += pair.x * pair.x + pair.y * pair.y;
+    }
+  }
+  const float inv_rms = rsqrtf(lane_group_sum<kLanesPerOutputRow>(square_sum) / kHeadDim + kRmsEps);
+  uint8_t bytes[kDimsPerOutputLane];
+  for (int i = 0; i < kDimsPerOutputLane / 2; ++i) {
+    const float2 rotation = row < row_count ? tile.rotation[row / group_size][first_dim / 2 + i]
+                                            : make_float2(1.0f, 0.0f);
+    const float x = q[2 * i] * inv_rms;
+    const float y = q[2 * i + 1] * inv_rms;
+    bytes[2 * i] = __nv_fp8_e4m3(x * rotation.x - y * rotation.y).__x;
+    bytes[2 * i + 1] = __nv_fp8_e4m3(x * rotation.y + y * rotation.x).__x;
+  }
+  *reinterpret_cast<uint2*>(&q_row[first_dim]) = *reinterpret_cast<const uint2*>(bytes);
+}
+
+/**
  * @brief `store_new_keys` normalizes and rotates the block's L new keys (staged by
  * `start_new_token_copy`), writes them and their
  * values to the FP8 cache, and puts the stored values in shared memory as a step of keys.
@@ -1412,16 +1459,12 @@ __global__ void __launch_bounds__(kWarpCount* kWarpSize, kMinBlocksPerSm)
   fill_rotation_table(p, tile, seq_len);
   wait_for_copies<kStages - 1>();
   __syncthreads();
-#pragma unroll 4
-  for (int row = warp; row < m_tile_count * kMmaRows; row += warp_count()) {
-    float2 q = make_float2(0.0f, 0.0f);
-    if (row < row_count) {
-      const float2 q_in = __bfloat1622float2(
-          reinterpret_cast<const __nv_bfloat162*>(&tile.start.q_in[row][0])[lane]);
-      q = normalize_and_rotate(q_in, 1.0f, tile.rotation[row / group_size][lane]);
-    }
-    tile.start.q[row][2 * lane] = __nv_fp8_e4m3(q.x).__x;
-    tile.start.q[row][2 * lane + 1] = __nv_fp8_e4m3(q.y).__x;
+  constexpr int kQueryRowsPerWarp = kWarpSize / kLanesPerOutputRow;
+  for (int warp_row = warp * kQueryRowsPerWarp; warp_row < m_tile_count * kMmaRows;
+       warp_row += warp_count() * kQueryRowsPerWarp) {
+    const int row = warp_row + lane / kLanesPerOutputRow;
+    normalize_query_row(tile, tile.start.q[row], row, row_count, group_size,
+                        lane % kLanesPerOutputRow * kDimsPerOutputLane);
   }
   __syncthreads();
   uint32_t q_fragments[kQkSteps][4];
@@ -1686,7 +1729,7 @@ def _get_extension() -> object:
     """
     if "module" not in _extension_cache:
         _extension_cache["module"] = load_inline(
-            name="muse_fused_attention_wgmma_overlap",
+            name="muse_fused_attention_query_lanes",
             cpp_sources=CPP_SOURCE,
             cuda_sources=CUDA_SOURCE,
             functions=["run", "resident_blocks_per_sm"],
