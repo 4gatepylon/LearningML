@@ -132,6 +132,7 @@ struct RingTile {
 
 struct MergeTile {
   float split_weight[kMergeFanIn][kMaxRows];
+  float split_sum[kMergeFanIn][kMaxRows];
   __nv_bfloat16 gate[kMaxRows][kHeadDim];
 };
 
@@ -1174,7 +1175,8 @@ __device__ bool arrive(const Params& p, SharedTile& tile, int counter, int expec
  *
  * @param[in] p Kernel parameters.
  * @param[in,out] tile Shared memory tile: gets the merged outputs, row maxima and row sums; uses
- * `split_weight` for each slot's weight per row.
+ * `split_weight` for each slot's weight per row, and `split_sum` for its softmax sums, which one
+ * round trip loads with the maxima.
  * @param[in] first_slot First workspace slot to merge.
  * @param[in] slot_stride Distance between merged slots.
  * @param[in] slot_count Slots to merge, at most `kMergeFanIn`.
@@ -1191,6 +1193,8 @@ __device__ void merge_slots(const Params& p, SharedTile& tile, int64_t first_slo
     const int64_t slot = first_slot + (index / row_count) * slot_stride;
     tile.merge.split_weight[index / row_count][index % row_count] =
         __ldcg(&p.partial_max_device[slot * kMaxRows + index % row_count]);
+    tile.merge.split_sum[index / row_count][index % row_count] =
+        __ldcg(&p.partial_sum_device[slot * kMaxRows + index % row_count]);
   }
   __syncthreads();
   for (int row = threadIdx.x; row < row_count; row += thread_count()) {
@@ -1204,9 +1208,7 @@ __device__ void merge_slots(const Params& p, SharedTile& tile, int64_t first_slo
     for (int s = 0; s < kMergeFanIn; ++s) {
       if (s < slot_count) {
         tile.merge.split_weight[s][row] = expf(tile.merge.split_weight[s][row] - safe_max);
-        merged_sum +=
-            tile.merge.split_weight[s][row] *
-            __ldcg(&p.partial_sum_device[(first_slot + s * slot_stride) * kMaxRows + row]);
+        merged_sum += tile.merge.split_weight[s][row] * tile.merge.split_sum[s][row];
       }
     }
     tile.row_max[row] = merged_max;
@@ -1595,7 +1597,7 @@ def _get_extension() -> object:
     """
     if "module" not in _extension_cache:
         _extension_cache["module"] = load_inline(
-            name="muse_fused_attention_vector_output",
+            name="muse_fused_attention_one_trip_merge",
             cpp_sources=CPP_SOURCE,
             cuda_sources=CUDA_SOURCE,
             functions=["run", "resident_blocks_per_sm"],
