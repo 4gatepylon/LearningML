@@ -89,6 +89,25 @@ constexpr int kLoadsPerThread = kPiecesPerStep / kMinThreads;
 constexpr int kMaxSplits = 256;
 constexpr int kStages = 3;
 constexpr int kMaxClusterBlocks = 16;
+/**
+ * @brief `are_new_tokens_in_range` says whether a build attends the new tokens as keys in their
+ * block's range (patched into the ring) rather than as an extra step of split 0: every build but
+ * 4-warp verify, whose code generation the extra step keeps sound.
+ *
+ * @tparam kWarpCount Warps per block.
+ * @tparam kIsVerify Whether the build is a verify build.
+ * @return Whether the new tokens are keys in their block's range.
+ *
+ * @par Example
+ * @code
+ * if constexpr (are_new_tokens_in_range<kWarpCount, kIsVerify>()) { ... }
+ * @endcode
+ */
+template <int kWarpCount, bool kIsVerify>
+constexpr bool are_new_tokens_in_range() {
+  return !(kIsVerify && kWarpCount * 32 == 128);
+}
+
 constexpr int kVerifyStages = 2;
 constexpr int kDecodeBlocksPerSm = 3;
 constexpr int kFullDecodeBlocksPerSm = 4;
@@ -228,6 +247,8 @@ struct SharedTile {
   float2 rotation[kMaxTokens][kHeadDim / 2];
   __nv_bfloat16 new_k_in[kMaxTokens][kHeadDim];
   __nv_bfloat16 new_v_in[kMaxTokens][kHeadDim];
+  uint8_t new_k_fp8[kMaxTokens][kHeadDim];
+  uint8_t new_v_fp8[kMaxTokens][kHeadDim];
   int key_position[kStepKeys];
   float warp_max[kMaxWarps][kMmaRows];
   float warp_sum[kMaxWarps][kMmaRows];
@@ -862,15 +883,15 @@ __device__ int step_piece(int i) {
  */
 template <int kThreadCount>
 __device__ KeyAddresses locate_keys(const Params& p, int b, int kv_head, int first_position_incl,
-                                    int end_position_excl) {
+                                    int end_position_excl, int cached_end_excl) {
   KeyAddresses addresses;
   static_assert(kPiecesPerStep % kThreadCount == 0, "each thread copies whole pieces");
   for (int i = 0; i < kPiecesPerStep / kThreadCount; ++i) {
     const int piece = step_piece<kThreadCount>(i);
     const int position = first_position_incl + piece / kLoadsPerRow;
     addresses.position[i] = position < end_position_excl ? position : -1;
-    addresses.page[i] = 0;
-    if (position < end_position_excl) {
+    addresses.page[i] = position < end_position_excl ? -1 : 0;
+    if (position < min(end_position_excl, cached_end_excl)) {
       addresses.page[i] =
           p.page_table_device[b * p.page_table_stride + (position >> p.page_size_log2)];
     }
@@ -1029,9 +1050,10 @@ __device__ void start_step_copy(const Params& p, SharedTile& tile, int kv_head,
     const int64_t row = (static_cast<int64_t>(addresses.page[i]) << p.page_size_log2) +
                         (position >= 0 ? position & ((1 << p.page_size_log2) - 1) : 0);
     const int64_t offset = (row * p.kv_head_count + kv_head) * kHeadDim + dim;
+    const bool is_cached = position >= 0 && addresses.page[i] >= 0;
     copy_async_16(&tile.ring.raw_k[stage][key][swizzled_dim(key, dim)], p.k_cache_device + offset,
-                  position >= 0);
-    copy_async_16(&tile.ring.raw_v[stage][key][dim], p.v_cache_device + offset, position >= 0);
+                  is_cached);
+    copy_async_16(&tile.ring.raw_v[stage][key][dim], p.v_cache_device + offset, is_cached);
     if (piece % kLoadsPerRow == 0) {
       tile.ring.raw_position[stage][key] = addresses.position[i];
     }
@@ -1868,16 +1890,16 @@ struct BalancedSplit {
  *
  * @par Example
  * @code
- * const BalancedSplit share = balance_splits(p, gridDim.z, blockIdx.z * gridDim.x + blockIdx.x);
+ * const BalancedSplit share = balance_splits(p, gridDim.z, blockIdx.z * gridDim.x + blockIdx.x, 8);
  * @endcode
  *
  * @par Must know
  * - Limitations:
  *   - A batch has at most 32 requests, one per lane; every warp computes the same plan.
  */
-__device__ BalancedSplit balance_splits(const Params& p, int B, int slot) {
+__device__ BalancedSplit balance_splits(const Params& p, int B, int slot, int new_key_count) {
   const int lane = threadIdx.x % kWarpSize;
-  const int seq_len = lane < B ? p.seq_lens_device[lane] : 0;
+  const int seq_len = lane < B ? p.seq_lens_device[lane] + new_key_count : 0;
   const int slot_count = p.split_count * B;
   const int total_keys = __reduce_add_sync(kFullWarpMask, seq_len);
   const int longest_keys = __reduce_max_sync(kFullWarpMask, seq_len);
@@ -1938,7 +1960,9 @@ __device__ BlockWork describe_block(const Params& p) {
   work.kv_head = blockIdx.y;
   work.b = blockIdx.z;
   if (kIsVerify && p.is_balanced) {
-    const BalancedSplit share = balance_splits(p, gridDim.z, blockIdx.z * gridDim.x + blockIdx.x);
+    const BalancedSplit share =
+        balance_splits(p, gridDim.z, blockIdx.z * gridDim.x + blockIdx.x,
+                       are_new_tokens_in_range<kWarpCount, kIsVerify>() ? p.L : 0);
     work.b = min(share.b, static_cast<int>(gridDim.z) - 1);
     work.split = share.split;
     work.split_count = share.split_count;
@@ -1960,7 +1984,9 @@ __device__ BlockWork describe_block(const Params& p) {
   const int split_offset =
       work.split == 0 ? 0 : first_split_keys + (work.split - 1) * keys_per_split;
   work.first_position_incl = work.window_start_incl + split_offset;
-  work.end_position_excl = min(work.first_position_incl + split_keys, work.seq_len);
+  work.end_position_excl =
+      min(work.first_position_incl + split_keys,
+          work.seq_len + (are_new_tokens_in_range<kWarpCount, kIsVerify>() ? p.L : 0));
   return work;
 }
 
@@ -1982,18 +2008,18 @@ __device__ BlockWork describe_block(const Params& p) {
  * KeyAddresses addresses = start_block<128, kStages>(p, tile, work);
  * @endcode
  */
-template <int kThreadCount, int kStageCount>
+template <int kThreadCount, int kStageCount, bool kAreNewTokensInRange>
 __device__ KeyAddresses start_block(const Params& p, SharedTile& tile, const BlockWork& work) {
-  if (work.split == 0) {
+  if (kAreNewTokensInRange ? work.end_position_excl > work.seq_len : work.split == 0) {
     start_new_token_copy(p, tile, work.b, work.kv_head);
   }
   start_rows_copy(p, tile.start.q_in, work.b, work.kv_head, work.row_count, 0);
   KeyAddresses addresses = locate_keys<kThreadCount>(
-      p, work.b, work.kv_head, work.first_position_incl, work.end_position_excl);
+      p, work.b, work.kv_head, work.first_position_incl, work.end_position_excl, work.seq_len);
   for (int stage = 0; stage < kStageCount - 1; ++stage) {
     const KeyAddresses next_addresses = locate_keys<kThreadCount>(
         p, work.b, work.kv_head, work.first_position_incl + (stage + 1) * kStepKeys,
-        work.end_position_excl);
+        work.end_position_excl, work.seq_len);
     start_step_copy<kThreadCount>(p, tile, work.kv_head, addresses, stage);
     addresses = next_addresses;
   }
@@ -2052,6 +2078,81 @@ __device__ void load_query_fragments(SharedTile& tile, const BlockWork& work,
 }
 
 /**
+ * @brief `prepare_new_tokens` normalizes and rotates the L new keys (staged by
+ * `start_new_token_copy`), rounds keys and values to FP8 in shared memory for the ring, and writes
+ * to the cache the new tokens that fall in this block's range.
+ *
+ * @param[in] p Kernel parameters.
+ * @param[in,out] tile Shared memory tile: gets `new_k_fp8` and `new_v_fp8`.
+ * @param[in] work The block's work.
+ *
+ * @par Example
+ * @code
+ * prepare_new_tokens(p, tile, work);
+ * @endcode
+ */
+__device__ void prepare_new_tokens(const Params& p, SharedTile& tile, const BlockWork& work) {
+  const int warp = threadIdx.x / kWarpSize;
+  const int lane = threadIdx.x % kWarpSize;
+  for (int token = warp; token < p.L; token += warp_count()) {
+    const float2 k_in =
+        __bfloat1622float2(reinterpret_cast<const __nv_bfloat162*>(&tile.new_k_in[token][0])[lane]);
+    const float2 v_in =
+        __bfloat1622float2(reinterpret_cast<const __nv_bfloat162*>(&tile.new_v_in[token][0])[lane]);
+    const float2 k = normalize_and_rotate(k_in, tile.rotation[token][lane]);
+    const __nv_fp8_e4m3 k_fp8[2] = {__nv_fp8_e4m3(k.x / tile.k_scale),
+                                    __nv_fp8_e4m3(k.y / tile.k_scale)};
+    const __nv_fp8_e4m3 v_fp8[2] = {__nv_fp8_e4m3(v_in.x / tile.v_scale),
+                                    __nv_fp8_e4m3(v_in.y / tile.v_scale)};
+    tile.new_k_fp8[token][2 * lane] = k_fp8[0].__x;
+    tile.new_k_fp8[token][2 * lane + 1] = k_fp8[1].__x;
+    tile.new_v_fp8[token][2 * lane] = v_fp8[0].__x;
+    tile.new_v_fp8[token][2 * lane + 1] = v_fp8[1].__x;
+    const int position = work.seq_len + token;
+    if (position >= work.first_position_incl && position < work.end_position_excl) {
+      const int64_t offset =
+          (tile.new_cache_loc[token] * p.kv_head_count + work.kv_head) * kHeadDim + 2 * lane;
+      p.k_cache_device[offset] = k_fp8[0];
+      p.k_cache_device[offset + 1] = k_fp8[1];
+      p.v_cache_device[offset] = v_fp8[0];
+      p.v_cache_device[offset + 1] = v_fp8[1];
+    }
+  }
+}
+
+/**
+ * @brief `patch_new_tokens` writes this thread's pieces of the new tokens in a landed ring stage
+ * from `new_k_fp8` and `new_v_fp8` (their cache copies were skipped).
+ *
+ * @tparam kThreadCount Threads per block.
+ * @param[in,out] tile Shared memory tile.
+ * @param[in] work The block's work.
+ * @param[in] start_incl The step's first key position.
+ * @param[in] stage The step's ring stage.
+ *
+ * @par Example
+ * @code
+ * patch_new_tokens<128>(tile, work, start_incl, step % kStages);
+ * @endcode
+ */
+template <int kThreadCount>
+__device__ void patch_new_tokens(SharedTile& tile, const BlockWork& work, int start_incl,
+                                 int stage) {
+  for (int i = 0; i < kPiecesPerStep / kThreadCount; ++i) {
+    const int piece = step_piece<kThreadCount>(i);
+    const int key = piece / kLoadsPerRow;
+    const int dim = (piece % kLoadsPerRow) * kBytesPerLoad;
+    const int token = start_incl + key - work.seq_len;
+    if (token >= 0 && start_incl + key < work.end_position_excl) {
+      *reinterpret_cast<uint4*>(&tile.ring.raw_k[stage][key][swizzled_dim(key, dim)]) =
+          *reinterpret_cast<const uint4*>(&tile.new_k_fp8[token][dim]);
+      *reinterpret_cast<uint4*>(&tile.ring.raw_v[stage][key][dim]) =
+          *reinterpret_cast<const uint4*>(&tile.new_v_fp8[token][dim]);
+    }
+  }
+}
+
+/**
  * @brief `attend_split` streams the split's keys and values through the ring, 64 per step, and
  * folds each step into this warp's softmax state.
  *
@@ -2085,10 +2186,19 @@ __device__ void attend_split(const Params& p, SharedTile& tile, const BlockWork&
     } else {
       __syncwarp();
     }
+    const int start_incl = work.first_position_incl + step * kStepKeys;
+    if (are_new_tokens_in_range<kWarpCount, kIsVerify>() && start_incl + kStepKeys > work.seq_len) {
+      patch_new_tokens<kThreadCount>(tile, work, start_incl, step % kStageCount);
+      if constexpr (kIsVerify) {
+        __syncthreads();
+      } else {
+        __syncwarp();
+      }
+    }
     convert_step<kThreadCount, !kIsVerify>(tile, step % kStageCount);
     const KeyAddresses next_addresses = locate_keys<kThreadCount>(
         p, work.b, work.kv_head, work.first_position_incl + (step + kStageCount) * kStepKeys,
-        work.end_position_excl);
+        work.end_position_excl, work.seq_len);
     start_step_copy<kThreadCount>(p, tile, work.kv_head, addresses,
                                   (step + kStageCount - 1) % kStageCount);
     addresses = next_addresses;
@@ -2098,8 +2208,8 @@ __device__ void attend_split(const Params& p, SharedTile& tile, const BlockWork&
     } else {
       __syncwarp();
     }
-    const int start_incl = work.first_position_incl + step * kStepKeys;
     const bool is_masked = start_incl + kStepKeys > work.end_position_excl ||
+                           start_incl + kStepKeys > work.seq_len ||
                            (p.window != 0 && start_incl < work.window_start_incl + p.L - 1);
     attend_keys<kChunksPerWarp, kIsVerify>(
         p, tile, tile.ring.raw_k[step % kStageCount], q_fragments,
@@ -2403,7 +2513,12 @@ __global__ void __launch_bounds__(kWarpCount* kWarpSize, kMinBlocksPerSm)
     tile.value_unit = kIsVerify ? 1.0f : 1.0f / kValueShiftScale;
   }
   KeyAddresses addresses =
-      start_block<kWarpCount * kWarpSize, kIsVerify ? kVerifyStages : kStages>(p, tile, work);
+      start_block<kWarpCount * kWarpSize, kIsVerify ? kVerifyStages : kStages,
+                  are_new_tokens_in_range<kWarpCount, kIsVerify>()>(p, tile, work);
+  constexpr bool kAreNewTokensInRange = are_new_tokens_in_range<kWarpCount, kIsVerify>();
+  if (kAreNewTokensInRange && work.end_position_excl > work.seq_len) {
+    prepare_new_tokens(p, tile, work);
+  }
   uint32_t q_fragments[kQkSteps][4];
   load_query_fragments<!kIsVerify>(tile, work, q_fragments);
   WarpState state = {};
@@ -2411,7 +2526,7 @@ __global__ void __launch_bounds__(kWarpCount* kWarpSize, kMinBlocksPerSm)
   const float logit_scale_log2 = p.sm_scale * p.qk_scale_factor * tile.k_scale * kLog2e;
   attend_split<kWarpCount, kChunksPerWarp, kIsVerify>(p, tile, work, addresses, q_fragments,
                                                       logit_scale_log2, state);
-  if (work.split == 0) {
+  if (!kAreNewTokensInRange && work.split == 0) {
     attend_new_tokens<kChunksPerWarp, kIsVerify>(p, tile, work, q_fragments, logit_scale_log2,
                                                  state);
   }
@@ -2713,7 +2828,7 @@ def _get_extension() -> object:
     """
     if "module" not in _extension_cache:
         _extension_cache["module"] = load_inline(
-            name="muse_fused_attention_push_merge",
+            name="muse_fused_attention_new_tokens_in_range_v2",
             cpp_sources=CPP_SOURCE,
             cuda_sources=CUDA_SOURCE,
             functions=["run", "resident_blocks_per_sm"],
@@ -2765,7 +2880,11 @@ def _plan_splits(data: dict) -> tuple[int, int, int, bool]:
         >>> split_count, keys_per_split, first_split_keys, is_balanced = _plan_splits(data)
     """
     config: dict = data["config"]
-    span_keys: int = config["window"] or data["page_table"].shape[1] * config["page_size"]
+    span_keys: int = (
+        config["window"] + config["q_len"] - 1
+        if config["window"]
+        else data["page_table"].shape[1] * config["page_size"]
+    )
     tile_count: int = -(-span_keys // _TILE_KEYS)
     sm_count: int = torch.cuda.get_device_properties(data["qkv"].device).multi_processor_count
     row_count: int = config["q_len"] * config["num_q_heads"] // config["num_kv_heads"]
@@ -2786,7 +2905,7 @@ def _plan_splits(data: dict) -> tuple[int, int, int, bool]:
         and 1 < config["batch"] <= _WARP_SIZE
         and split_count > 1
     )
-    first_split_keys: int = keys_per_split - _TILE_KEYS
+    first_split_keys: int = keys_per_split
     shifted_split_count: int = 1 + max(0, -(-(span_keys - first_split_keys) // keys_per_split))
     is_tree_limited: bool = tile_count <= 2 * _MERGE_FAN_IN and config["q_len"] == 1
     if (
