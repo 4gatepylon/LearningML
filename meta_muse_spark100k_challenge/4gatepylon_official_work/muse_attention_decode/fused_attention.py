@@ -167,6 +167,7 @@ struct Params {
   int split_count, max_split_count, keys_per_split, first_split_keys;
   bool is_balanced, is_cluster_merge;
   int push_slot_count, push_row_count, merger_count;
+  int heads_per_block;
 };
 
 /**
@@ -261,6 +262,43 @@ struct SharedTile {
   float v_scale;
   float value_unit;
 };
+
+/**
+ * @brief `PieceSpot` says where one 16-byte piece of a step's copies goes: its token within the
+ * step, its KV head within the block, its row of the ring stage, and its first byte in that row.
+ *
+ * @par Example
+ * @code
+ * const PieceSpot spot = spot_piece<1>(piece);
+ * @endcode
+ */
+struct PieceSpot {
+  int token, head, row, dim;
+};
+
+/**
+ * @brief `spot_piece` places piece `piece` of a step: consecutive pieces cover a token's row of
+ * every KV head of the block, so `kHeadsPerBlock` heads read whole 128-byte lines together, and
+ * head h's tokens fill rows `h * kStepKeys / kHeadsPerBlock` onward.
+ *
+ * @tparam kHeadsPerBlock KV heads per block: 1 in every build so far.
+ * @param[in] piece The piece, below `kPiecesPerStep`.
+ * @return Its token, head, row and first byte.
+ *
+ * @par Example
+ * @code
+ * const PieceSpot spot = spot_piece<1>(step_piece<128>(i));
+ * @endcode
+ */
+template <int kHeadsPerBlock>
+__device__ PieceSpot spot_piece(int piece) {
+  PieceSpot spot;
+  spot.token = piece / (kLoadsPerRow * kHeadsPerBlock);
+  spot.head = piece / kLoadsPerRow % kHeadsPerBlock;
+  spot.row = spot.head * (kStepKeys / kHeadsPerBlock) + spot.token;
+  spot.dim = piece % kLoadsPerRow * kBytesPerLoad;
+  return spot;
+}
 
 /**
  * @brief `KeyAddresses` holds this thread's page and position for each piece of one step's
@@ -429,8 +467,8 @@ __device__ void write_gated_output(const Params& p, const SharedTile& tile, int 
                       __fdividef(o[2 * i + 1] * inv_rms, 1.0f + __expf(-g.y))));
     }
     if (warp_row + lane / kLanesPerOutputRow < my_row_count) {
-      const int token = b * p.L + row / kGroupSize;
-      const int head = kv_head * kGroupSize + row % kGroupSize;
+      const int token = b * p.L + row / (kGroupSize * p.heads_per_block);
+      const int head = kv_head * kGroupSize + row % (kGroupSize * p.heads_per_block);
       *reinterpret_cast<uint4*>(p.out_device + (token * p.q_head_count + head) * kHeadDim +
                                 first_dim) = out_bits;
     }
@@ -867,6 +905,7 @@ __device__ int step_piece(int i) {
  * missing keys get position -1.
  *
  * @tparam kThreadCount Threads per block, so the piece loop has fixed bounds.
+ * @tparam kHeadsPerBlock KV heads per block: 1 in every build so far.
  * @param[in] p Kernel parameters.
  * @param[in] b Request index.
  * @param[in] kv_head Key/value head index.
@@ -881,14 +920,14 @@ __device__ int step_piece(int i) {
  * KeyAddresses addresses = locate_keys<128>(p, b, kv_head, start, end);
  * @endcode
  */
-template <int kThreadCount>
+template <int kThreadCount, int kHeadsPerBlock>
 __device__ KeyAddresses locate_keys(const Params& p, int b, int kv_head, int first_position_incl,
                                     int end_position_excl, int cached_end_excl) {
   KeyAddresses addresses;
   static_assert(kPiecesPerStep % kThreadCount == 0, "each thread copies whole pieces");
   for (int i = 0; i < kPiecesPerStep / kThreadCount; ++i) {
     const int piece = step_piece<kThreadCount>(i);
-    const int position = first_position_incl + piece / kLoadsPerRow;
+    const int position = first_position_incl + spot_piece<kHeadsPerBlock>(piece).token;
     addresses.position[i] = position < end_position_excl ? position : -1;
     addresses.page[i] = position < end_position_excl ? -1 : 0;
     if (position < min(end_position_excl, cached_end_excl)) {
@@ -962,8 +1001,9 @@ __device__ void start_rows_copy(const Params& p, __nv_bfloat16 (*rows)[kHeadDim]
   for (int piece = threadIdx.x; piece < row_count * kPiecesPerRow; piece += thread_count()) {
     const int row = piece / kPiecesPerRow;
     const int column = (piece % kPiecesPerRow) * kHalvesPerLoad;
-    const int head = kv_head * kGroupSize + row % kGroupSize;
-    const __nv_bfloat16* source = p.qkv_device + (b * p.L + row / kGroupSize) * qkv_row_size +
+    const int head = kv_head * kGroupSize + row % (kGroupSize * p.heads_per_block);
+    const __nv_bfloat16* source =
+        p.qkv_device + (b * p.L + row / (kGroupSize * p.heads_per_block)) * qkv_row_size +
                                   first_head_column + head * kHeadDim + column;
     copy_async_16(&rows[row][column], source, true);
   }
@@ -971,8 +1011,9 @@ __device__ void start_rows_copy(const Params& p, __nv_bfloat16 (*rows)[kHeadDim]
 }
 
 /**
- * @brief `start_new_token_copy` starts copying the block's new key and value rows for one KV head
- * from the fused projection output into shared memory; the next `cp.async` commit includes them.
+ * @brief `start_new_token_copy` starts copying the block's new key and value rows for each of its
+ * KV heads from the fused projection output into shared memory (head h's token t in slot
+ * `h * kMaxTokens / heads_per_block + t`); the next `cp.async` commit includes them.
  *
  * @param[in] p Kernel parameters.
  * @param[out] tile Shared memory tile: its `new_k_in` and `new_v_in` rows.
@@ -986,13 +1027,17 @@ __device__ void start_rows_copy(const Params& p, __nv_bfloat16 (*rows)[kHeadDim]
  */
 __device__ void start_new_token_copy(const Params& p, SharedTile& tile, int b, int kv_head) {
   const int qkv_row_size = (2 * p.q_head_count + 2 * p.kv_head_count) * kHeadDim;
-  for (int piece = threadIdx.x; piece < p.L * kPiecesPerRow; piece += thread_count()) {
-    const int token = piece / kPiecesPerRow;
+  for (int piece = threadIdx.x; piece < p.heads_per_block * p.L * kPiecesPerRow;
+       piece += thread_count()) {
+    const int head = piece / kPiecesPerRow / p.L;
+    const int token = piece / kPiecesPerRow % p.L;
+    const int slot = head * (kMaxTokens / p.heads_per_block) + token;
     const int column = (piece % kPiecesPerRow) * kHalvesPerLoad;
     const __nv_bfloat16* row = p.qkv_device + (b * p.L + token) * qkv_row_size + column;
-    copy_async_16(&tile.new_k_in[token][column], row + (p.q_head_count + kv_head) * kHeadDim, true);
-    copy_async_16(&tile.new_v_in[token][column],
-                  row + (p.q_head_count + p.kv_head_count + kv_head) * kHeadDim, true);
+    copy_async_16(&tile.new_k_in[slot][column],
+                  row + (p.q_head_count + kv_head + head) * kHeadDim, true);
+    copy_async_16(&tile.new_v_in[slot][column],
+                  row + (p.q_head_count + p.kv_head_count + kv_head + head) * kHeadDim, true);
   }
 }
 
@@ -1027,6 +1072,7 @@ __device__ void fill_rotation_table(const Params& p, SharedTile& tile, int seq_l
  * into a ring stage, as one `cp.async` group; missing keys become zeros.
  *
  * @tparam kThreadCount Threads per block, so the piece loop has fixed bounds.
+ * @tparam kHeadsPerBlock KV heads per block: 1 in every build so far.
  * @param[in] p Kernel parameters.
  * @param[out] tile Shared memory tile: its ring stage and the stage's key positions.
  * @param[in] kv_head Key/value head index.
@@ -1038,23 +1084,23 @@ __device__ void fill_rotation_table(const Params& p, SharedTile& tile, int seq_l
  * start_step_copy<128>(p, tile, kv_head, addresses, (step + kStages - 1) % kStages);
  * @endcode
  */
-template <int kThreadCount>
+template <int kThreadCount, int kHeadsPerBlock>
 __device__ void start_step_copy(const Params& p, SharedTile& tile, int kv_head,
                                 const KeyAddresses& addresses, int stage) {
   static_assert(kPiecesPerStep % kThreadCount == 0, "each thread copies whole pieces");
   for (int i = 0; i < kPiecesPerStep / kThreadCount; ++i) {
-    const int piece = step_piece<kThreadCount>(i);
-    const int key = piece / kLoadsPerRow;
-    const int dim = (piece % kLoadsPerRow) * kBytesPerLoad;
+    const PieceSpot spot = spot_piece<kHeadsPerBlock>(step_piece<kThreadCount>(i));
+    const int key = spot.row;
+    const int dim = spot.dim;
     const int position = addresses.position[i];
     const int64_t row = (static_cast<int64_t>(addresses.page[i]) << p.page_size_log2) +
                         (position >= 0 ? position & ((1 << p.page_size_log2) - 1) : 0);
-    const int64_t offset = (row * p.kv_head_count + kv_head) * kHeadDim + dim;
+    const int64_t offset = (row * p.kv_head_count + kv_head + spot.head) * kHeadDim + dim;
     const bool is_cached = position >= 0 && addresses.page[i] >= 0;
     copy_async_16(&tile.ring.raw_k[stage][key][swizzled_dim(key, dim)], p.k_cache_device + offset,
                   is_cached);
     copy_async_16(&tile.ring.raw_v[stage][key][dim], p.v_cache_device + offset, is_cached);
-    if (piece % kLoadsPerRow == 0) {
+    if (dim == 0) {
       tile.ring.raw_position[stage][key] = addresses.position[i];
     }
   }
@@ -1066,6 +1112,7 @@ __device__ void start_step_copy(const Params& p, SharedTile& tile, int kv_head,
  * the P V tensor cores read; the keys stay FP8.
  *
  * @tparam kThreadCount Threads per block, so the piece loop has fixed bounds.
+ * @tparam kHeadsPerBlock KV heads per block: 1 in every build so far.
  * @param[in,out] tile Shared memory tile: reads the stage, writes values and key positions.
  * @param[in] stage Ring stage whose copies this thread has waited for.
  *
@@ -1074,18 +1121,18 @@ __device__ void start_step_copy(const Params& p, SharedTile& tile, int kv_head,
  * convert_step<128, true>(tile, step % kStages);
  * @endcode
  */
-template <int kThreadCount, bool kUseIntegerPipes>
+template <int kThreadCount, bool kUseIntegerPipes, int kHeadsPerBlock>
 __device__ void convert_step(SharedTile& tile, int stage) {
   static_assert(kPiecesPerStep % kThreadCount == 0, "each thread copies whole pieces");
   for (int i = 0; i < kPiecesPerStep / kThreadCount; ++i) {
-    const int piece = step_piece<kThreadCount>(i);
-    const int key = piece / kLoadsPerRow;
-    const int dim = (piece % kLoadsPerRow) * kBytesPerLoad;
+    const PieceSpot spot = spot_piece<kHeadsPerBlock>(step_piece<kThreadCount>(i));
+    const int key = spot.row;
+    const int dim = spot.dim;
     store_fp8_as_halves<kUseIntegerPipes>(
         *reinterpret_cast<const uint4*>(&tile.ring.raw_v[stage][key][dim]),
         &tile.v[key][swizzled_value_dim(key, dim)],
         &tile.v[key][swizzled_value_dim(key, dim + kHalvesPerLoad)]);
-    if (piece % kLoadsPerRow == 0) {
+    if (dim == 0) {
       tile.key_position[key] = tile.ring.raw_position[stage][key];
     }
   }
@@ -1099,6 +1146,7 @@ __device__ void convert_step(SharedTile& tile, int stage) {
  * @param[out] q_row The row's FP8 bytes.
  * @param[in] row Query row; rows past `row_count` become zeros.
  * @param[in] row_count Query rows (L x query heads per KV head).
+ * @param[in] rows_per_token Query rows of one token: 8 per KV head of the block.
  * @param[in] first_dim This lane's first dimension, a multiple of 8.
  *
  * @par Example
@@ -1111,7 +1159,7 @@ __device__ void convert_step(SharedTile& tile, int stage) {
  *   - All 32 lanes must call `normalize_query_row` together (it sums over groups of 8 lanes).
  */
 __device__ void normalize_query_row(const SharedTile& tile, uint8_t* q_row, int row, int row_count,
-                                    int first_dim) {
+                                    int rows_per_token, int first_dim) {
   float q[kDimsPerOutputLane] = {};
   float square_sum = 0.0f;
   if (row < row_count) {
@@ -1126,7 +1174,7 @@ __device__ void normalize_query_row(const SharedTile& tile, uint8_t* q_row, int 
   }
   const float inv_rms = rsqrtf(lane_group_sum<kLanesPerOutputRow>(square_sum) / kHeadDim + kRmsEps);
   uint8_t bytes[kDimsPerOutputLane];
-  const int token = row < row_count ? row / kGroupSize : 0;
+  const int token = row < row_count ? row / rows_per_token : 0;
   for (int i = 0; i < kDimsPerOutputLane / 2; ++i) {
     const float2 rotation =
         row < row_count ? tile.rotation[token][first_dim / 2 + i] : make_float2(1.0f, 0.0f);
@@ -1849,8 +1897,8 @@ __device__ bool merge_splits(const Params& p, SharedTile& tile, int b, int kv_he
 
 /**
  * @brief `BlockWork` describes what one block of `attention_kernel` works on: its split, its
- * group's split count, KV head and request (or that it has none), its warp's place among the query
- * rows and keys, and its split's key positions.
+ * group's split count, first KV head and request (or that it has none), its warp's place among the
+ * query rows, heads and keys, and its split's key positions.
  *
  * @par Example
  * @code
@@ -1861,6 +1909,7 @@ struct BlockWork {
   int split, split_count, kv_head, b, warp, lane;
   bool is_idle;
   int row_count, m_tile_count, key_group_count, m_tile, key_group;
+  int rows_per_token, warp_head, first_key;
   bool is_active;
   int seq_len, window_start_incl, first_position_incl, end_position_excl;
 };
@@ -1942,6 +1991,8 @@ __device__ BalancedSplit balance_splits(const Params& p, int B, int slot, int ne
  *
  * @tparam kWarpCount Warps per block.
  * @tparam kIsVerify Whether the block serves 8 tokens (64 query rows) rather than 1 (8 rows).
+ * @tparam kHeadsPerBlock KV heads per block: with h heads a decode block has 8 h rows, head i's in
+ * rows 8 i to 8 i + 7, and warp w attends head `w % h`.
  * @param[in] p Kernel parameters; the grid is (splits, KV heads, requests), or, when the split
  * plan is balanced, `split_count x B` slots per KV head that `balance_splits` assigns.
  * @return The block's work.
@@ -1951,13 +2002,13 @@ __device__ BalancedSplit balance_splits(const Params& p, int B, int slot, int ne
  * const BlockWork work = describe_block<kWarpCount, kIsVerify>(p);
  * @endcode
  */
-template <int kWarpCount, bool kIsVerify>
+template <int kWarpCount, bool kIsVerify, int kHeadsPerBlock>
 __device__ BlockWork describe_block(const Params& p) {
   BlockWork work;
   int keys_per_split = p.keys_per_split;
   work.split = blockIdx.x;
   work.split_count = p.split_count;
-  work.kv_head = blockIdx.y;
+  work.kv_head = blockIdx.y * kHeadsPerBlock;
   work.b = blockIdx.z;
   if (kIsVerify && p.is_balanced) {
     const BalancedSplit share =
@@ -1971,12 +2022,18 @@ __device__ BlockWork describe_block(const Params& p) {
   work.is_idle = work.split >= work.split_count;
   work.warp = threadIdx.x / kWarpSize;
   work.lane = threadIdx.x % kWarpSize;
-  work.row_count = kIsVerify ? kMaxTokens * kGroupSize : kGroupSize;
+  work.row_count = kIsVerify ? kMaxTokens * kGroupSize : kGroupSize * kHeadsPerBlock;
+  work.rows_per_token = kGroupSize * kHeadsPerBlock;
   work.m_tile_count = (work.row_count + kMmaRows - 1) / kMmaRows;
   work.key_group_count = kWarpCount / work.m_tile_count;
   work.m_tile = work.warp % work.m_tile_count;
   work.key_group = work.warp / work.m_tile_count;
   work.is_active = work.key_group < work.key_group_count;
+  work.warp_head = work.warp % kHeadsPerBlock;
+  work.first_key = kHeadsPerBlock == 1
+                       ? work.key_group * (kStepKeys / work.key_group_count)
+                       : work.warp_head * (kStepKeys / kHeadsPerBlock) +
+                             work.warp / kHeadsPerBlock * kChunkKeys;
   work.seq_len = p.seq_lens_device[work.b];
   work.window_start_incl = p.window == 0 ? 0 : max(0, work.seq_len - p.window + 1);
   const int first_split_keys = p.is_balanced ? keys_per_split : p.first_split_keys;
@@ -1998,6 +2055,8 @@ __device__ BlockWork describe_block(const Params& p) {
  * @tparam kThreadCount Threads per block.
  * @tparam kStageCount Ring stages the build uses: `kStages` for decode, `kVerifyStages` for
  * verify.
+ * @tparam kAreNewTokensInRange Whether the new tokens are keys of the last split.
+ * @tparam kHeadsPerBlock KV heads per block: 1 in every build so far.
  * @param[in] p Kernel parameters.
  * @param[in,out] tile Shared memory tile.
  * @param[in] work The block's work.
@@ -2008,19 +2067,20 @@ __device__ BlockWork describe_block(const Params& p) {
  * KeyAddresses addresses = start_block<128, kStages>(p, tile, work);
  * @endcode
  */
-template <int kThreadCount, int kStageCount, bool kAreNewTokensInRange>
+template <int kThreadCount, int kStageCount, bool kAreNewTokensInRange, int kHeadsPerBlock>
 __device__ KeyAddresses start_block(const Params& p, SharedTile& tile, const BlockWork& work) {
   if (kAreNewTokensInRange ? work.end_position_excl > work.seq_len : work.split == 0) {
     start_new_token_copy(p, tile, work.b, work.kv_head);
   }
   start_rows_copy(p, tile.start.q_in, work.b, work.kv_head, work.row_count, 0);
-  KeyAddresses addresses = locate_keys<kThreadCount>(
+  constexpr int kStepTokens = kStepKeys / kHeadsPerBlock;
+  KeyAddresses addresses = locate_keys<kThreadCount, kHeadsPerBlock>(
       p, work.b, work.kv_head, work.first_position_incl, work.end_position_excl, work.seq_len);
   for (int stage = 0; stage < kStageCount - 1; ++stage) {
-    const KeyAddresses next_addresses = locate_keys<kThreadCount>(
-        p, work.b, work.kv_head, work.first_position_incl + (stage + 1) * kStepKeys,
+    const KeyAddresses next_addresses = locate_keys<kThreadCount, kHeadsPerBlock>(
+        p, work.b, work.kv_head, work.first_position_incl + (stage + 1) * kStepTokens,
         work.end_position_excl, work.seq_len);
-    start_step_copy<kThreadCount>(p, tile, work.kv_head, addresses, stage);
+    start_step_copy<kThreadCount, kHeadsPerBlock>(p, tile, work.kv_head, addresses, stage);
     addresses = next_addresses;
   }
   if (threadIdx.x < p.L) {
@@ -2056,14 +2116,15 @@ __device__ void load_query_fragments(SharedTile& tile, const BlockWork& work,
   for (int warp_row = work.warp * kQueryRowsPerWarp; warp_row < work.m_tile_count * kMmaRows;
        warp_row += warp_count() * kQueryRowsPerWarp) {
     const int row = warp_row + work.lane / kLanesPerOutputRow;
-    normalize_query_row(tile, tile.start.q[row], row, work.row_count,
+    normalize_query_row(tile, tile.start.q[row], row, work.row_count, work.rows_per_token,
                         work.lane % kLanesPerOutputRow * kDimsPerOutputLane);
   }
   __syncthreads();
   if constexpr (kIsTransposed) {
     for (int depth = 0; depth < kQkSteps; ++depth) {
       const uint8_t* query =
-          &tile.start.q[work.lane / 4][kFp8MmaDepth * depth + 4 * (work.lane % 4)];
+          &tile.start.q[work.warp_head * kGroupSize + work.lane / 4]
+                       [kFp8MmaDepth * depth + 4 * (work.lane % 4)];
       q_fragments[depth][0] = *reinterpret_cast<const uint32_t*>(query);
       q_fragments[depth][1] = *reinterpret_cast<const uint32_t*>(query + kBytesPerLoad);
     }
@@ -2079,8 +2140,8 @@ __device__ void load_query_fragments(SharedTile& tile, const BlockWork& work,
 
 /**
  * @brief `prepare_new_tokens` normalizes and rotates the L new keys (staged by
- * `start_new_token_copy`), rounds keys and values to FP8 in shared memory for the ring, and writes
- * to the cache the new tokens that fall in this block's range.
+ * `start_new_token_copy`) of each of the block's KV heads, rounds keys and values to FP8 in shared
+ * memory for the ring, and writes to the cache the new tokens that fall in this block's range.
  *
  * @param[in] p Kernel parameters.
  * @param[in,out] tile Shared memory tile: gets `new_k_fp8` and `new_v_fp8`.
@@ -2094,24 +2155,28 @@ __device__ void load_query_fragments(SharedTile& tile, const BlockWork& work,
 __device__ void prepare_new_tokens(const Params& p, SharedTile& tile, const BlockWork& work) {
   const int warp = threadIdx.x / kWarpSize;
   const int lane = threadIdx.x % kWarpSize;
-  for (int token = warp; token < p.L; token += warp_count()) {
+  for (int item = warp; item < p.heads_per_block * p.L; item += warp_count()) {
+    const int head = item / p.L;
+    const int token = item % p.L;
+    const int slot = head * (kMaxTokens / p.heads_per_block) + token;
     const float2 k_in =
-        __bfloat1622float2(reinterpret_cast<const __nv_bfloat162*>(&tile.new_k_in[token][0])[lane]);
+        __bfloat1622float2(reinterpret_cast<const __nv_bfloat162*>(&tile.new_k_in[slot][0])[lane]);
     const float2 v_in =
-        __bfloat1622float2(reinterpret_cast<const __nv_bfloat162*>(&tile.new_v_in[token][0])[lane]);
+        __bfloat1622float2(reinterpret_cast<const __nv_bfloat162*>(&tile.new_v_in[slot][0])[lane]);
     const float2 k = normalize_and_rotate(k_in, tile.rotation[token][lane]);
     const __nv_fp8_e4m3 k_fp8[2] = {__nv_fp8_e4m3(k.x / tile.k_scale),
                                     __nv_fp8_e4m3(k.y / tile.k_scale)};
     const __nv_fp8_e4m3 v_fp8[2] = {__nv_fp8_e4m3(v_in.x / tile.v_scale),
                                     __nv_fp8_e4m3(v_in.y / tile.v_scale)};
-    tile.new_k_fp8[token][2 * lane] = k_fp8[0].__x;
-    tile.new_k_fp8[token][2 * lane + 1] = k_fp8[1].__x;
-    tile.new_v_fp8[token][2 * lane] = v_fp8[0].__x;
-    tile.new_v_fp8[token][2 * lane + 1] = v_fp8[1].__x;
+    tile.new_k_fp8[slot][2 * lane] = k_fp8[0].__x;
+    tile.new_k_fp8[slot][2 * lane + 1] = k_fp8[1].__x;
+    tile.new_v_fp8[slot][2 * lane] = v_fp8[0].__x;
+    tile.new_v_fp8[slot][2 * lane + 1] = v_fp8[1].__x;
     const int position = work.seq_len + token;
     if (position >= work.first_position_incl && position < work.end_position_excl) {
       const int64_t offset =
-          (tile.new_cache_loc[token] * p.kv_head_count + work.kv_head) * kHeadDim + 2 * lane;
+          (tile.new_cache_loc[token] * p.kv_head_count + work.kv_head + head) * kHeadDim +
+          2 * lane;
       p.k_cache_device[offset] = k_fp8[0];
       p.k_cache_device[offset + 1] = k_fp8[1];
       p.v_cache_device[offset] = v_fp8[0];
@@ -2125,6 +2190,7 @@ __device__ void prepare_new_tokens(const Params& p, SharedTile& tile, const Bloc
  * from `new_k_fp8` and `new_v_fp8` (their cache copies were skipped).
  *
  * @tparam kThreadCount Threads per block.
+ * @tparam kHeadsPerBlock KV heads per block: 1 in every build so far.
  * @param[in,out] tile Shared memory tile.
  * @param[in] work The block's work.
  * @param[in] start_incl The step's first key position.
@@ -2135,20 +2201,45 @@ __device__ void prepare_new_tokens(const Params& p, SharedTile& tile, const Bloc
  * patch_new_tokens<128>(tile, work, start_incl, step % kStages);
  * @endcode
  */
-template <int kThreadCount>
+template <int kThreadCount, int kHeadsPerBlock>
 __device__ void patch_new_tokens(SharedTile& tile, const BlockWork& work, int start_incl,
                                  int stage) {
   for (int i = 0; i < kPiecesPerStep / kThreadCount; ++i) {
-    const int piece = step_piece<kThreadCount>(i);
-    const int key = piece / kLoadsPerRow;
-    const int dim = (piece % kLoadsPerRow) * kBytesPerLoad;
-    const int token = start_incl + key - work.seq_len;
-    if (token >= 0 && start_incl + key < work.end_position_excl) {
+    const PieceSpot spot = spot_piece<kHeadsPerBlock>(step_piece<kThreadCount>(i));
+    const int key = spot.row;
+    const int dim = spot.dim;
+    const int token = start_incl + spot.token - work.seq_len;
+    const int slot = spot.head * (kMaxTokens / kHeadsPerBlock) + token;
+    if (token >= 0 && start_incl + spot.token < work.end_position_excl) {
       *reinterpret_cast<uint4*>(&tile.ring.raw_k[stage][key][swizzled_dim(key, dim)]) =
-          *reinterpret_cast<const uint4*>(&tile.new_k_fp8[token][dim]);
+          *reinterpret_cast<const uint4*>(&tile.new_k_fp8[slot][dim]);
       *reinterpret_cast<uint4*>(&tile.ring.raw_v[stage][key][dim]) =
-          *reinterpret_cast<const uint4*>(&tile.new_v_fp8[token][dim]);
+          *reinterpret_cast<const uint4*>(&tile.new_v_fp8[slot][dim]);
     }
+  }
+}
+
+/**
+ * @brief `sync_step` makes a step's converted values and landed keys visible to every warp that
+ * reads them: the block in verify (with a proxy fence for `wgmma`) and the warp in decode.
+ *
+ * @tparam kIsVerify Whether this is a verify build.
+ * @tparam kHeadsPerBlock KV heads per block.
+ * @param[in] warp This thread's warp.
+ *
+ * @par Example
+ * @code
+ * sync_step<false, 1>(work.warp);
+ * @endcode
+ */
+template <bool kIsVerify, int kHeadsPerBlock>
+__device__ void sync_step(int warp) {
+  if constexpr (kIsVerify) {
+    asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
+    __syncthreads();
+  } else {
+    static_assert(kHeadsPerBlock == 1, "decode syncs one warp");
+    __syncwarp();
   }
 }
 
@@ -2159,6 +2250,7 @@ __device__ void patch_new_tokens(SharedTile& tile, const BlockWork& work, int st
  * @tparam kWarpCount Warps per block.
  * @tparam kChunksPerWarp Chunks of 16 keys each warp attends per step.
  * @tparam kIsVerify Whether this is a verify build (`wgmma`).
+ * @tparam kHeadsPerBlock KV heads per block: 1 in every build so far.
  * @param[in] p Kernel parameters.
  * @param[in,out] tile Shared memory tile.
  * @param[in] work The block's work.
@@ -2172,48 +2264,41 @@ __device__ void patch_new_tokens(SharedTile& tile, const BlockWork& work, int st
  * attend_split<4, 4, true>(p, tile, work, addresses, q_fragments, logit_scale_log2, state);
  * @endcode
  */
-template <int kWarpCount, int kChunksPerWarp, bool kIsVerify>
+template <int kWarpCount, int kChunksPerWarp, bool kIsVerify, int kHeadsPerBlock>
 __device__ void attend_split(const Params& p, SharedTile& tile, const BlockWork& work,
                              KeyAddresses& addresses, const uint32_t (&q_fragments)[kQkSteps][4],
                              float logit_scale_log2, WarpState& state) {
   constexpr int kThreadCount = kWarpCount * kWarpSize;
   constexpr int kStageCount = kIsVerify ? kVerifyStages : kStages;
-  for (int step = 0; work.first_position_incl + step * kStepKeys < work.end_position_excl; ++step) {
+  constexpr int kStepTokens = kStepKeys / kHeadsPerBlock;
+  for (int step = 0; work.first_position_incl + step * kStepTokens < work.end_position_excl;
+       ++step) {
     wait_for_copies<kStageCount - 2>();
-    if constexpr (kIsVerify) {
-      asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
-      __syncthreads();
-    } else {
-      __syncwarp();
-    }
-    const int start_incl = work.first_position_incl + step * kStepKeys;
-    if (are_new_tokens_in_range<kWarpCount, kIsVerify>() && start_incl + kStepKeys > work.seq_len) {
-      patch_new_tokens<kThreadCount>(tile, work, start_incl, step % kStageCount);
+    sync_step<kIsVerify, kHeadsPerBlock>(work.warp);
+    const int start_incl = work.first_position_incl + step * kStepTokens;
+    if (are_new_tokens_in_range<kWarpCount, kIsVerify>() &&
+        start_incl + kStepTokens > work.seq_len) {
+      patch_new_tokens<kThreadCount, kHeadsPerBlock>(tile, work, start_incl, step % kStageCount);
       if constexpr (kIsVerify) {
         __syncthreads();
       } else {
         __syncwarp();
       }
     }
-    convert_step<kThreadCount, !kIsVerify>(tile, step % kStageCount);
-    const KeyAddresses next_addresses = locate_keys<kThreadCount>(
-        p, work.b, work.kv_head, work.first_position_incl + (step + kStageCount) * kStepKeys,
+    convert_step<kThreadCount, !kIsVerify, kHeadsPerBlock>(tile, step % kStageCount);
+    const KeyAddresses next_addresses = locate_keys<kThreadCount, kHeadsPerBlock>(
+        p, work.b, work.kv_head, work.first_position_incl + (step + kStageCount) * kStepTokens,
         work.end_position_excl, work.seq_len);
-    start_step_copy<kThreadCount>(p, tile, work.kv_head, addresses,
-                                  (step + kStageCount - 1) % kStageCount);
+    start_step_copy<kThreadCount, kHeadsPerBlock>(p, tile, work.kv_head, addresses,
+                                                  (step + kStageCount - 1) % kStageCount);
     addresses = next_addresses;
-    if constexpr (kIsVerify) {
-      asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
-      __syncthreads();
-    } else {
-      __syncwarp();
-    }
-    const bool is_masked = start_incl + kStepKeys > work.end_position_excl ||
-                           start_incl + kStepKeys > work.seq_len ||
+    sync_step<kIsVerify, kHeadsPerBlock>(work.warp);
+    const bool is_masked = start_incl + kStepTokens > work.end_position_excl ||
+                           start_incl + kStepTokens > work.seq_len ||
                            (p.window != 0 && start_incl < work.window_start_incl + p.L - 1);
     attend_keys<kChunksPerWarp, kIsVerify>(
         p, tile, tile.ring.raw_k[step % kStageCount], q_fragments,
-        work.key_group * kChunksPerWarp * kChunkKeys, work.m_tile * kMmaRows, work.seq_len,
+        work.first_key, work.m_tile * kMmaRows, work.seq_len,
         logit_scale_log2, is_masked, state);
   }
   wait_for_copies<0>();
@@ -2272,7 +2357,7 @@ __device__ void combine_block_state(SharedTile& tile, const BlockWork& work, War
       for (int offset = 4; offset < kWarpSize; offset *= 2) {
         state.sum[e] += __shfl_xor_sync(kFullWarpMask, state.sum[e], offset);
       }
-      const int query = 2 * (lane % 4) + e;
+      const int query = work.warp_head * kGroupSize + 2 * (lane % 4) + e;
       if (lane < 4) {
         tile.warp_max[work.warp][query] = state.max_log2[e];
         tile.warp_sum[work.warp][query] = state.sum[e];
@@ -2534,13 +2619,14 @@ __device__ void merge_with_tree(const Params& p, SharedTile& tile, const BlockWo
  * sizeof(SharedTile), stream>>>(p);
  * @endcode
  */
-template <int kWarpCount, int kChunksPerWarp, int kMinBlocksPerSm, bool kUsePushMerge = false>
+template <int kWarpCount, int kChunksPerWarp, int kMinBlocksPerSm, bool kUsePushMerge = false,
+          int kHeadsPerBlock = 1>
 __global__ void __launch_bounds__(kWarpCount* kWarpSize, kMinBlocksPerSm)
     attention_kernel(const Params p) {
   constexpr bool kIsVerify = kChunksPerWarp > 1;
   extern __shared__ __align__(16) unsigned char shared_bytes[];
   SharedTile& tile = *reinterpret_cast<SharedTile*>(shared_bytes);
-  const BlockWork work = describe_block<kWarpCount, kIsVerify>(p);
+  const BlockWork work = describe_block<kWarpCount, kIsVerify, kHeadsPerBlock>(p);
   if (work.is_idle) {
     return;
   }
@@ -2549,7 +2635,7 @@ __global__ void __launch_bounds__(kWarpCount* kWarpSize, kMinBlocksPerSm)
   }
   KeyAddresses addresses =
       start_block<kWarpCount * kWarpSize, kIsVerify ? kVerifyStages : kStages,
-                  are_new_tokens_in_range<kWarpCount, kIsVerify>()>(p, tile, work);
+                  are_new_tokens_in_range<kWarpCount, kIsVerify>(), kHeadsPerBlock>(p, tile, work);
   constexpr bool kAreNewTokensInRange = are_new_tokens_in_range<kWarpCount, kIsVerify>();
   if (kAreNewTokensInRange && work.end_position_excl > work.seq_len) {
     prepare_new_tokens(p, tile, work);
@@ -2559,7 +2645,8 @@ __global__ void __launch_bounds__(kWarpCount* kWarpSize, kMinBlocksPerSm)
   WarpState state = {};
   state.max_log2[0] = state.max_log2[1] = -INFINITY;
   const float logit_scale_log2 = p.sm_scale * p.qk_scale_factor * tile.k_scale * kLog2e;
-  attend_split<kWarpCount, kChunksPerWarp, kIsVerify>(p, tile, work, addresses, q_fragments,
+  attend_split<kWarpCount, kChunksPerWarp, kIsVerify, kHeadsPerBlock>(p, tile, work, addresses,
+                                                                      q_fragments,
                                                       logit_scale_log2, state);
   if (!kAreNewTokensInRange && work.split == 0) {
     attend_new_tokens<kChunksPerWarp, kIsVerify>(p, tile, work, q_fragments, logit_scale_log2,
@@ -2586,8 +2673,8 @@ using attention_kernel_t = void (*)(Params);
 
 /**
  * @brief `KernelBuild` names one compiled kernel build: the kernel, its threads per block, and the
- * blocks per SM its launch bounds and the split plan target, and whether it launches
- * cooperatively (its mergers wait for the other blocks).
+ * blocks per SM its launch bounds and the split plan target, whether it launches cooperatively
+ * (its mergers wait for the other blocks), and how many KV heads each block attends.
  *
  * @par Example
  * @code
@@ -2599,6 +2686,7 @@ struct KernelBuild {
   int thread_count;
   int blocks_per_sm;
   bool is_cooperative;
+  int heads_per_block = 1;
 };
 
 /**
@@ -2608,8 +2696,8 @@ struct KernelBuild {
  * @param[in] row_count Query rows per block (L x query heads per KV head).
  * @param[in] window Sliding window in tokens, or 0 for full attention.
  * @param[in] group_count Requests x KV heads: full verify with few groups also gets 8 warps.
- * @return The kernel to launch, its threads per block, its blocks per SM, and whether it launches
- * cooperatively.
+ * @return The kernel to launch, its threads per block, its blocks per SM, whether it launches
+ * cooperatively, and its KV heads per block.
  * @throws c10::Error When a block has 17 to 48 query rows (2 or 3 row tiles).
  *
  * @par Example
@@ -2768,7 +2856,8 @@ void run(torch::Tensor qkv, torch::Tensor k_cache, torch::Tensor v_cache, torch:
       static_cast<size_t>(p.push_slot_count) * p.push_row_count * (kHeadDim + 2) * sizeof(float);
   p.is_cluster_merge = wants_push_merge;
   cudaLaunchConfig_t config = {};
-  config.gridDim = dim3(p.split_count, k_cache.size(2), qkv.size(0));
+  p.heads_per_block = build.heads_per_block;
+  config.gridDim = dim3(p.split_count, k_cache.size(2) / build.heads_per_block, qkv.size(0));
   config.blockDim = dim3(build.thread_count);
   config.dynamicSmemBytes = sizeof(SharedTile) + (p.is_cluster_merge ? push_bytes : 0);
   config.stream = at::cuda::getCurrentCUDAStream();
@@ -2863,7 +2952,7 @@ def _get_extension() -> object:
     """
     if "module" not in _extension_cache:
         _extension_cache["module"] = load_inline(
-            name="muse_fused_attention_push_parts",
+            name="muse_fused_attention_heads_per_block",
             cpp_sources=CPP_SOURCE,
             cuda_sources=CUDA_SOURCE,
             functions=["run", "resident_blocks_per_sm"],
