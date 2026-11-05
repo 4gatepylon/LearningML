@@ -856,7 +856,10 @@ __device__ uint32_t pack_halves(float low, float high) {
 template <bool kUseIntegerPipes>
 __device__ void store_fp8_as_halves(const uint4& bytes, __half* low, __half* high) {
   if constexpr (!kUseIntegerPipes) {
-    const __nv_fp8x2_storage_t* pairs = reinterpret_cast<const __nv_fp8x2_storage_t*>(&bytes);
+    // DANGEROUS DANGEROUS DANGEROUS IF YOU CHANGE THIS THEN THE PAIRS ARE READ 2 BYTES AT A TIME
+    const uint4 bytes_in_registers = bytes;
+    const __nv_fp8x2_storage_t* pairs =
+        reinterpret_cast<const __nv_fp8x2_storage_t*>(&bytes_in_registers);
     uint32_t halves[kHalvesPerLoad];
     for (int i = 0; i < kHalvesPerLoad; ++i) {
       const __half2_raw pair = __nv_cvt_fp8x2_to_halfraw2(pairs[i], __NV_E4M3);
@@ -2994,7 +2997,7 @@ def _get_extension() -> object:
     """
     if "module" not in _extension_cache:
         _extension_cache["module"] = load_inline(
-            name="muse_fused_attention_paired_heads",
+            name="muse_fused_attention_register_values",
             cpp_sources=CPP_SOURCE,
             cuda_sources=CUDA_SOURCE,
             functions=["run", "resident_blocks_per_sm", "heads_per_block"],
