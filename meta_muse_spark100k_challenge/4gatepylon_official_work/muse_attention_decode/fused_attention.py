@@ -54,6 +54,7 @@ from torch.utils.cpp_extension import load_inline
 
 CUDA_SOURCE: str = r"""
 #include <ATen/cuda/CUDAContext.h>
+#include <cooperative_groups.h>
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #include <cuda_fp8.h>
@@ -87,6 +88,7 @@ constexpr int kPiecesPerStep = kStepKeys * kLoadsPerRow;
 constexpr int kLoadsPerThread = kPiecesPerStep / kMinThreads;
 constexpr int kMaxSplits = 256;
 constexpr int kStages = 3;
+constexpr int kMaxClusterBlocks = 16;
 constexpr int kVerifyStages = 2;
 constexpr int kDecodeBlocksPerSm = 3;
 constexpr int kFullDecodeBlocksPerSm = 4;
@@ -144,7 +146,8 @@ struct Params {
   float* partial_sum_device;
   int* arrival_count_device;
   int split_count, max_split_count, keys_per_split, first_split_keys;
-  bool is_balanced;
+  bool is_balanced, is_cluster_merge;
+  int push_slot_count, push_row_count, merger_count;
 };
 
 /**
@@ -2201,6 +2204,111 @@ __device__ void combine_block_state(SharedTile& tile, const BlockWork& work, War
 }
 
 /**
+ * @brief `merge_by_push` merges a cluster's splits (one request and KV head): every warp writes
+ * its softmax state for each row into the shared memory of the block that merges the row (row r
+ * goes to block r % mergers), one cluster barrier makes them visible, and each merger folds its
+ * rows' states and writes their gated output.
+ *
+ * @tparam kIsTransposed Whether warps hold the decode layout (per query column).
+ * @param[in] p Kernel parameters.
+ * @param[in,out] tile Shared memory tile; the push buffer follows it.
+ * @param[in] work The block's work.
+ * @param[in] state This thread's softmax state.
+ *
+ * @par Example
+ * @code
+ * merge_by_push<false>(p, tile, work, state);
+ * @endcode
+ */
+template <bool kIsTransposed>
+__device__ void merge_by_push(const Params& p, SharedTile& tile, const BlockWork& work,
+                              WarpState& state) {
+  namespace cg = cooperative_groups;
+  cg::cluster_group cluster = cg::this_cluster();
+  const int rank = static_cast<int>(cluster.block_rank());
+  const int mergers = p.merger_count;
+  const int local_rows = p.push_row_count;
+  const int lane = work.lane;
+  float* push_out =
+      reinterpret_cast<float*>(reinterpret_cast<unsigned char*>(&tile) + sizeof(SharedTile));
+  float* push_max = push_out + p.push_slot_count * local_rows * kHeadDim;
+  float* push_sum = push_max + p.push_slot_count * local_rows;
+  const int slot = rank * work.key_group_count + work.key_group;
+  if (work.is_active) {
+    if constexpr (kIsTransposed) {
+      for (int e = 0; e < 2; ++e) {
+        for (int offset = 4; offset < kWarpSize; offset *= 2) {
+          state.sum[e] += __shfl_xor_sync(kFullWarpMask, state.sum[e], offset);
+        }
+        const int row = 2 * (lane % 4) + e;
+        const int index = slot * local_rows + row / mergers;
+        float* out = cluster.map_shared_rank(push_out, row % mergers) + index * kHeadDim;
+        for (int d = 0; d < kHeadDim / kMmaRows; ++d) {
+          for (int h = 0; h < 2; ++h) {
+            out[kMmaRows * d + lane / 4 + kMmaCols * h] = state.out[d][2 * h + e];
+          }
+        }
+        if (lane < 4) {
+          cluster.map_shared_rank(push_max, row % mergers)[index] = state.max_log2[e];
+          cluster.map_shared_rank(push_sum, row % mergers)[index] = state.sum[e];
+        }
+      }
+    } else {
+      for (int half = 0; half < 2; ++half) {
+        state.sum[half] += __shfl_xor_sync(kFullWarpMask, state.sum[half], 1);
+        state.sum[half] += __shfl_xor_sync(kFullWarpMask, state.sum[half], 2);
+        const int row = work.m_tile * kMmaRows + lane / 4 + 8 * half;
+        if (row < work.row_count) {
+          const int index = slot * local_rows + row / mergers;
+          float* out = cluster.map_shared_rank(push_out, row % mergers) + index * kHeadDim;
+          for (int d = 0; d < kDimTiles; ++d) {
+            *reinterpret_cast<float2*>(&out[d * kMmaCols + 2 * (lane % 4)]) =
+                make_float2(state.out[d][2 * half], state.out[d][2 * half + 1]);
+          }
+          if (lane % 4 == 0) {
+            cluster.map_shared_rank(push_max, row % mergers)[index] = state.max_log2[half];
+            cluster.map_shared_rank(push_sum, row % mergers)[index] = state.sum[half];
+          }
+        }
+      }
+    }
+  }
+  cluster.sync();
+  if (rank >= mergers) {
+    wait_for_copies<0>();
+    return;
+  }
+  const int my_row_count = (work.row_count - rank + mergers - 1) / mergers;
+  for (int task = threadIdx.x; task < my_row_count * kVectorsPerRow; task += thread_count()) {
+    const int local_row = task / kVectorsPerRow;
+    const int vector = task % kVectorsPerRow;
+    float merged_max = -INFINITY;
+    for (int s = 0; s < p.push_slot_count; ++s) {
+      merged_max = fmaxf(merged_max, push_max[s * local_rows + local_row]);
+    }
+    const float safe_max = merged_max == -INFINITY ? 0.0f : merged_max;
+    float merged_sum = 0.0f;
+    float4 merged = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+    for (int s = 0; s < p.push_slot_count; ++s) {
+      const int index = s * local_rows + local_row;
+      const float weight = fast_exp2(push_max[index] - safe_max);
+      const float4 x = reinterpret_cast<const float4*>(push_out + index * kHeadDim)[vector];
+      merged_sum += weight * push_sum[index];
+      merged = make_float4(merged.x + weight * x.x, merged.y + weight * x.y,
+                           merged.z + weight * x.z, merged.w + weight * x.w);
+    }
+    const int row = rank + local_row * mergers;
+    reinterpret_cast<float4*>(tile.out[row])[vector] = merged;
+    if (vector == 0) {
+      tile.row_sum[row] = merged_sum;
+    }
+  }
+  wait_for_copies<0>();
+  __syncthreads();
+  write_gated_output(p, tile, work.b, work.kv_head, work.row_count, rank, mergers);
+}
+
+/**
  * @brief `merge_in_parallel` publishes the block's state; the last blocks to arrive wait for the
  * others, then each merges and writes its own slice of the rows (verify).
  *
@@ -2281,7 +2389,7 @@ __device__ void merge_with_tree(const Params& p, SharedTile& tile, const BlockWo
  * sizeof(SharedTile), stream>>>(p);
  * @endcode
  */
-template <int kWarpCount, int kChunksPerWarp, int kMinBlocksPerSm>
+template <int kWarpCount, int kChunksPerWarp, int kMinBlocksPerSm, bool kUsePushMerge = false>
 __global__ void __launch_bounds__(kWarpCount* kWarpSize, kMinBlocksPerSm)
     attention_kernel(const Params p) {
   constexpr bool kIsVerify = kChunksPerWarp > 1;
@@ -2306,6 +2414,13 @@ __global__ void __launch_bounds__(kWarpCount* kWarpSize, kMinBlocksPerSm)
   if (work.split == 0) {
     attend_new_tokens<kChunksPerWarp, kIsVerify>(p, tile, work, q_fragments, logit_scale_log2,
                                                  state);
+  }
+  if constexpr (kUsePushMerge) {
+    __syncthreads();
+    start_rows_copy(p, tile.merge.gate, work.b, work.kv_head, work.row_count,
+                    (p.q_head_count + 2 * p.kv_head_count) * kHeadDim);
+    merge_by_push<!kIsVerify>(p, tile, work, state);
+    return;
   }
   combine_block_state<!kIsVerify>(tile, work, state);
   start_rows_copy(p, tile.merge.gate, work.b, work.kv_head, work.row_count,
@@ -2352,9 +2467,14 @@ struct KernelBuild {
  * const KernelBuild build = select_kernel(64, 2048, 32);
  * @endcode
  */
-KernelBuild select_kernel(int64_t row_count, int64_t window, int64_t group_count) {
+KernelBuild select_kernel(int64_t row_count, int64_t window, int64_t group_count,
+                          bool use_push_merge = false) {
   const int64_t m_tile_count = (row_count + kMmaRows - 1) / kMmaRows;
   if (m_tile_count == 1) {
+    if (use_push_merge) {
+      return {attention_kernel<4, 1, kDecodeBlocksPerSm, true>, kMinThreads, kDecodeBlocksPerSm,
+              false};
+    }
     if (window == 0) {
       return {attention_kernel<4, 1, kFullDecodeBlocksPerSm>, kMinThreads, kFullDecodeBlocksPerSm,
               false};
@@ -2364,6 +2484,10 @@ KernelBuild select_kernel(int64_t row_count, int64_t window, int64_t group_count
   TORCH_CHECK(m_tile_count == kMaxRows / kMmaRows,
               "a block needs at most 16 or 49 to 64 query rows (L x query heads per KV head), got ",
               row_count);
+  if (use_push_merge) {
+    return {attention_kernel<8, 2, kWideVerifyBlocksPerSm, true>, 2 * kMinThreads,
+            kWideVerifyBlocksPerSm, false};
+  }
   if (window != 0 || group_count <= kMaxWideFullGroups) {
     return {attention_kernel<8, 2, kWideVerifyBlocksPerSm>, 2 * kMinThreads, kWideVerifyBlocksPerSm,
             true};
@@ -2477,19 +2601,56 @@ void run(torch::Tensor qkv, torch::Tensor k_cache, torch::Tensor v_cache, torch:
   p.keys_per_split = static_cast<int>(keys_per_split);
   p.first_split_keys = static_cast<int>(first_split_keys);
   p.is_balanced = is_balanced;
-  const KernelBuild build = select_kernel(p.L * (p.q_head_count / p.kv_head_count), window,
-                                          qkv.size(0) * p.kv_head_count);
-  C10_CUDA_CHECK(cudaFuncSetAttribute(build.kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                                      sizeof(SharedTile)));
+  const bool wants_push_merge =
+      window != 0 && !is_balanced && split_count >= 2 && split_count <= kMaxClusterBlocks;
+  const KernelBuild push_build = select_kernel(p.L * (p.q_head_count / p.kv_head_count), window,
+                                               qkv.size(0) * p.kv_head_count, true);
+  const KernelBuild plain_build = select_kernel(p.L * (p.q_head_count / p.kv_head_count), window,
+                                                qkv.size(0) * p.kv_head_count, false);
+  KernelBuild build = wants_push_merge ? push_build : plain_build;
+  const int row_count = p.L * kGroupSize;
+  const int m_tile_count = (row_count + kMmaRows - 1) / kMmaRows;
+  const int key_group_count = build.thread_count / kWarpSize / m_tile_count;
+  p.merger_count = std::min(p.split_count, row_count);
+  p.push_row_count = (row_count + p.merger_count - 1) / p.merger_count;
+  p.push_slot_count = p.split_count * key_group_count;
+  const size_t push_bytes =
+      static_cast<size_t>(p.push_slot_count) * p.push_row_count * (kHeadDim + 2) * sizeof(float);
+  p.is_cluster_merge = wants_push_merge;
   cudaLaunchConfig_t config = {};
   config.gridDim = dim3(p.split_count, k_cache.size(2), qkv.size(0));
   config.blockDim = dim3(build.thread_count);
-  config.dynamicSmemBytes = sizeof(SharedTile);
+  config.dynamicSmemBytes = sizeof(SharedTile) + (p.is_cluster_merge ? push_bytes : 0);
   config.stream = at::cuda::getCurrentCUDAStream();
+  C10_CUDA_CHECK(cudaFuncSetAttribute(build.kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                      static_cast<int>(config.dynamicSmemBytes)));
+  cudaLaunchAttribute cluster_attribute = {};
+  cluster_attribute.id = cudaLaunchAttributeClusterDimension;
+  cluster_attribute.val.clusterDim.x = p.split_count;
+  cluster_attribute.val.clusterDim.y = 1;
+  cluster_attribute.val.clusterDim.z = 1;
+  if (p.is_cluster_merge) {
+    C10_CUDA_CHECK(
+        cudaFuncSetAttribute(build.kernel, cudaFuncAttributeNonPortableClusterSizeAllowed, 1));
+    config.attrs = &cluster_attribute;
+    config.numAttrs = 1;
+    int cluster_count = 0;
+    C10_CUDA_CHECK(cudaOccupancyMaxActiveClusters(&cluster_count, build.kernel, &config));
+    p.is_cluster_merge =
+        static_cast<int64_t>(cluster_count) * p.split_count >=
+        static_cast<int64_t>(config.gridDim.x) * config.gridDim.y * config.gridDim.z;
+    if (!p.is_cluster_merge) {
+      build = plain_build;
+      config.numAttrs = 0;
+      config.dynamicSmemBytes = sizeof(SharedTile);
+      C10_CUDA_CHECK(cudaFuncSetAttribute(build.kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                          sizeof(SharedTile)));
+    }
+  }
   cudaLaunchAttribute cooperative_attribute = {};
   cooperative_attribute.id = cudaLaunchAttributeCooperative;
   cooperative_attribute.val.cooperative = 1;
-  if (build.is_cooperative) {
+  if (!p.is_cluster_merge && build.is_cooperative) {
     config.attrs = &cooperative_attribute;
     config.numAttrs = 1;
   }
@@ -2552,7 +2713,7 @@ def _get_extension() -> object:
     """
     if "module" not in _extension_cache:
         _extension_cache["module"] = load_inline(
-            name="muse_fused_attention_padded_out",
+            name="muse_fused_attention_push_merge",
             cpp_sources=CPP_SOURCE,
             cuda_sources=CUDA_SOURCE,
             functions=["run", "resident_blocks_per_sm"],
