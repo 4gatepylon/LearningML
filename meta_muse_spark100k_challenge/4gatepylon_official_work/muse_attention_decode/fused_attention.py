@@ -91,6 +91,7 @@ constexpr int kLoadsPerThread = kPiecesPerStep / kMinThreads;
 constexpr int kMaxSplits = 256;
 constexpr int kStages = 3;
 constexpr int kMaxClusterBlocks = 16;
+constexpr int kTreeClusterBlocks = 8;
 /**
  * @brief `are_new_tokens_in_range` says whether a build attends the new tokens as keys in their
  * block's range (patched into the ring) rather than as an extra step of split 0: every build but
@@ -168,7 +169,7 @@ struct Params {
   float* partial_sum_device;
   int* arrival_count_device;
   int split_count, max_split_count, keys_per_split, first_split_keys;
-  bool is_balanced, is_cluster_merge;
+  bool is_balanced, is_cluster_merge, is_cluster_tree;
   int push_slot_count, push_row_count, merger_count;
   int heads_per_block;
 };
@@ -1587,13 +1588,21 @@ __device__ void publish_state(const Params& p, const SharedTile& tile, int64_t s
  * @code
  * if (!arrive(p, tile, counter, 8)) { return false; }
  * @endcode
+ *
+ * @par Must know
+ * - Gotchas:
+ *   - The count is an acquire-release atomic at GPU scope; the barriers around it order the
+ *     block's published state before it and the last block's reads after it.
  */
 __device__ bool arrive(const Params& p, SharedTile& tile, int counter, int expected_count) {
   __syncthreads();
   if (threadIdx.x == 0) {
-    __threadfence();
-    tile.is_last_split = atomicAdd(&p.arrival_count_device[counter], 1) == expected_count - 1;
-    __threadfence();
+    int previous_count;
+    asm volatile("atom.add.acq_rel.gpu.s32 %0, [%1], 1;\n"
+                 : "=r"(previous_count)
+                 : "l"(&p.arrival_count_device[counter])
+                 : "memory");
+    tile.is_last_split = previous_count == expected_count - 1;
   }
   __syncthreads();
   return tile.is_last_split;
@@ -2597,6 +2606,149 @@ __device__ void merge_in_parallel(const Params& p, SharedTile& tile, const Block
 }
 
 /**
+ * @brief `merge_by_cluster_tree` merges full decode's splits in two levels: each block pushes row
+ * r of its state to block r of its cluster of `kTreeClusterBlocks`, which folds the row after one
+ * cluster barrier. With several clusters, each folded row goes to the workspace, and the last
+ * cluster at the row's counter merges the clusters and writes the row's gated output.
+ *
+ * @param[in] p Kernel parameters.
+ * @param[in,out] tile Shared memory tile with the block's state and its gate rows in flight; the
+ * push buffer follows it.
+ * @param[in] work The block's work.
+ *
+ * @par Example
+ * @code
+ * merge_by_cluster_tree(p, tile, work);
+ * @endcode
+ *
+ * @par Must know
+ * - Gotchas:
+ *   - The grid's splits come in whole clusters of `kTreeClusterBlocks`, and a block owns one row.
+ *   - At most `kMergeFanIn * kMaxRows` clusters fit the staged maxima and sums.
+ */
+__device__ void merge_by_cluster_tree(const Params& p, SharedTile& tile, const BlockWork& work) {
+  namespace cg = cooperative_groups;
+  cg::cluster_group cluster = cg::this_cluster();
+  const int rank = static_cast<int>(cluster.block_rank());
+  float* push_out =
+      reinterpret_cast<float*>(reinterpret_cast<unsigned char*>(&tile) + sizeof(SharedTile));
+  float* push_max = push_out + kTreeClusterBlocks * kHeadDim;
+  float* push_sum = push_max + kTreeClusterBlocks;
+  for (int i = threadIdx.x; i < work.row_count * kVectorsPerRow; i += thread_count()) {
+    const int row = i / kVectorsPerRow;
+    const int vector = i % kVectorsPerRow;
+    reinterpret_cast<float4*>(cluster.map_shared_rank(push_out, row))[rank * kVectorsPerRow +
+                                                                      vector] =
+        reinterpret_cast<const float4*>(tile.out[row])[vector];
+    if (vector == 0) {
+      cluster.map_shared_rank(push_max, row)[rank] = tile.row_max[row];
+      cluster.map_shared_rank(push_sum, row)[rank] = tile.row_sum[row];
+    }
+  }
+  cluster.sync();
+  if (rank >= work.row_count) {
+    wait_for_copies<0>();
+    return;
+  }
+  const int row = rank;
+  const int group = work.b * p.kv_head_count + work.kv_head;
+  const int64_t first_slot = static_cast<int64_t>(group) * p.split_count;
+  const int cluster_count = p.split_count / kTreeClusterBlocks;
+  const int cluster_index = work.split / kTreeClusterBlocks;
+  if (threadIdx.x < kVectorsPerRow) {
+    float merged_max = -INFINITY;
+    for (int slot = 0; slot < kTreeClusterBlocks; ++slot) {
+      merged_max = fmaxf(merged_max, push_max[slot]);
+    }
+    const float safe_max = merged_max == -INFINITY ? 0.0f : merged_max;
+    float merged_sum = 0.0f;
+    float4 merged = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+    for (int slot = 0; slot < kTreeClusterBlocks; ++slot) {
+      const float weight = fast_exp2(push_max[slot] - safe_max);
+      const float4 x = reinterpret_cast<const float4*>(push_out)[slot * kVectorsPerRow +
+                                                                 threadIdx.x];
+      merged_sum += weight * push_sum[slot];
+      merged = make_float4(merged.x + weight * x.x, merged.y + weight * x.y,
+                           merged.z + weight * x.z, merged.w + weight * x.w);
+    }
+    if (cluster_count == 1) {
+      reinterpret_cast<float4*>(tile.out[row])[threadIdx.x] = merged;
+      tile.row_sum[row] = merged_sum;
+    } else {
+      const int64_t slot = first_slot + cluster_index;
+      reinterpret_cast<float4*>(p.partial_out_device +
+                                (slot * kMaxRows + row) * kHeadDim)[threadIdx.x] = merged;
+      if (threadIdx.x == 0) {
+        p.partial_max_device[slot * kMaxRows + row] = merged_max;
+        p.partial_sum_device[slot * kMaxRows + row] = merged_sum;
+      }
+    }
+  }
+  if (cluster_count > 1) {
+    if (!arrive(p, tile, group * kCountersPerGroup + row, cluster_count)) {
+      wait_for_copies<0>();
+      return;
+    }
+    if (threadIdx.x == 0) {
+      p.arrival_count_device[group * kCountersPerGroup + row] = 0;
+    }
+    float* cluster_max = &tile.merge.split_weight[0][0];
+    float* cluster_sum = &tile.merge.split_sum[0][0];
+    for (int c = threadIdx.x; c < cluster_count; c += thread_count()) {
+      cluster_max[c] = __ldcg(&p.partial_max_device[(first_slot + c) * kMaxRows + row]);
+      cluster_sum[c] = __ldcg(&p.partial_sum_device[(first_slot + c) * kMaxRows + row]);
+    }
+    __syncthreads();
+    if (threadIdx.x < kWarpSize) {
+      float merged_max = -INFINITY;
+      for (int c = threadIdx.x; c < cluster_count; c += kWarpSize) {
+        merged_max = fmaxf(merged_max, cluster_max[c]);
+      }
+      for (int offset = kWarpSize / 2; offset > 0; offset /= 2) {
+        merged_max = fmaxf(merged_max, __shfl_xor_sync(kFullWarpMask, merged_max, offset));
+      }
+      const float safe_max = merged_max == -INFINITY ? 0.0f : merged_max;
+      float merged_sum = 0.0f;
+      for (int c = threadIdx.x; c < cluster_count; c += kWarpSize) {
+        const float weight = fast_exp2(cluster_max[c] - safe_max);
+        merged_sum += weight * cluster_sum[c];
+        cluster_max[c] = weight;
+      }
+      merged_sum = lane_group_sum<kWarpSize>(merged_sum);
+      if (threadIdx.x == 0) {
+        tile.row_sum[row] = merged_sum;
+      }
+    }
+    __syncthreads();
+    const int vector = threadIdx.x % kVectorsPerRow;
+    const int part = threadIdx.x / kVectorsPerRow;
+    const int part_count = thread_count() / kVectorsPerRow;
+    float4 merged = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+#pragma unroll 4
+    for (int c = part; c < cluster_count; c += part_count) {
+      const float weight = cluster_max[c];
+      const float* slot_row = p.partial_out_device + ((first_slot + c) * kMaxRows + row) * kHeadDim;
+      const float4 x = __ldcg(reinterpret_cast<const float4*>(slot_row) + vector);
+      merged = make_float4(merged.x + weight * x.x, merged.y + weight * x.y,
+                           merged.z + weight * x.z, merged.w + weight * x.w);
+    }
+    tile.merge.part_out[threadIdx.x] = merged;
+    __syncthreads();
+    if (threadIdx.x < kVectorsPerRow) {
+      float4 total = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+      for (int q = 0; q < part_count; ++q) {
+        const float4 x = tile.merge.part_out[q * kVectorsPerRow + threadIdx.x];
+        total = make_float4(total.x + x.x, total.y + x.y, total.z + x.z, total.w + x.w);
+      }
+      reinterpret_cast<float4*>(tile.out[row])[threadIdx.x] = total;
+    }
+  }
+  wait_for_copies<0>();
+  __syncthreads();
+  write_gated_output(p, tile, work.b, work.kv_head, work.row_count, row, work.row_count);
+}
+
+/**
  * @brief `merge_with_tree` publishes the block's state into the two-level merge tree; the block
  * that finishes the tree writes every row (decode).
  *
@@ -2684,6 +2836,8 @@ __global__ void __launch_bounds__(kWarpCount* kWarpSize, kMinBlocksPerSm)
                   (p.q_head_count + 2 * p.kv_head_count) * kHeadDim);
   if constexpr (kIsVerify) {
     merge_in_parallel<kWarpCount>(p, tile, work);
+  } else if (p.is_cluster_tree) {
+    merge_by_cluster_tree(p, tile, work);
   } else {
     merge_with_tree(p, tile, work);
   }
@@ -2880,32 +3034,43 @@ void run(torch::Tensor qkv, torch::Tensor k_cache, torch::Tensor v_cache, torch:
   const size_t push_bytes =
       static_cast<size_t>(p.push_slot_count) * p.push_row_count * (kHeadDim + 2) * sizeof(float);
   p.is_cluster_merge = wants_push_merge;
+  p.is_cluster_tree = window == 0 && p.L == 1 && split_count % kTreeClusterBlocks == 0 &&
+                      row_count * build.heads_per_block <= kTreeClusterBlocks;
+  const size_t tree_push_bytes = kTreeClusterBlocks * (kHeadDim + 2) * sizeof(float);
   cudaLaunchConfig_t config = {};
   TORCH_CHECK(p.kv_head_count % build.heads_per_block == 0,
               "the paired build needs an even KV head count, got ", p.kv_head_count);
   p.heads_per_block = build.heads_per_block;
   config.gridDim = dim3(p.split_count, k_cache.size(2) / build.heads_per_block, qkv.size(0));
   config.blockDim = dim3(build.thread_count);
-  config.dynamicSmemBytes = sizeof(SharedTile) + (p.is_cluster_merge ? push_bytes : 0);
+  config.dynamicSmemBytes = sizeof(SharedTile) + (p.is_cluster_merge  ? push_bytes
+                                                   : p.is_cluster_tree ? tree_push_bytes
+                                                                       : 0);
   config.stream = at::cuda::getCurrentCUDAStream();
   C10_CUDA_CHECK(cudaFuncSetAttribute(build.kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
                                       static_cast<int>(config.dynamicSmemBytes)));
   cudaLaunchAttribute cluster_attribute = {};
   cluster_attribute.id = cudaLaunchAttributeClusterDimension;
-  cluster_attribute.val.clusterDim.x = p.split_count;
+  cluster_attribute.val.clusterDim.x = p.is_cluster_tree ? kTreeClusterBlocks : p.split_count;
   cluster_attribute.val.clusterDim.y = 1;
   cluster_attribute.val.clusterDim.z = 1;
-  if (p.is_cluster_merge) {
+  if (p.is_cluster_merge || p.is_cluster_tree) {
     C10_CUDA_CHECK(
         cudaFuncSetAttribute(build.kernel, cudaFuncAttributeNonPortableClusterSizeAllowed, 1));
     config.attrs = &cluster_attribute;
     config.numAttrs = 1;
     int cluster_count = 0;
     C10_CUDA_CHECK(cudaOccupancyMaxActiveClusters(&cluster_count, build.kernel, &config));
-    p.is_cluster_merge =
-        static_cast<int64_t>(cluster_count) * p.split_count >=
-        static_cast<int64_t>(config.gridDim.x) * config.gridDim.y * config.gridDim.z;
-    if (!p.is_cluster_merge) {
+    if (p.is_cluster_merge) {
+      p.is_cluster_merge =
+          static_cast<int64_t>(cluster_count) * p.split_count >=
+          static_cast<int64_t>(config.gridDim.x) * config.gridDim.y * config.gridDim.z;
+    } else {
+      p.is_cluster_tree =
+          static_cast<int64_t>(cluster_count) * kTreeClusterBlocks >=
+          static_cast<int64_t>(config.gridDim.x) * config.gridDim.y * config.gridDim.z;
+    }
+    if (!p.is_cluster_merge && !p.is_cluster_tree) {
       build = plain_build;
       config.numAttrs = 0;
       config.dynamicSmemBytes = sizeof(SharedTile);
@@ -2916,7 +3081,7 @@ void run(torch::Tensor qkv, torch::Tensor k_cache, torch::Tensor v_cache, torch:
   cudaLaunchAttribute cooperative_attribute = {};
   cooperative_attribute.id = cudaLaunchAttributeCooperative;
   cooperative_attribute.val.cooperative = 1;
-  if (!p.is_cluster_merge && build.is_cooperative) {
+  if (!p.is_cluster_merge && !p.is_cluster_tree && build.is_cooperative) {
     config.attrs = &cooperative_attribute;
     config.numAttrs = 1;
   }
@@ -2980,6 +3145,7 @@ _TILE_KEYS: int = 64
 _MAX_SPLITS: int = 256
 _WARP_SIZE: int = 32
 _MERGE_FAN_IN: int = 16
+_CLUSTER_BLOCKS: int = 8
 _COUNTERS_PER_GROUP: int = 17
 _extension_cache: dict[str, object] = {}
 _inv_freq_cache: dict[tuple[float, torch.device], torch.Tensor] = {}
@@ -2997,7 +3163,7 @@ def _get_extension() -> object:
     """
     if "module" not in _extension_cache:
         _extension_cache["module"] = load_inline(
-            name="muse_fused_attention_register_values",
+            name="muse_fused_attention_cluster_tree",
             cpp_sources=CPP_SOURCE,
             cuda_sources=CUDA_SOURCE,
             functions=["run", "resident_blocks_per_sm", "heads_per_block"],
@@ -3086,8 +3252,32 @@ def _plan_splits(data: dict) -> tuple[int, int, int, bool]:
         or shifted_split_count * block_group_count > slot_count
         or shifted_split_count > (_MERGE_FAN_IN if is_tree_limited else _MAX_SPLITS)
     ):
-        return split_count, keys_per_split, keys_per_split, is_balanced
-    return shifted_split_count, keys_per_split, first_split_keys, is_balanced
+        return _pad_to_clusters(config, split_count), keys_per_split, keys_per_split, is_balanced
+    return (
+        _pad_to_clusters(config, shifted_split_count),
+        keys_per_split,
+        first_split_keys,
+        is_balanced,
+    )
+
+
+def _pad_to_clusters(config: dict, split_count: int) -> int:
+    """`_pad_to_clusters` rounds full decode's split count up to whole clusters of 8 blocks.
+
+    Args:
+        config: The inputs' `config`.
+        split_count: Splits that cover the request's keys.
+
+    Returns:
+        `split_count`, or for full decode with more splits than one tree level merges
+        (`_MERGE_FAN_IN`) the next multiple of 8; the extra splits have no keys.
+
+    Example:
+        >>> split_count = _pad_to_clusters(data["config"], 250)  # 256
+    """
+    if config["window"] != 0 or config["q_len"] != 1 or split_count <= _MERGE_FAN_IN:
+        return split_count
+    return -(-split_count // _CLUSTER_BLOCKS) * _CLUSTER_BLOCKS
 
 
 def _get_workspace(data: dict, split_count: int) -> tuple[torch.Tensor, ...]:
