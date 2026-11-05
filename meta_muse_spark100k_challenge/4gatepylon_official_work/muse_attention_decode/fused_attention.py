@@ -2389,27 +2389,62 @@ __device__ void merge_by_push(const Params& p, SharedTile& tile, const BlockWork
     return;
   }
   const int my_row_count = (work.row_count - rank + mergers - 1) / mergers;
-  for (int task = threadIdx.x; task < my_row_count * kVectorsPerRow; task += thread_count()) {
-    const int local_row = task / kVectorsPerRow;
-    const int vector = task % kVectorsPerRow;
+  const int vector_count = my_row_count * kVectorsPerRow;
+  const int part_count = max(1, thread_count() / vector_count);
+  for (int task = threadIdx.x; task < vector_count * part_count; task += thread_count()) {
+    const int vector = task % vector_count;
+    const int local_row = vector / kVectorsPerRow;
     float merged_max = -INFINITY;
-    for (int s = 0; s < p.push_slot_count; ++s) {
-      merged_max = fmaxf(merged_max, push_max[s * local_rows + local_row]);
+    float merged_sum = 0.0f;
+    float4 merged = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+    for (int s = task / vector_count; s < p.push_slot_count; s += part_count) {
+      const int index = s * local_rows + local_row;
+      const float slot_max = push_max[index];
+      const float new_max = fmaxf(merged_max, slot_max);
+      const float safe_max = new_max == -INFINITY ? 0.0f : new_max;
+      const float old_weight = fast_exp2(merged_max - safe_max);
+      const float weight = fast_exp2(slot_max - safe_max);
+      const float4 x =
+          reinterpret_cast<const float4*>(push_out + index * kHeadDim)[vector % kVectorsPerRow];
+      merged_max = new_max;
+      merged_sum = old_weight * merged_sum + weight * push_sum[index];
+      merged =
+          make_float4(old_weight * merged.x + weight * x.x, old_weight * merged.y + weight * x.y,
+                      old_weight * merged.z + weight * x.z, old_weight * merged.w + weight * x.w);
+    }
+    if (part_count == 1) {
+      const int row = rank + local_row * mergers;
+      reinterpret_cast<float4*>(tile.out[row])[vector % kVectorsPerRow] = merged;
+      if (vector % kVectorsPerRow == 0) {
+        tile.row_sum[row] = merged_sum;
+      }
+    } else {
+      tile.merge.part_out[task] = merged;
+      tile.merge.part_max[task] = merged_max;
+      tile.merge.part_sum[task] = merged_sum;
+    }
+  }
+  __syncthreads();
+  for (int vector = threadIdx.x; vector < vector_count && part_count > 1;
+       vector += thread_count()) {
+    float merged_max = -INFINITY;
+    for (int part = 0; part < part_count; ++part) {
+      merged_max = fmaxf(merged_max, tile.merge.part_max[part * vector_count + vector]);
     }
     const float safe_max = merged_max == -INFINITY ? 0.0f : merged_max;
     float merged_sum = 0.0f;
     float4 merged = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
-    for (int s = 0; s < p.push_slot_count; ++s) {
-      const int index = s * local_rows + local_row;
-      const float weight = fast_exp2(push_max[index] - safe_max);
-      const float4 x = reinterpret_cast<const float4*>(push_out + index * kHeadDim)[vector];
-      merged_sum += weight * push_sum[index];
+    for (int part = 0; part < part_count; ++part) {
+      const int task = part * vector_count + vector;
+      const float weight = fast_exp2(tile.merge.part_max[task] - safe_max);
+      const float4 x = tile.merge.part_out[task];
+      merged_sum += weight * tile.merge.part_sum[task];
       merged = make_float4(merged.x + weight * x.x, merged.y + weight * x.y,
                            merged.z + weight * x.z, merged.w + weight * x.w);
     }
-    const int row = rank + local_row * mergers;
-    reinterpret_cast<float4*>(tile.out[row])[vector] = merged;
-    if (vector == 0) {
+    const int row = rank + vector / kVectorsPerRow * mergers;
+    reinterpret_cast<float4*>(tile.out[row])[vector % kVectorsPerRow] = merged;
+    if (vector % kVectorsPerRow == 0) {
       tile.row_sum[row] = merged_sum;
     }
   }
@@ -2828,7 +2863,7 @@ def _get_extension() -> object:
     """
     if "module" not in _extension_cache:
         _extension_cache["module"] = load_inline(
-            name="muse_fused_attention_new_tokens_in_range_v2",
+            name="muse_fused_attention_push_parts",
             cpp_sources=CPP_SOURCE,
             cuda_sources=CUDA_SOURCE,
             functions=["run", "resident_blocks_per_sm"],
