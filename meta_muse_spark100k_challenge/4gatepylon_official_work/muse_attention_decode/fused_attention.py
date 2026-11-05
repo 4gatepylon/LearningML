@@ -44,6 +44,8 @@ Must know:
           KV heads, so the other head's block hits in L2.
         - The split count fills one wave of resident blocks: the occupancy calculator's count,
           capped at each build's intended blocks per SM.
+        - Full decode with at least 64 request x KV-head groups attends two KV heads per block, so
+          each copy reads a token's whole 128-byte line; the step then holds 32 tokens.
         - Each build compiles one path: decode (4 warps, 1 chunk per warp per step, 3 blocks per
           SM), full verify (4 warps, 4 chunks, 4 blocks per SM) or verify on sliding layers or with
           at most 8 request x KV-head groups (8 warps, 2 chunks, 2 blocks per SM).
@@ -111,6 +113,7 @@ constexpr bool are_new_tokens_in_range() {
 constexpr int kVerifyStages = 2;
 constexpr int kDecodeBlocksPerSm = 3;
 constexpr int kFullDecodeBlocksPerSm = 4;
+constexpr int kMinPairedGroups = 64;
 constexpr int kVerifyBlocksPerSm = 4;
 constexpr int kWideVerifyBlocksPerSm = 2;
 constexpr int kMaxWideFullGroups = 8;
@@ -269,7 +272,7 @@ struct SharedTile {
  *
  * @par Example
  * @code
- * const PieceSpot spot = spot_piece<1>(piece);
+ * const PieceSpot spot = spot_piece<2>(piece);
  * @endcode
  */
 struct PieceSpot {
@@ -281,13 +284,13 @@ struct PieceSpot {
  * every KV head of the block, so `kHeadsPerBlock` heads read whole 128-byte lines together, and
  * head h's tokens fill rows `h * kStepKeys / kHeadsPerBlock` onward.
  *
- * @tparam kHeadsPerBlock KV heads per block: 1 in every build so far.
+ * @tparam kHeadsPerBlock KV heads per block: 1, or 2 for the paired full-decode build.
  * @param[in] piece The piece, below `kPiecesPerStep`.
  * @return Its token, head, row and first byte.
  *
  * @par Example
  * @code
- * const PieceSpot spot = spot_piece<1>(step_piece<128>(i));
+ * const PieceSpot spot = spot_piece<2>(step_piece<128>(i));
  * @endcode
  */
 template <int kHeadsPerBlock>
@@ -905,7 +908,7 @@ __device__ int step_piece(int i) {
  * missing keys get position -1.
  *
  * @tparam kThreadCount Threads per block, so the piece loop has fixed bounds.
- * @tparam kHeadsPerBlock KV heads per block: 1 in every build so far.
+ * @tparam kHeadsPerBlock KV heads per block: 1, or 2 for the paired full-decode build.
  * @param[in] p Kernel parameters.
  * @param[in] b Request index.
  * @param[in] kv_head Key/value head index.
@@ -1072,7 +1075,7 @@ __device__ void fill_rotation_table(const Params& p, SharedTile& tile, int seq_l
  * into a ring stage, as one `cp.async` group; missing keys become zeros.
  *
  * @tparam kThreadCount Threads per block, so the piece loop has fixed bounds.
- * @tparam kHeadsPerBlock KV heads per block: 1 in every build so far.
+ * @tparam kHeadsPerBlock KV heads per block: 1, or 2 for the paired full-decode build.
  * @param[in] p Kernel parameters.
  * @param[out] tile Shared memory tile: its ring stage and the stage's key positions.
  * @param[in] kv_head Key/value head index.
@@ -1112,7 +1115,7 @@ __device__ void start_step_copy(const Params& p, SharedTile& tile, int kv_head,
  * the P V tensor cores read; the keys stay FP8.
  *
  * @tparam kThreadCount Threads per block, so the piece loop has fixed bounds.
- * @tparam kHeadsPerBlock KV heads per block: 1 in every build so far.
+ * @tparam kHeadsPerBlock KV heads per block: 1, or 2 for the paired full-decode build.
  * @param[in,out] tile Shared memory tile: reads the stage, writes values and key positions.
  * @param[in] stage Ring stage whose copies this thread has waited for.
  *
@@ -1991,8 +1994,8 @@ __device__ BalancedSplit balance_splits(const Params& p, int B, int slot, int ne
  *
  * @tparam kWarpCount Warps per block.
  * @tparam kIsVerify Whether the block serves 8 tokens (64 query rows) rather than 1 (8 rows).
- * @tparam kHeadsPerBlock KV heads per block: with h heads a decode block has 8 h rows, head i's in
- * rows 8 i to 8 i + 7, and warp w attends head `w % h`.
+ * @tparam kHeadsPerBlock KV heads per block: the paired build's 2 heads give it 16 rows, head h's
+ * in rows 8 h to 8 h + 7, and warp w attends head `w % 2`.
  * @param[in] p Kernel parameters; the grid is (splits, KV heads, requests), or, when the split
  * plan is balanced, `split_count x B` slots per KV head that `balance_splits` assigns.
  * @return The block's work.
@@ -2056,7 +2059,7 @@ __device__ BlockWork describe_block(const Params& p) {
  * @tparam kStageCount Ring stages the build uses: `kStages` for decode, `kVerifyStages` for
  * verify.
  * @tparam kAreNewTokensInRange Whether the new tokens are keys of the last split.
- * @tparam kHeadsPerBlock KV heads per block: 1 in every build so far.
+ * @tparam kHeadsPerBlock KV heads per block: 1, or 2 for the paired full-decode build.
  * @param[in] p Kernel parameters.
  * @param[in,out] tile Shared memory tile.
  * @param[in] work The block's work.
@@ -2190,7 +2193,7 @@ __device__ void prepare_new_tokens(const Params& p, SharedTile& tile, const Bloc
  * from `new_k_fp8` and `new_v_fp8` (their cache copies were skipped).
  *
  * @tparam kThreadCount Threads per block.
- * @tparam kHeadsPerBlock KV heads per block: 1 in every build so far.
+ * @tparam kHeadsPerBlock KV heads per block: 1, or 2 for the paired full-decode build.
  * @param[in,out] tile Shared memory tile.
  * @param[in] work The block's work.
  * @param[in] start_incl The step's first key position.
@@ -2221,7 +2224,8 @@ __device__ void patch_new_tokens(SharedTile& tile, const BlockWork& work, int st
 
 /**
  * @brief `sync_step` makes a step's converted values and landed keys visible to every warp that
- * reads them: the block in verify (with a proxy fence for `wgmma`) and the warp in decode.
+ * reads them: the block in verify (with a proxy fence for `wgmma`), the warp in decode, and the
+ * warp's pair in the paired build, whose two warps copy the tokens that both attend.
  *
  * @tparam kIsVerify Whether this is a verify build.
  * @tparam kHeadsPerBlock KV heads per block.
@@ -2229,7 +2233,7 @@ __device__ void patch_new_tokens(SharedTile& tile, const BlockWork& work, int st
  *
  * @par Example
  * @code
- * sync_step<false, 1>(work.warp);
+ * sync_step<false, 2>(work.warp);
  * @endcode
  */
 template <bool kIsVerify, int kHeadsPerBlock>
@@ -2237,9 +2241,12 @@ __device__ void sync_step(int warp) {
   if constexpr (kIsVerify) {
     asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
     __syncthreads();
-  } else {
-    static_assert(kHeadsPerBlock == 1, "decode syncs one warp");
+  } else if constexpr (kHeadsPerBlock == 1) {
     __syncwarp();
+  } else {
+    asm volatile("bar.sync %0, %1;\n" ::"r"(1 + warp / kHeadsPerBlock),
+                 "n"(kHeadsPerBlock * kWarpSize)
+                 : "memory");
   }
 }
 
@@ -2250,7 +2257,7 @@ __device__ void sync_step(int warp) {
  * @tparam kWarpCount Warps per block.
  * @tparam kChunksPerWarp Chunks of 16 keys each warp attends per step.
  * @tparam kIsVerify Whether this is a verify build (`wgmma`).
- * @tparam kHeadsPerBlock KV heads per block: 1 in every build so far.
+ * @tparam kHeadsPerBlock KV heads per block: 1, or 2 for the paired full-decode build.
  * @param[in] p Kernel parameters.
  * @param[in,out] tile Shared memory tile.
  * @param[in] work The block's work.
@@ -2367,6 +2374,16 @@ __device__ void combine_block_state(SharedTile& tile, const BlockWork& work, War
           warp_out_row(tile, work.warp, query)[kMmaRows * d + lane / 4 + kMmaCols * h] =
               state.out[d][2 * h + e];
         }
+      }
+    }
+    if (work.rows_per_token > kGroupSize) {
+      const int other_row = (1 - work.warp_head) * kGroupSize + lane % kGroupSize;
+      if (lane < kGroupSize) {
+        tile.warp_max[work.warp][other_row] = -INFINITY;
+        tile.warp_sum[work.warp][other_row] = 0.0f;
+      }
+      for (int d = lane / kGroupSize; d < kHeadDim; d += kWarpSize / kGroupSize) {
+        warp_out_row(tile, work.warp, other_row)[d] = 0.0f;
       }
     }
   } else {
@@ -2695,7 +2712,8 @@ struct KernelBuild {
  *
  * @param[in] row_count Query rows per block (L x query heads per KV head).
  * @param[in] window Sliding window in tokens, or 0 for full attention.
- * @param[in] group_count Requests x KV heads: full verify with few groups also gets 8 warps.
+ * @param[in] group_count Requests x KV heads: full verify with few groups also gets 8 warps, and
+ * full decode with at least `kMinPairedGroups` attends two KV heads per block.
  * @return The kernel to launch, its threads per block, its blocks per SM, whether it launches
  * cooperatively, and its KV heads per block.
  * @throws c10::Error When a block has 17 to 48 query rows (2 or 3 row tiles).
@@ -2714,6 +2732,10 @@ KernelBuild select_kernel(int64_t row_count, int64_t window, int64_t group_count
               false};
     }
     if (window == 0) {
+      if (group_count >= kMinPairedGroups) {
+        return {attention_kernel<4, 1, kFullDecodeBlocksPerSm, false, 2>, kMinThreads,
+                kFullDecodeBlocksPerSm, false, 2};
+      }
       return {attention_kernel<4, 1, kFullDecodeBlocksPerSm>, kMinThreads, kFullDecodeBlocksPerSm,
               false};
     }
@@ -2856,6 +2878,8 @@ void run(torch::Tensor qkv, torch::Tensor k_cache, torch::Tensor v_cache, torch:
       static_cast<size_t>(p.push_slot_count) * p.push_row_count * (kHeadDim + 2) * sizeof(float);
   p.is_cluster_merge = wants_push_merge;
   cudaLaunchConfig_t config = {};
+  TORCH_CHECK(p.kv_head_count % build.heads_per_block == 0,
+              "the paired build needs an even KV head count, got ", p.kv_head_count);
   p.heads_per_block = build.heads_per_block;
   config.gridDim = dim3(p.split_count, k_cache.size(2) / build.heads_per_block, qkv.size(0));
   config.blockDim = dim3(build.thread_count);
@@ -2918,6 +2942,23 @@ int64_t resident_blocks_per_sm(int64_t row_count, int64_t window, int64_t group_
       &block_count, build.kernel, build.thread_count, sizeof(SharedTile)));
   return std::min(block_count, build.blocks_per_sm);
 }
+
+/**
+ * @brief `heads_per_block` returns how many KV heads each block of the selected build attends.
+ *
+ * @param[in] row_count Query rows per block (L x query heads per KV head), which picks the build.
+ * @param[in] window Sliding window in tokens, or 0 for full attention, which also picks it.
+ * @param[in] group_count Requests x KV heads, which also picks it.
+ * @return 1, or 2 for the paired full-decode build.
+ *
+ * @par Example
+ * @code
+ * int64_t heads = heads_per_block(8, 0, 64);
+ * @endcode
+ */
+int64_t heads_per_block(int64_t row_count, int64_t window, int64_t group_count) {
+  return select_kernel(row_count, window, group_count).heads_per_block;
+}
 """
 CPP_SOURCE: str = (
     "void run(torch::Tensor qkv, torch::Tensor k_cache, torch::Tensor v_cache, "
@@ -2927,6 +2968,7 @@ CPP_SOURCE: str = (
     "torch::Tensor partial_max, torch::Tensor partial_sum, torch::Tensor arrival_count, "
     "int64_t split_count, int64_t keys_per_split, int64_t first_split_keys, bool is_balanced); "
     "int64_t resident_blocks_per_sm(int64_t row_count, int64_t window, int64_t group_count);"
+    "int64_t heads_per_block(int64_t row_count, int64_t window, int64_t group_count);"
 )
 _HEAD_DIM: int = 64
 _ROPE_PAIR_STRIDE: int = 2
@@ -2952,10 +2994,10 @@ def _get_extension() -> object:
     """
     if "module" not in _extension_cache:
         _extension_cache["module"] = load_inline(
-            name="muse_fused_attention_heads_per_block",
+            name="muse_fused_attention_paired_heads",
             cpp_sources=CPP_SOURCE,
             cuda_sources=CUDA_SOURCE,
-            functions=["run", "resident_blocks_per_sm"],
+            functions=["run", "resident_blocks_per_sm", "heads_per_block"],
             extra_cuda_cflags=["-O3", "-gencode=arch=compute_90a,code=sm_90a"],
         )
     return _extension_cache["module"]
@@ -2998,7 +3040,8 @@ def _plan_splits(data: dict) -> tuple[int, int, int, bool]:
         (verify on full layers, 2 to 32 requests). Split 0 also attends the new tokens, so it
         gets one step fewer of cached keys when the grid still fits. In decode, short spans (at
         most 32 steps, such as the 2,048-token window) use at most 16 splits, so the merge tree
-        needs one level.
+        needs one level. A build that attends two KV heads per block has half as many groups to
+        split.
 
     Example:
         >>> split_count, keys_per_split, first_split_keys, is_balanced = _plan_splits(data)
@@ -3017,7 +3060,10 @@ def _plan_splits(data: dict) -> tuple[int, int, int, bool]:
         row_count, config["window"], group_count
     )
     slot_count: int = sm_count * resident_count
-    wanted_split_count: int = max(1, slot_count // group_count)
+    block_group_count: int = group_count // _get_extension().heads_per_block(
+        row_count, config["window"], group_count
+    )
+    wanted_split_count: int = max(1, slot_count // block_group_count)
     wanted_split_count = min(wanted_split_count, _MAX_SPLITS)
     if tile_count <= 2 * _MERGE_FAN_IN and config["q_len"] == 1:
         wanted_split_count = min(wanted_split_count, _MERGE_FAN_IN)
@@ -3034,7 +3080,7 @@ def _plan_splits(data: dict) -> tuple[int, int, int, bool]:
     is_tree_limited: bool = tile_count <= 2 * _MERGE_FAN_IN and config["q_len"] == 1
     if (
         is_balanced
-        or shifted_split_count * group_count > slot_count
+        or shifted_split_count * block_group_count > slot_count
         or shifted_split_count > (_MERGE_FAN_IN if is_tree_limited else _MAX_SPLITS)
     ):
         return split_count, keys_per_split, keys_per_split, is_balanced
